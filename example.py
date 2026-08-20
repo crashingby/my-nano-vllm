@@ -1,11 +1,15 @@
 import os
 from nanovllm import LLM, SamplingParams
+from nanovllm.logger import init_logger
 from transformers import AutoTokenizer
 
+logger = init_logger(__name__)
 
 def main():
     path = os.path.expanduser("/home/huangxy/models/Qwen3-0.6B")
+    logger.info("Loading tokenizer from %s", path)
     tokenizer = AutoTokenizer.from_pretrained(path)
+    logger.info("Initializing LLM")
     llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
 
     sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
@@ -21,6 +25,7 @@ def main():
         )
         for prompt in prompts
     ]
+    logger.info("Generating outputs")
     outputs = llm.generate(prompts, sampling_params)
 
     for prompt, output in zip(prompts, outputs):
