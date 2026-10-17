@@ -15,8 +15,9 @@ dependencies = [
     "torch>=2.4.0",
     "triton>=3.0.0",
     "transformers>=4.51.0",
-    "flash-attn",
+    "flash-attn>=2.8.3,<2.9",
     "xxhash",
+    "ninja", # 为按需编译 LibTorch 扩展提供构建工具。
 ]
 
 [project.urls]
@@ -25,3 +26,6 @@ Homepage="https://github.com/GeeeekExplorer/nano-vllm"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["nanovllm*"]
+
+[tool.setuptools.package-data]
+nanovllm = ["csrc/*.h", "csrc/*.cpp"]
