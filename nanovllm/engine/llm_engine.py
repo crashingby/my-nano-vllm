@@ -19,19 +19,13 @@ from __future__ import annotations
 
 import atexit
 from collections.abc import Callable
-from dataclasses import fields
 from itertools import count
 from time import perf_counter
-from typing import Any, cast
 
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
-from nanovllm.config import (
-    ModelConfig,
-    NanovllmConfig,
-    SchedulerConfig,
-)
+from nanovllm.config import NanovllmConfig
 from nanovllm.core.kv_cache_utils import (
     BlockHash,
     get_kv_cache_configs,
@@ -56,7 +50,8 @@ class LLMEngine:
     """同步连续批处理 Engine。
 
     Attributes:
-        vllm_config: 全局推理配置；初始化时回写物理 KV block 数和编译耗时。
+        vllm_config: 调用方传入的完整配置引用；初始化时回写 EOS、物理 KV block
+            数和编译耗时，执行端与 Scheduler 从同一对象读取子配置。
         tokenizer: 将字符串 prompt 编码为 token IDs、将 completion 解码为文本。
         model_executor: 创建和调用 Worker 的执行端；当前选择单卡 UniProcExecutor。
         available_gpu_memory_for_kv_cache: profiling 得到的 KV 字节预算，测量前为 -1。
@@ -65,104 +60,30 @@ class LLMEngine:
         _request_id_counter: 自动生成 request ID 的单调递增计数器。
         _is_closed: 关闭入口已经开始执行的标记，用于拒绝新请求和重复关闭。
     """
-    def __init__(self, model: str, **kwargs: Any) -> None:
-        """创建配置、tokenizer、执行端和正式 KV cache，再初始化 Scheduler。
+    def __init__(self, vllm_config: NanovllmConfig) -> None:
+        """使用完整配置创建 tokenizer、执行端、正式 KV cache 和 Scheduler。
 
         当前保留单个 LLMEngine 编排同步推理。执行端启动和 KV 初始化顺序参考
         vLLM EngineCore：Executor 构造负责加载权重，显存测量与 KV 规划随后进行，
         正式 KV 初始化和预热结束后，Scheduler 才能使用确定的物理 block 容量。
 
         Args:
-            model: 本地 Hugging Face 模型目录。
-            **kwargs: ``NanovllmConfig`` 的子配置，或为兼容旧入口保留的
-                ``enforce_eager``、``max_model_len``、``max_num_batched_tokens``、
-                ``max_num_seqs`` 等扁平参数。
+            vllm_config: 调用方已经构造并完成静态校验的总配置。Engine 直接保存
+                该对象，并传给 Executor 和 Scheduler，不重建或复制任何子配置。
+                每个 Engine 应使用独立配置，避免共享模型层注册表等运行时状态。
 
         Raises:
-            TypeError: kwargs 包含 NanovllmConfig 不支持的字段，或重复传入 ``model``
-                时抛出。
-            ValueError: 显式 model_config 的路径与 model 不一致，或配置、显存预算
-                无法生成有效的 KV 分配方案时抛出。
+            ValueError: 配置与显存预算无法生成有效的 KV 分配方案时抛出。
             NotImplementedError: Executor 不支持配置指定的并行方式时抛出。
 
         Side Effects:
-            读取本地模型配置与 tokenizer；创建 Worker、初始化设备并加载权重；
+            读取本地 tokenizer；创建 Worker、初始化设备并加载权重；
             执行显存 profiling，分配正式 KV cache，并按配置预热和捕获 CUDA Graph。
             随后初始化 prefix hash 根节点，创建 Scheduler，注册进程退出时的关闭回调。
+            启动结果直接回写传入配置，包括 EOS、KV 容量和编译统计等运行时字段。
         """
-        # NanovllmConfig 的字段由 Engine 直接转发；hf_config 等派生状态没有入口。
-        config_field_names = {
-            config_field.name
-            for config_field in fields(NanovllmConfig)
-            if config_field.init
-        }
-        # 保留旧 LLM(model, enforce_eager=..., max_num_seqs=...) 调用方式；它们会
-        # 在此边界被翻译成对应子配置，内部代码不再读取旧顶层字段。
-        model_config_field_names = {
-            config_field.name
-            for config_field in fields(ModelConfig)
-            if config_field.init and config_field.name != "model"
-        }
-        scheduler_config_field_names = {
-            config_field.name
-            for config_field in fields(SchedulerConfig)
-            if config_field.init
-        }
-        supported_kwargs = (
-            config_field_names
-            | model_config_field_names
-            | scheduler_config_field_names
-        )
-        unknown_kwargs = set(kwargs) - supported_kwargs
-        if unknown_kwargs:
-            unknown_names = ", ".join(sorted(unknown_kwargs))
-            raise TypeError(f"Unsupported Engine arguments: {unknown_names}")
-
-        if "model" in kwargs:
-            raise TypeError("model must be passed as the first positional argument")
-        # 显式传入子配置时，禁止同时传对应的旧扁平字段，避免两个来源相互矛盾。
-        model_config = cast(ModelConfig | None, kwargs.pop("model_config", None))
-        scheduler_config = cast(
-            SchedulerConfig | None,
-            kwargs.pop("scheduler_config", None),
-        )
-        legacy_model_kwargs = {
-            field_name: kwargs.pop(field_name)
-            for field_name in model_config_field_names & set(kwargs)
-        }
-        legacy_scheduler_kwargs = {
-            field_name: kwargs.pop(field_name)
-            for field_name in scheduler_config_field_names & set(kwargs)
-        }
-        if model_config is not None and legacy_model_kwargs:
-            conflicting_names = ", ".join(sorted(legacy_model_kwargs))
-            raise TypeError(
-                "model_config cannot be combined with legacy model arguments: "
-                f"{conflicting_names}"
-            )
-        if scheduler_config is not None and legacy_scheduler_kwargs:
-            conflicting_names = ", ".join(sorted(legacy_scheduler_kwargs))
-            raise TypeError(
-                "scheduler_config cannot be combined with legacy scheduler "
-                f"arguments: {conflicting_names}"
-            )
-        # 旧入口没有传子配置时，按旧字段构造相应的 vLLM 风格子配置。
-        if model_config is None:
-            model_config = ModelConfig(model=model, **legacy_model_kwargs)
-        elif model_config.model != model:
-            raise ValueError(
-                "The positional model path must match model_config.model, got "
-                f"{model!r} and {model_config.model!r}."
-            )
-        if scheduler_config is None:
-            scheduler_config = SchedulerConfig(**legacy_scheduler_kwargs)
-
-        # NanovllmConfig 只聚合已经完成各自校验的子配置及跨领域配置。
-        self.vllm_config: NanovllmConfig = NanovllmConfig(
-            model_config=model_config,
-            scheduler_config=scheduler_config,
-            **cast(dict[str, object], kwargs),
-        )
+        # 沿用 vLLM 的配置传递方式：外层负责组装，Engine 与执行端共享完整配置。
+        self.vllm_config: NanovllmConfig = vllm_config
         # executor_class 是执行器类型；先选择类型，使不支持的 TP 配置在加载执行端前报错。
         executor_class = Executor.get_class(self.vllm_config)
         logger.info("Loading tokenizer from %s", self.vllm_config.model_config.model)

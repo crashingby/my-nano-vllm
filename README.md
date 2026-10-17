@@ -33,15 +33,38 @@ huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
 
 ## Quick Start
 
-See `example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
+先组装 `NanovllmConfig`，再将完整配置传给 `LLM`。模型路径和执行选项由
+`ModelConfig` 管理，批处理容量由 `SchedulerConfig` 管理；完整示例见 `example.py`。
+
 ```python
 from nanovllm import LLM, SamplingParams
-llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
+from nanovllm.config import ModelConfig, NanovllmConfig, SchedulerConfig
+
+vllm_config = NanovllmConfig(
+    model_config=ModelConfig(
+        model="/YOUR/MODEL/PATH",
+        enforce_eager=True,
+        max_model_len=1024,
+    ),
+    scheduler_config=SchedulerConfig(
+        max_num_batched_tokens=256,
+        max_num_seqs=4,
+    ),
+)
+llm = LLM(vllm_config=vllm_config)
 sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
 prompts = ["Hello, Nano-vLLM."]
-outputs = llm.generate(prompts, sampling_params)
-outputs[0]["text"]
+try:
+    outputs = llm.generate(prompts, sampling_params)
+    print(outputs[0]["text"])
+finally:
+    llm.close()
 ```
+
+`cache_config`、`parallel_config`、`compilation_config`、`load_config` 和
+`device_config` 同样通过 `NanovllmConfig` 传入，省略时使用各自的默认配置。
+Engine、Executor 和 Worker 共享该配置对象，初始化得到的 EOS、KV 容量等状态也会
+回写到这个对象。
 
 ## Benchmark
 

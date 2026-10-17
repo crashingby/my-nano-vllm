@@ -14,11 +14,12 @@ else:
 
 @dataclass
 class LoadConfig:
-    """描述权重加载方式，供后续模型加载器选择和执行加载流程。
+    """描述权重加载方式，供已接入的 Loader 工厂和 BaseModelLoader 使用。
 
     模型目录由 ModelConfig.model 指定，模型结构与计算 dtype 也不归本类管理。
     本类仅保存选项，不会下载模型、读取权重或改变当前 CUDA device。
     当前 DefaultModelLoader 仅支持本地 safetensors，不包含 PT 回退或远程下载。
+    本类没有额外构造期校验；加载格式是否合法由 get_model_loader() 检查。
 
     Attributes:
         load_format: 权重加载格式或加载器选择标识。当前 auto、hf、safetensors
@@ -29,10 +30,12 @@ class LoadConfig:
         device: 可选的权重加载目标设备，例如 cuda:0。None 表示沿用
             NanovllmConfig.device_config.device；未指定设备编号时使用 Worker
             绑定的当前 CUDA 设备。它不是 TP rank 配置，也不是 safetensors 读取时的
-            CPU 暂存位置。BaseModelLoader 在模型构造阶段应用该设备覆盖。
+            CPU 暂存位置。BaseModelLoader 用该设备构造模型参数；checkpoint 文件
+            仍由文件迭代器在 CPU 读取，再写入这些参数。指定 CPU 加载不会自动
+            将模型搬回执行 GPU，因此普通单卡推理应保持与 Worker 的设备一致。
     """
 
-    # 保留与 vLLM 一致的选择入口；接受哪些格式由实际加载器决定。
+    # auto/hf/safetensors 均选择 DefaultModelLoader，其他格式由工厂明确报错。
     load_format: str | LoadFormats = "auto"
     # 文件加载进度的显示策略，不参与模型结构或权重数值计算。
     use_tqdm_on_load: bool = True

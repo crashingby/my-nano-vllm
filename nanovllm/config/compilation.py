@@ -1,8 +1,9 @@
 """定义 CUDA Graph 执行策略与模型构建期共享的静态上下文。
 
 模式名称和辅助接口对齐 vLLM。这里仅描述配置，不创建 CUDA stream、捕获
-Graph 或探测 GPU；具体支持范围由后续 Dispatcher、Attention 后端和 Runner
-共同决定。当前计划先接入 FULL_DECODE_ONLY，piecewise 执行链尚未实现。
+Graph 或探测 GPU。当前 FA2 连续批处理执行链已接入 FULL_DECODE_ONLY：
+每请求一个 query token 的 uniform batch 可用完整 Graph，其他 batch 普通执行；
+各请求的历史 KV 长度可以不同。PIECEWISE 的模型切分与编译执行链尚未实现。
 """
 
 import enum
@@ -29,10 +30,10 @@ class CUDAGraphMode(enum.Enum):
     mixed_mode() 返回 NONE。FULL_AND_PIECEWISE 则分别返回 FULL、PIECEWISE。
     """
 
-    NONE = 0  # 关闭 CUDA Graph，按正常模型调用路径执行。
+    NONE = 0  # 关闭 CUDA Graph；普通调用仍可执行局部已编译函数或 Triton kernel。
     PIECEWISE = 1  # 对可捕获的模型片段分别使用 Graph，当前执行链尚未接入。
     FULL = 2  # 捕获整个模型 forward；后端能力决定哪些 batch 可以使用。
-    FULL_DECODE_ONLY = (FULL, NONE)  # decode 用完整 Graph，混合 batch 不使用 Graph。
+    FULL_DECODE_ONLY = (FULL, NONE)  # uniform decode 用完整 Graph，其他 batch 普通执行。
     FULL_AND_PIECEWISE = (FULL, PIECEWISE)  # decode 用完整 Graph，混合 batch 用分段 Graph。
 
     def decode_mode(self) -> "CUDAGraphMode":
@@ -107,33 +108,42 @@ class CUDAGraphMode(enum.Enum):
 class CompilationConfig:
     """保存 CUDA Graph 配置，以及模型构建期间登记的静态 module 表。
 
-    与 vLLM 一样，部分字段初始为 None，表示等待总配置结合模型、Scheduler
-    容量和后端能力完成解析。None 不等价于 CUDAGraphMode.NONE；Runner 使用
-    捕获尺寸、Dispatcher 初始化 keys 之前，必须先完成配置解析。
+    与 vLLM 一样，部分字段初始为 None。NanovllmConfig 构造时先结合模型策略
+    和 Scheduler 容量解析默认模式与候选尺寸；Runner 确定 Attention 后端后，
+    再解析能力限制并初始化 Dispatcher keys。None 不等价于 CUDAGraphMode.NONE。
 
     本类不执行捕获。static_forward_context 供 Worker 等模型外部组件按稳定
     层名查找 module，例如收集 Attention 的 KVCacheSpec；本轮 Attention
     metadata、Graph 运行模式和描述符由独立的 ForwardContext 携带。
+    当前没有模型级 CompilationMode、compile_sizes 或分段编译后端；局部层的
+    @torch.compile 独立于这些 Graph 配置，不由本类统一开关或计时。
 
     Attributes:
         cudagraph_mode: Graph 配置策略；None 表示尚未解析，NONE 表示明确禁用。
-        cudagraph_num_of_warmups: 每个捕获形状在正式 capture 前的预热次数。
-            具体循环由 Runner 执行；不包含其他 profiling/kernel warmup 次数。
+        cudagraph_num_of_warmups: 各捕获形状请求的 eager 预热次数，供 Runner 的
+            _warmup_and_capture() 默认使用。当前实际次数至少为 1，避免首次
+            内核初始化进入 capture；显式方法参数可覆盖它，负数在预热入口报错。
+            不包含独立的 profile_run() 或 kernel_warmup() 调用。
         cudagraph_capture_sizes: 要捕获的 packed token 数列表；None 表示待推导。
-            普通单 token decode 下，token 数也等于请求数。[] 是解析后的空列表，
-            不应将它当成 None 自动推导默认尺寸。
+            列表应提供正整数，代表包含 padding 的执行容量，不是上下文长度。
+            总配置负责去重、排序及按 token budget 过滤；Dispatcher 生成 FULL
+            decode keys 时还会过滤超过请求容量的尺寸。显式 [] 不会推导默认值，
+            在启用 Graph 的总配置初始化中会触发断言。
         cudagraph_copy_inputs: 上游 piecewise 编译路径的输入复制选项；当前预留，
             不控制完整模型 Wrapper 的输入复制。
         max_cudagraph_capture_size: 最大捕获 token 数；None 表示待推导，存在捕获
             尺寸时应与规范化列表的最大值一致。超过范围的 batch 应回退普通执行。
-        compilation_time: 模型级编译耗时统计，单位为秒。当前尚无模型级编译链，
-            因而保持 0.0；不代表预热、Graph 捕获或局部函数 JIT 的总耗时。
+        compilation_time: 模型级编译统计，单位为秒，初值 0.0。Executor 在
+            initialize_from_config() 收集各 Worker 的 CompilationTimes 后回写
+            language_model 的最大值。当前无模型级编译计时，正常路径仍为 0.0；
+            不代表整个启动、Graph 捕获或局部函数首次 JIT 的墙钟耗时。
         static_forward_context: 稳定完整层名到模型 module 的实例级映射；当前主要
-            保存 Attention，供 Worker 查询和运行时上下文引用。
+            由 Attention 构造函数登记自身，供 Runner 查询后端和 KV 规格，并供
+            ForwardContext 引用已构造的层。字典持有实际 module，不是请求 metadata。
     """
     # 保留上游的 None 初始值与字段类型；总配置解析完成后再交给运行时组件。
     cudagraph_mode: CUDAGraphMode = None  # type: ignore[assignment]
-    # 沿用上游默认值 0；后续预热流程必须保证首次 JIT 编译发生在 capture 外。
+    # 默认请求 0 次；当前 Runner 会提升到至少 1 次，独立 kernel warmup 另行执行。
     cudagraph_num_of_warmups: int = 0
     # None 等待 NanovllmConfig 推导；显式列表随后统一排序和验证容量约束。
     cudagraph_capture_sizes: list[int] = None  # type: ignore[assignment]
@@ -141,7 +151,7 @@ class CompilationConfig:
     cudagraph_copy_inputs: bool = False
     # 这是 token 维度的捕获上限，不是最大上下文长度，也不是 KV cache block 数。
     max_cudagraph_capture_size: int = None  # type: ignore[assignment]
-    # 由编译流程累计、供 Worker 返回 CompilationTimes；当前只有零值统计占位。
+    # Worker 返回该模型级统计，Executor 汇总后回写；当前不累计局部 JIT 耗时。
     compilation_time: float = field(default=0.0, init=False)
     # 每个配置独立持有注册表；init=False 防止调用方注入外部 module 映射。
     static_forward_context: dict[str, Any] = field(
@@ -154,7 +164,7 @@ class CompilationConfig:
 
         对齐 vLLM 的同名接口，由 NanovllmConfig._set_cudagraph_sizes() 在
         推导默认尺寸、去重和按 Scheduler 容量过滤后调用。
-        这里不推导默认值，也不替调用方修改最大捕获尺寸。
+        这里不推导默认值、不逐项校验尺寸类型与正值，也不修改最大捕获尺寸。
         上游还会在此解析 compile_sizes；当前项目尚未支持该字段，暂时省略。
 
         例如捕获尺寸为 [8, 1, 4]、最大尺寸为 8，调用后列表变为 [1, 4, 8]。
@@ -210,6 +220,8 @@ class CompilationConfig:
         Returns:
             最终配置策略，与回写的 cudagraph_mode 一致；组合策略仍需由
             Dispatcher 根据每轮 batch 选择具体运行模式。
+            当前 FA2 声明 UNIFORM_BATCH，因此 FULL 会降级为 FULL_DECODE_ONLY，
+            已设置的 FULL_DECODE_ONLY 则保留。
 
         Side Effects:
             回写 cudagraph_mode，自动降级时记录 warning；捕获尺寸保持原值。

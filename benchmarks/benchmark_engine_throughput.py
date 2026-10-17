@@ -9,7 +9,13 @@ from contextlib import contextmanager
 from collections.abc import Generator
 import torch
 from nanovllm import LLM,SamplingParams
-from nanovllm.config import ParallelConfig
+from nanovllm.config import (
+    CacheConfig,
+    ModelConfig,
+    NanovllmConfig,
+    ParallelConfig,
+    SchedulerConfig,
+)
 from nanovllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -42,6 +48,9 @@ class BenchmarkConfig:
     max_tokens: int  # 每个请求最多生成多少 token。
     temperature:float # 采样温度。
     enforce_eager: bool  # 是否关闭 CUDA graph，便于调试。
+    max_model_len: int  # 单请求上下文上限，同时决定 Runner 请求行的固定容量。
+    max_num_batched_tokens: int  # 单轮调度与 profiling 使用的 token 预算。
+    gpu_memory_utilization: float  # 模型、激活、Graph 和 KV 共用的设备总显存预算比例。
 
 @dataclass
 class BenchmarkStats:
@@ -51,8 +60,7 @@ class BenchmarkStats:
     num_finished:int =0 # 已完成的请求数
     num_input_tokens:int =0 #所有提示词token数之和
     num_output_tokens:int =0 # 所有 completion token 数之和
-    num_prefill_tokens:int =0 # engine step 返回的 prefill token数累计
-    num_decode_tokens:int =0 # engine step 返回的 decode token数累计
+    num_scheduled_tokens: int = 0  # step() 返回的真实调度 token 总数，含混合 batch。
     num_engine_steps:int =0 # 调用了多少次llm.step()
 
 def parse_args()->BenchmarkConfig:
@@ -99,7 +107,23 @@ def parse_args()->BenchmarkConfig:
         action="store_true",
         help="开启后禁用 CUDA graph，调试更直观但可能更慢。",
     )
+    parser.add_argument(
+        "--max-model-len", type=int, default=4096,
+        help="每请求的 prompt 与 output 总长度上限。",
+    )
+    parser.add_argument(
+        "--max-num-batched-tokens", type=int, default=256,
+        help="单轮真实 token 预算；长 prompt 使用 chunked prefill。",
+    )
+    parser.add_argument(
+        "--gpu-memory-utilization", type=float, default=0.9,
+        help="当前实例占设备总显存的预算比例。",
+    )
     args=parser.parse_args()
+    # 先拒绝无有效工作量的命令，避免空循环或直到加载模型后才暴露参数错误。
+    for name in ("num_prompts", "max_active", "max_tokens"):
+        if getattr(args, name) <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
     return BenchmarkConfig(
         model_path=args.model_path,
         dataset_path=args.dataset_path,
@@ -108,6 +132,9 @@ def parse_args()->BenchmarkConfig:
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         enforce_eager=args.enforce_eager,
+        max_model_len=args.max_model_len,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        gpu_memory_utilization=args.gpu_memory_utilization,
     )
 
 '''
@@ -147,11 +174,12 @@ def load_prompts(config:BenchmarkConfig,tokenizer:AutoTokenizer)->list[str]:
     for example in selected_dataset:
         user_prompt = build_alpaca_prompt(example=example)
 
-        # nano-vLLM 内部会自己 encode 字符串；这里先套 chat template
+        # 关闭 Qwen3 thinking，让较短 output 预算也能用于普通回答负载。
         chat_prompt = tokenizer.apply_chat_template(
             [{"role":"user","content":user_prompt}],
             tokenize=False,
-            add_generation_prompt=True
+            add_generation_prompt=True,
+            enable_thinking=False,
         )
         prompts.append(chat_prompt)
     return prompts
@@ -170,9 +198,9 @@ def submit_requests(
     # 当 engine 里未完成请求不足时，继续从 prompt 列表里补新请求。
     while next_prompt_idx < len(prompts) and num_active<max_active:
         prompt = prompts[next_prompt_idx]
-        # 直接在这里先编码
+        # 同一份 token IDs 同时用于请求输入和逻辑输入量统计，避免重复编码。
         prompts_token_ids = llm.tokenizer.encode(prompt)
-        llm.add_request(prompt=prompt,sampling_params=sampling_params)
+        llm.add_request(prompt=prompts_token_ids,sampling_params=sampling_params)
 
         stats.num_submitted+=1
         stats.num_input_tokens+=len(prompts_token_ids)
@@ -190,6 +218,8 @@ def run_benchmark(config:BenchmarkConfig)->None:
     logger.info("Loading Alpaca prompts from %s",config.dataset_path)
     with nvtx_range("load_prompts"):
         prompts=load_prompts(config,tokenizer=tokenizer)
+    if not prompts:
+        raise ValueError("The dataset must contain at least one prompt")
 
     logger.info(
         "Initializing LLM: model=%s num_prompts=%d max_active=%d max_tokens=%d",
@@ -199,51 +229,38 @@ def run_benchmark(config:BenchmarkConfig)->None:
         config.max_tokens,
     )
     with nvtx_range("init_llm"):
-        llm=LLM(
-            config.model_path,
-            enforce_eager=config.enforce_eager,
+        # BenchmarkConfig 保存脚本选项；Engine 只接收已经组装好的完整推理配置。
+        vllm_config = NanovllmConfig(
+            model_config=ModelConfig(
+                model=config.model_path,
+                enforce_eager=config.enforce_eager,
+                max_model_len=config.max_model_len,
+            ),
             parallel_config=ParallelConfig(tensor_parallel_size=1),
+            # 脚本并发上限同时约束 Runner 的行容量和 FULL decode 捕获尺寸。
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=config.max_active,
+                max_num_batched_tokens=config.max_num_batched_tokens,
+            ),
+            cache_config=CacheConfig(
+                gpu_memory_utilization=config.gpu_memory_utilization,
+            ),
         )
-    sampling_params = SamplingParams(
-        temperature=config.temperature,
-        max_tokens=config.max_tokens,
-    )
-    stats = BenchmarkStats()
-    next_prompt_idx=0
-    num_active=0
-    last_reported_finished = 0
-    start_time = perf_counter()
-
-    # 先塞入第一批请求；否则 engine 为空时直接 step 会触发 scheduler 的 assert。
-    with nvtx_range("submit_initial_requests"):
-        next_prompt_idx,num_active=submit_requests(
-            llm=llm,
-            prompts=prompts,
-            sampling_params=sampling_params,
-            stats=stats,
-            max_active=config.max_active,
-            next_prompt_idx=next_prompt_idx,
-            num_active=num_active
+        llm = LLM(vllm_config=vllm_config)
+    try:
+        sampling_params = SamplingParams(
+            temperature=config.temperature,
+            max_tokens=config.max_tokens,
         )
-    with nvtx_range("benchmark_loop"):
-        while next_prompt_idx<len(prompts) or not llm.is_finished():
-            step_outputs,num_tokens=llm.step()
-            stats.num_engine_steps+=1
+        stats = BenchmarkStats()
+        next_prompt_idx = 0  # 下一个待提交的输入下标。
+        num_active = 0  # 已提交但尚未收到完成结果的请求数。
+        last_reported_finished = 0  # 防止同一完成数在多个 step 重复输出进度。
+        # 只测请求提交和执行；模型加载、profiling、预热及捕获已经完成。
+        start_time = perf_counter()
 
-            # 这个正负的规则是nano-vllm定的
-            # num_tokens > 0 表示本轮是 prefill；num_tokens < 0 表示本轮是 decode。
-            if num_tokens > 0:
-                stats.num_prefill_tokens += num_tokens
-            else:
-                stats.num_decode_tokens += -num_tokens
-
-            # step_outputs 只包含本轮完成的请求；token_ids 是 completion 部分。
-            for _, completion_token_ids in step_outputs:
-                stats.num_finished += 1
-                stats.num_output_tokens += len(completion_token_ids)
-                num_active -= 1
-
-            # 有请求完成后，继续补新请求，维持持续压测。
+        # 首批请求先入队，后续每完成一批便补充请求，维持持续负载。
+        with nvtx_range("submit_initial_requests"):
             next_prompt_idx, num_active = submit_requests(
                 llm=llm,
                 prompts=prompts,
@@ -253,36 +270,60 @@ def run_benchmark(config:BenchmarkConfig)->None:
                 next_prompt_idx=next_prompt_idx,
                 num_active=num_active,
             )
-            # 每完成一小段打印一次进度，避免长时间运行时不知道卡在哪里。
-            if (
-                stats.num_finished
-                and stats.num_finished % 32 == 0
-                and stats.num_finished != last_reported_finished
-            ):
-                logger.info(
-                    "Progress: finished=%d/%d active=%d submitted=%d",
-                    stats.num_finished,
-                    len(prompts),
-                    num_active,
-                    stats.num_submitted,
-                )
-                last_reported_finished = stats.num_finished
-    elapsed = perf_counter() - start_time
-    total_tokens = stats.num_input_tokens + stats.num_output_tokens
+        with nvtx_range("benchmark_loop"):
+            while next_prompt_idx < len(prompts) or not llm.is_finished():
+                step_outputs, num_tokens = llm.step()
+                stats.num_engine_steps += 1
+                # 连续批处理允许 prefill/decode 混合；step() 返回非负的真实总量。
+                stats.num_scheduled_tokens += num_tokens
 
-    logger.info("Benchmark finished.")
-    logger.info("num_prompts: %d", len(prompts))
-    logger.info("num_submitted: %d", stats.num_submitted)
-    logger.info("num_finished: %d", stats.num_finished)
-    logger.info("num_engine_steps: %d", stats.num_engine_steps)
-    logger.info("input_tokens: %d", stats.num_input_tokens)
-    logger.info("output_tokens: %d", stats.num_output_tokens)
-    logger.info("prefill_tokens_by_engine: %d", stats.num_prefill_tokens)
-    logger.info("decode_tokens_by_engine: %d", stats.num_decode_tokens)
-    logger.info("elapsed: %.3f s", elapsed)
-    logger.info("requests/s: %.3f", stats.num_finished / elapsed)
-    logger.info("total_tokens/s: %.3f", total_tokens / elapsed)
-    logger.info("output_tokens/s: %.3f", stats.num_output_tokens / elapsed)
+                # 完成结果包含实际生成 token，EOS 提前结束时也据实计数。
+                for _, completion_token_ids in step_outputs:
+                    stats.num_finished += 1
+                    stats.num_output_tokens += len(completion_token_ids)
+                    num_active -= 1
+
+                # 输出处理已释放完成请求的 KV 资源，下一步可以接纳新请求。
+                next_prompt_idx, num_active = submit_requests(
+                    llm=llm,
+                    prompts=prompts,
+                    sampling_params=sampling_params,
+                    stats=stats,
+                    max_active=config.max_active,
+                    next_prompt_idx=next_prompt_idx,
+                    num_active=num_active,
+                )
+                if (
+                    stats.num_finished
+                    and stats.num_finished % 32 == 0
+                    and stats.num_finished != last_reported_finished
+                ):
+                    logger.info(
+                        "Progress: finished=%d/%d active=%d submitted=%d",
+                        stats.num_finished, len(prompts), num_active, stats.num_submitted,
+                    )
+                    last_reported_finished = stats.num_finished
+        elapsed = perf_counter() - start_time
+        # 最后的结束通知仍须下发给 Worker；清理耗时不纳入请求吞吐统计。
+        llm.step()
+        # 逻辑输入量包含命中 prefix cache 的 token，不等同于实际计算量。
+        total_tokens = stats.num_input_tokens + stats.num_output_tokens
+
+        logger.info("Benchmark finished.")
+        logger.info("num_prompts: %d", len(prompts))
+        logger.info("num_submitted: %d", stats.num_submitted)
+        logger.info("num_finished: %d", stats.num_finished)
+        logger.info("num_engine_steps: %d", stats.num_engine_steps)
+        logger.info("input_tokens: %d", stats.num_input_tokens)
+        logger.info("output_tokens: %d", stats.num_output_tokens)
+        logger.info("scheduled_tokens: %d", stats.num_scheduled_tokens)
+        logger.info("elapsed: %.3f s", elapsed)
+        logger.info("requests/s: %.3f", stats.num_finished / elapsed)
+        logger.info("total_tokens/s: %.3f", total_tokens / elapsed)
+        logger.info("output_tokens/s: %.3f", stats.num_output_tokens / elapsed)
+    finally:
+        # 直接使用 add_request/step 的脚本也必须显式释放执行资源和通信组。
+        llm.close()
 
 def main() -> None:
     """benchmark 脚本入口。"""

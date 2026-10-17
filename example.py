@@ -4,7 +4,12 @@ import argparse
 import os
 
 from nanovllm import LLM, SamplingParams
-from nanovllm.config import CacheConfig
+from nanovllm.config import (
+    CacheConfig,
+    ModelConfig,
+    NanovllmConfig,
+    SchedulerConfig,
+)
 from nanovllm.logger import init_logger
 from transformers import AutoTokenizer
 
@@ -25,15 +30,21 @@ def main() -> None:
     os.environ.setdefault("VLLM_HOST_IP", "127.0.0.1")
     logger.info("Loading tokenizer from %s", path)
     tokenizer = AutoTokenizer.from_pretrained(path)
-    logger.info("Initializing LLM")
-    llm = LLM(
-        path,
-        enforce_eager=not args.cuda_graph,
-        max_model_len=1024,
-        max_num_batched_tokens=256,
-        max_num_seqs=4,
+    # 各领域参数先由对应子配置解析，再聚合成贯穿 Engine 和 Worker 的总配置。
+    vllm_config = NanovllmConfig(
+        model_config=ModelConfig(
+            model=path,
+            enforce_eager=not args.cuda_graph,
+            max_model_len=1024,
+        ),
+        scheduler_config=SchedulerConfig(
+            max_num_batched_tokens=256,
+            max_num_seqs=4,
+        ),
         cache_config=CacheConfig(gpu_memory_utilization=args.gpu_memory_utilization),
     )
+    logger.info("Initializing LLM")
+    llm = LLM(vllm_config=vllm_config)
     try:
         sampling_params = SamplingParams(temperature=0.6, max_tokens=args.max_tokens)
         prompts = ["introduce yourself", "list all prime numbers within 100"]

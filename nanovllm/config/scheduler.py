@@ -14,12 +14,15 @@ class SchedulerConfig:
     pipeline parallel 相关的配置项。
 
     Attributes:
-        max_num_batched_tokens: 单次 ``SchedulerOutput`` 最多调度的 token 总数。
-            一个请求的 prefill 可以跨多个 step 被分块提交。
-        max_num_seqs: 一个 step 最多同时驻留在连续 batch 中的 request 数。
+        max_num_batched_tokens: 单次 SchedulerOutput 最多调度的真实 token 总数。
+            一个请求的 prefill 可以跨多个 step 分块提交；Runner 同时用它确定
+            token 输入 buffer 的固定容量，总配置据此限制 Graph 捕获尺寸。
+        max_num_seqs: 同时处于 running batch 的请求数上限，不限制 waiting 队列
+            长度或一次 generate() 能提交的请求总数。Runner 用它分配 InputBatch
+            行槽位、block table 和请求级 metadata，Graph 分派也受该容量约束。
     """
 
-    # 保留项目原有默认值，避免纯配置重构改变 benchmark 的默认执行规模。
+    # Scheduler 的单轮真实 token 预算，也是 Runner token buffer 的容量上限。
     max_num_batched_tokens: int = 16384
     # 该限制既约束 Scheduler.running，也决定 InputBatch 的固定槽位数量。
     max_num_seqs: int = 512
@@ -28,7 +31,7 @@ class SchedulerConfig:
         """校验不依赖模型结构的 batch 容量约束。
 
         Raises:
-            ValueError: token 预算或 request 容量不是正整数时抛出。
+            ValueError: token 预算或 request 容量非正时抛出。
         """
         # 每轮没有 token 预算便无法形成合法的模型输入。
         if self.max_num_batched_tokens <= 0:
@@ -43,6 +46,7 @@ class SchedulerConfig:
         当前 Scheduler 始终允许 chunked prefill，因此 ``max_num_batched_tokens``
         可以小于 ``max_model_len``：长 prompt 会拆到多个 step 处理。每个活跃
         request 至少需要一个 token 预算，故 token 预算不能小于 request 上限。
+        本方法由 NanovllmConfig 构造时调用，只检查关系，不修改已有容量值。
 
         Args:
             max_model_len: ``ModelConfig`` 已经根据模型位置编码收紧后的上下文上限。

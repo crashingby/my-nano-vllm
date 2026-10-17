@@ -2,6 +2,7 @@ import os
 import time
 from random import randint, seed
 from nanovllm import LLM, SamplingParams
+from nanovllm.config import ModelConfig, NanovllmConfig
 # from vllm import LLM, SamplingParams
 
 
@@ -12,7 +13,15 @@ def main():
     max_ouput_len = 1024
 
     path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-    llm = LLM(path, enforce_eager=False, max_model_len=4096)
+    # 模型执行选项由 ModelConfig 管理，其余领域沿用总配置的独立默认值。
+    vllm_config = NanovllmConfig(
+        model_config=ModelConfig(
+            model=path,
+            enforce_eager=False,
+            max_model_len=4096,
+        ),
+    )
+    llm = LLM(vllm_config=vllm_config)
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
     sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_ouput_len)) for _ in range(num_seqs)]

@@ -16,6 +16,7 @@ from collections.abc import Callable
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any, TypeVar
 
+from nanovllm.distributed import cleanup_dist_env_and_memory
 from nanovllm.executor.abstract import Executor
 from nanovllm.worker.worker_base import WorkerBase, WorkerWrapperBase
 from nanovllm.logger import init_logger
@@ -53,7 +54,8 @@ class UniProcExecutor(Executor):
         Side Effects:
             保存 driver_worker，初始化设备与 world / TP group，采集显存基线、
             创建 Runner 并加载模型权重。返回后可查询 KV 规格和执行显存 profiling，
-            正式 KV cache 尚未分配；任一步骤的异常直接向上传播。
+            正式 KV cache 尚未分配。Worker 构造、设备初始化或权重加载失败时，
+            先关闭已创建的 Worker 并清理本进程分布式环境，再重新抛出原始异常。
         """
         # driver_worker 保存包装端点；两个编号均为 0，不由实际 CUDA device index 决定。
         self.driver_worker = WorkerWrapperBase(
@@ -71,12 +73,27 @@ class UniProcExecutor(Executor):
             distributed_init_method=distributed_init_method,
             is_driver_worker=True,
         )
-        # Wrapper 按 rpc_rank=0 从列表中选择 kwargs；此时 Worker 只保存公共状态。
-        self.driver_worker.init_worker(all_kwargs=[kwargs])
-        # 先绑定设备、建立通信组与显存基线，再创建 GPUModelRunner。
-        self.driver_worker.init_device()
-        # 模型加载由 Wrapper 转发给 GPU Worker，后者负责模型构建的配置上下文。
-        self.driver_worker.load_model()
+        try:
+            # Wrapper 按 rpc_rank=0 从列表中选择 kwargs；此时 Worker 只保存公共状态。
+            self.driver_worker.init_worker(all_kwargs=[kwargs])
+            # 先绑定设备、建立通信组与显存基线，再创建 GPUModelRunner。
+            self.driver_worker.init_device()
+            # 模型加载由 Wrapper 转发给 GPU Worker，后者负责模型构建的配置上下文。
+            self.driver_worker.load_model()
+        except BaseException:
+            # 构造未返回时，Engine 尚未取得 Executor，也没有注册退出回调。
+            # 本地执行器仍持有 Wrapper，因此在这里先释放可能已创建的 Runner 资源。
+            try:
+                self.shutdown()
+            except Exception:
+                # 清理失败单独记录，保留显存预算不足等原始启动错误及其 traceback。
+                logger.exception("Failed to shut down Worker after initialization failure")
+            # 即使 Worker 清理失败，也继续销毁已经创建的 TP/WORLD/NCCL 进程组。
+            try:
+                cleanup_dist_env_and_memory()
+            except Exception:
+                logger.exception("Failed to clean up distributed state after initialization failure")
+            raise
 
     # 保留原有的回环端口 helper；当前启动路径使用 network_utils.get_open_port()。
     @staticmethod

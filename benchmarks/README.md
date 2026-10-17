@@ -16,8 +16,7 @@
 - **Request throughput**：请求吞吐，单位是 `req/s`，表示每秒完成多少个请求。
 - **Output token throughput**：输出 token 吞吐，单位是 `tok/s`，只统计生成出来的 completion token。
 - **Total token throughput**：总 token 吞吐，单位是 `tok/s`，统计 prompt token 和 output token 之和。
-- **Prefill tokens**：prefill 阶段处理的 prompt token 数。nano-vLLM 当前用 `num_tokens > 0` 表示一次 prefill step。
-- **Decode tokens**：decode 阶段处理的 token 数。nano-vLLM 当前用 `num_tokens < 0` 表示一次 decode step，数值取反后代表本轮 decode token 数。
+- **Scheduled tokens**：`step()` 返回的真实调度 token 数之和，包含混合 batch、chunked prefill 和可能的重算；不包含 CUDA Graph padding。当前不按正负号区分 prefill/decode。
 - **TTFT**：Time To First Token，首 token 延迟，表示请求提交后多久生成第一个 token。当前脚本暂未统计。
 - **TPOT**：Time Per Output Token，首 token 之后的平均逐 token 时间。当前脚本暂未统计。
 - **ITL**：Inter-Token Latency，相邻输出 token 之间的间隔。当前脚本暂未统计。
@@ -30,7 +29,7 @@
 ### 测试目标
 
 - 观察 Engine 在固定最大活跃请求数下的整体吞吐。
-- 观察 prefill token、decode token、完成请求数和 engine step 数之间的关系。
+- 观察逻辑输入量、实际调度 token 量、生成 token 量和 engine step 数之间的关系。
 - 为后续分析 scheduler、KV cache、CUDA graph 和 kernel launch 开销提供基础数据。
 
 ### 执行流程
@@ -41,7 +40,7 @@ flowchart TD
     B --> C["初始化 LLM 和 SamplingParams"]
     C --> D["提交第一批请求到 scheduler"]
     D --> E["循环调用 llm.step"]
-    E --> F["统计 prefill / decode token"]
+    E --> F["累计真实调度 token"]
     F --> G["记录完成请求和输出 token"]
     G --> H{"还有待提交请求或运行中请求?"}
     H -- "是" --> I["补充新请求，维持 max_active"]
@@ -59,38 +58,49 @@ flowchart TD
 /home/huangxy/datasets/alpaca/data/train-00000-of-00001-a09b74b3ef9c3b56.parquet
 ```
 
-每条样本使用 `instruction` 和 `input` 构造用户 prompt，然后通过模型 tokenizer 的 `apply_chat_template()` 转成 Qwen3 chat 格式。
+每条样本使用 `instruction` 和 `input` 构造用户 prompt，再通过 tokenizer 的 `apply_chat_template()` 转成 Qwen3 chat 格式。当前关闭 thinking，生成预算用于普通回答。
 
 ### 运行命令
 
-小规模冒烟测试：
+在项目根目录激活 `nano-vllm` 环境。模型和数据集使用上面的本地默认路径。
+先用 4 条请求、2 个并发槽位和最多 8 个输出 token 做冒烟测试：
 
 ```shell
-python benchmarks/benchmark_engine_throughput.py \
-  --num-prompts 1 \
-  --max-active 1 \
-  --max-tokens 1 \
+conda activate nano-vllm
+VLLM_HOST_IP=127.0.0.1 python -m benchmarks.benchmark_engine_throughput \
+  --num-prompts 4 \
+  --max-active 2 \
+  --max-tokens 8 \
+  --max-model-len 1024 \
+  --max-num-batched-tokens 256 \
+  --gpu-memory-utilization 0.5 \
   --enforce-eager
 ```
 
 常规吞吐测试：
 
 ```shell
-python benchmarks/benchmark_engine_throughput.py \
+VLLM_HOST_IP=127.0.0.1 python -m benchmarks.benchmark_engine_throughput \
   --num-prompts 128 \
   --max-active 16 \
   --max-tokens 128 \
+  --gpu-memory-utilization 0.5 \
   --enforce-eager
 ```
 
 测试 CUDA graph 路径时去掉 `--enforce-eager`：
 
 ```shell
-python benchmarks/benchmark_engine_throughput.py \
+VLLM_HOST_IP=127.0.0.1 python -m benchmarks.benchmark_engine_throughput \
   --num-prompts 128 \
   --max-active 16 \
-  --max-tokens 128
+  --max-tokens 128 \
+  --gpu-memory-utilization 0.5
 ```
+
+`--max-active` 同时写入 SchedulerConfig.max_num_seqs，因此小并发命令也会减小
+Runner 请求容量及 FULL decode 捕获范围。`--max-num-batched-tokens` 控制 token
+buffer 和 profiling 容量，必须不小于 `--max-active`；较长 prompt 可分块执行。
 
 ### 参数说明
 
@@ -99,31 +109,17 @@ python benchmarks/benchmark_engine_throughput.py \
 | `--model-path` | `/home/huangxy/models/Qwen3-0.6B` | 本地 Hugging Face 模型目录。 |
 | `--dataset-path` | `/home/huangxy/datasets/alpaca/data/train-00000-of-00001-a09b74b3ef9c3b56.parquet` | 本地 Alpaca parquet 文件路径。 |
 | `--num-prompts` | `128` | 本次最多读取并执行多少条 prompt。 |
-| `--max-active` | `16` | Engine 内同时保持的最大未完成请求数。 |
+| `--max-active` | `16` | 最大活跃请求数，同时作为 Scheduler 和 Runner 的请求槽位容量。 |
 | `--max-tokens` | `128` | 每条请求最多生成多少 output token。 |
 | `--temperature` | `0.6` | 采样温度。 |
 | `--enforce-eager` | 关闭 | 开启后禁用 CUDA graph，便于调试和 profiling，但 decode 性能通常更低。 |
+| `--max-model-len` | `4096` | 单请求的 prompt 与 output 总长度上限。 |
+| `--max-num-batched-tokens` | `256` | 单轮真实 token 预算及 Runner token buffer 容量。 |
+| `--gpu-memory-utilization` | `0.9` | 当前实例的预算占 GPU 总显存的比例，包含权重、激活、Graph 和 KV。 |
 
 ### 输出指标
 
-脚本结束后会输出：
-
-```shell
-num_prompts: 128
-num_submitted: 128
-num_finished: 128
-num_engine_steps: 1032
-input_tokens: 3225
-output_tokens: 16335
-prefill_tokens_by_engine: 3225
-decode_tokens_by_engine: 16207
-elapsed: 38.781 s
-requests/s: 3.301
-total_tokens/s: 504.375
-output_tokens/s: 421.215
-```
-
-其中：
+脚本结束后输出以下统计：
 
 - `num_prompts` 表示本次加载的 prompt 数。
 - `num_submitted` 表示实际提交给 engine 的请求数。
@@ -131,14 +127,16 @@ output_tokens/s: 421.215
 - `num_engine_steps` 表示调用 `llm.step()` 的次数。
 - `input_tokens` 表示所有 prompt token 数之和。
 - `output_tokens` 表示所有 completion token 数之和。
-- `prefill_tokens_by_engine` 表示 prefill step 处理的 token 数累计。
-- `decode_tokens_by_engine` 表示 decode step 处理的 token 数累计。
-- `elapsed` 表示从提交第一批请求到全部请求完成的耗时，不包含 tokenizer 和模型初始化阶段。
+- `scheduled_tokens` 表示各轮真实执行 token 数之和；不包含 Graph padding，也不强行拆分混合 batch 的 prefill/decode。
+- `elapsed` 表示从提交第一批请求到全部请求完成的耗时，不包含数据集和模型加载、启动 profiling、预热、Graph 捕获或最后的 Worker 清理。
 - `requests/s` 表示完成请求数除以 `elapsed`。
 - `total_tokens/s` 表示 `(input_tokens + output_tokens) / elapsed`。
 - `output_tokens/s` 表示 `output_tokens / elapsed`。
 
-注意：`output_tokens` 通常会比 `decode_tokens_by_engine` 多出 `num_finished` 左右，因为 nano-vLLM 当前会在 prefill 结束后采样第一个 output token，后续 token 才来自 decode step。
+`input_tokens` 是逻辑 prompt 长度，即使命中 prefix cache 也会计入；`output_tokens`
+包含最后一个已采样、尚未再次 forward 的 token。因此 `input_tokens + output_tokens`
+不等于 `scheduled_tokens`，实际调度量还会受到 prefix cache 复用与抢占重算影响。
+脚本在结束或异常时显式关闭 Engine。
 
 ## 当前限制
 

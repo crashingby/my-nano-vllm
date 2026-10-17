@@ -1,4 +1,4 @@
-"""文本生成模型的静态配置。"""
+"""本地文本生成模型的路径、HF 结构和执行精度配置。"""
 
 from __future__ import annotations
 
@@ -18,15 +18,18 @@ if TYPE_CHECKING:
 class ModelConfig:
     """描述一个已选择语言模型的结构和执行方式。
 
-    当前 nano-vLLM 只支持本地 Hugging Face decoder-only 文本模型。因此本类不
-    包含 vLLM 完整版本中的量化、LoRA、多模态、pooling 或 tokenizer 策略。模型
-    路径对应的 ``hf_config`` 会在构造时读取，但不会在这里加载模型权重。
+    当前模型注册表只接入本地 Hugging Face Qwen3 decoder-only 文本模型。
+    构造时读取 hf_config、解析 dtype，并按位置编码长度收紧 max_model_len；
+    不创建模型层、不加载权重、不初始化 CUDA。量化、LoRA、多模态、pooling
+    和独立 tokenizer 策略尚未接入。
 
     Attributes:
         model: 本地 Hugging Face 模型目录。
         max_model_len: 单个请求允许的最大总 token 数，包含 prompt 与生成 token。
             构造后会受模型位置编码长度限制。
-        enforce_eager: 是否禁用 CUDA Graph 并始终使用 eager 执行。
+        enforce_eager: 是否关闭模型 forward 的 CUDA Graph 捕获与回放。
+            NanovllmConfig 会据此将 Graph 模式解析为 NONE；局部层已有的
+            @torch.compile、Triton JIT 以及启动时的内核和采样预热仍会执行。
         dtype: 参数与浮点计算精度；输入为 auto、half/float16、bfloat16、
             float/float32 或相应 torch.dtype，构造后统一为 torch.dtype。
             auto 保留声明的 FP16/BF16；FP32 或未声明时选择 FP16。当前暂不做
@@ -39,7 +42,7 @@ class ModelConfig:
     model: str
     # 该上限同时约束 Scheduler 接纳请求和 Worker 侧固定容量输入 buffer。
     max_model_len: int = 4096
-    # eager 模式是模型执行策略，不属于 Scheduler 的 token 预算策略。
+    # 禁用 CUDA Graph；不等价于关闭局部函数编译、Triton JIT 或内核预热。
     enforce_eager: bool = False
     # HF 只提供 auto 的候选精度，运行时消费者统一读取这个已解析的字段。
     dtype: str | torch.dtype = "auto"
@@ -55,7 +58,7 @@ class ModelConfig:
             不会创建 torch.nn.Module 或加载权重。
 
         Raises:
-            ValueError: 模型目录不存在、max_model_len 非正整数或 dtype 不支持。
+            ValueError: 模型目录不存在、max_model_len 非正或 dtype 不支持。
         """
         # nano-vLLM 当前不负责 Hub 下载，因此启动前必须确保模型已位于本地。
         if not os.path.isdir(self.model):
@@ -98,7 +101,7 @@ class ModelConfig:
         Raises:
             ValueError: 当前模型配置没有有效的正整数 ``vocab_size`` 时抛出。
         """
-        # 模型层、InputBatch 和未来 TP vocab parallel 都依赖这一稳定结构信息。
+        # 词表并行层、InputBatch 和采样负载均使用同一个全局词表大小。
         vocab_size = getattr(self.hf_config, "vocab_size", None)
         if not isinstance(vocab_size, int) or vocab_size <= 0:
             raise ValueError(
@@ -118,6 +121,7 @@ class ModelConfig:
         Returns:
             单个 rank 负责的 Query head 数，不是 KV head 数。
         """
+        # 这里只读取结构并计算分片数量，执行器支持范围由 Executor.get_class() 检查。
         num_heads = self.hf_config.num_attention_heads
         return num_heads // parallel_config.tensor_parallel_size
 
