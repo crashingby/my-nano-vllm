@@ -20,6 +20,9 @@ dependencies = [
     "ninja", # 为按需编译 LibTorch 扩展提供构建工具。
 ]
 
+[project.optional-dependencies]
+benchmark = ["pyarrow"] # Alpaca 本地 Parquet 读取；LongBench JSONL 只使用标准库。
+
 [project.urls]
 Homepage="https://github.com/GeeeekExplorer/nano-vllm"
 
