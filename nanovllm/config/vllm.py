@@ -15,6 +15,7 @@ from typing import TypeVar
 from nanovllm.config.cache import CacheConfig
 from nanovllm.config.compilation import CUDAGraphMode, CompilationConfig
 from nanovllm.config.device import DeviceConfig
+from nanovllm.config.kernel import KernelConfig
 from nanovllm.config.load import LoadConfig
 from nanovllm.config.model import ModelConfig
 from nanovllm.config.parallel import ParallelConfig
@@ -50,6 +51,7 @@ class NanovllmConfig:
             当前 FA2 路径支持 FULL decode 与其他 batch 的普通执行。
         load_config: checkpoint 加载格式、加载进度显示及可选目标设备。
         device_config: 模型执行设备描述；具体 GPU 由 Worker 按 local_rank 绑定。
+        kernel_config: 各模型层在构造时绑定的算子实现，例如 SiLU × Mul 的后端。
     """
 
     # 模型配置必须显式提供，因为其中的 model 路径没有合理默认值。
@@ -70,6 +72,8 @@ class NanovllmConfig:
     load_config: LoadConfig = field(default_factory=LoadConfig)
     # 每个 Engine 独立持有设备配置，配置构造不会探测或初始化 CUDA。
     device_config: DeviceConfig = field(default_factory=DeviceConfig)
+    # 后端选择随 Engine 独立保存，模型层读取后绑定函数，不改全局 IR 默认策略。
+    kernel_config: KernelConfig = field(default_factory=KernelConfig)
 
     def __post_init__(self) -> None:
         """在总配置构造时检查容量，并完成后端无关的 Graph 配置解析。

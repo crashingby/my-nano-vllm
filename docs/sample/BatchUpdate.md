@@ -28,7 +28,7 @@ logits processor 的状态也必须做完全相同的更新**。如果 processor
 2. 让 `InputBatch` 能即时取得最小空槽位并复用它。
 3. 在模型前向前构造一个 `BatchUpdate`，一次性交给所有 processor 同步状态。
 
-它位于 [nanovllm/sample/logits_processor/state.py](/home/huangxy/Projects/my-nano-vllm/nanovllm/sample/logits_processor/state.py)，通信协议定义在 [interface.py](/home/huangxy/Projects/my-nano-vllm/nanovllm/sample/logits_processor/interface.py)。当前 nano-vLLM 尚未把它接入 `InputBatch` 和采样器；本笔记描述的是接入时应遵守的契约。
+它位于 [nanovllm/sample/logits_processor/state.py](../../nanovllm/sample/logits_processor/state.py)，通信协议定义在 [interface.py](../../nanovllm/sample/logits_processor/interface.py)。当前 `InputBatch` 已记录槽位事件，在 `refresh_metadata()` 中将其交给 processor；`Sampler` 已保留 processor 的执行入口，默认容器为空。
 
 ## 三个对象的分工
 
@@ -63,7 +63,7 @@ class MoveDirectionality(Enum):
 | `UNIDIRECTIONAL` | `(source_index, target_index, UNIDIRECTIONAL)` | 将源槽位请求单向搬到目标槽位。源槽位之后为空或落在逻辑 batch 之外。 |
 | `SWAP` | `(index_a, index_b, SWAP)` | 交换两个仍然存活的槽位。两个请求的 processor 状态也必须同时交换。 |
 
-当前最常见的是 `UNIDIRECTIONAL`：一个中间请求完成后，把末尾仍活跃的请求搬到中间，令活跃请求继续占据 `[0, batch_size)` 这个连续前缀。`SWAP` 是完整协议的一部分，目前 MVP 可以暂时没有实际调用点。
+当前最常见的是 `UNIDIRECTIONAL`：一个中间请求完成后，把末尾仍活跃的请求搬到中间，令活跃请求继续占据 `[0, batch_size)` 这个连续前缀。`InputBatch.swap_states()` 也会记录 `SWAP`，但常规槽位压缩使用单向移动。
 
 ### 事件类型
 
@@ -386,14 +386,13 @@ assert batch_update is None
 
 换句话说，`BatchUpdate` 描述的是**布局变化**，不描述每轮普通 decode 产生的 token。
 
-## 接入 `InputBatch` 时的最小调用位置
+## `InputBatch` 中的调用位置
 
-后续修改 `InputBatch` 时，建议由它持有一个 `BatchUpdateBuilder`：
+`InputBatch` 持有一个 `BatchUpdateBuilder`，在请求布局变化时写入事件：
 
 ```python
-class InputBatch:
-    def __init__(self, ...) -> None:
-        self.batch_update_builder = BatchUpdateBuilder()
+# InputBatch.__init__() 中创建本实例的事件收集器。
+self.batch_update_builder = BatchUpdateBuilder()
 ```
 
 对应关系应当是：
@@ -414,7 +413,7 @@ SchedulerOutput
     -> builder.get_and_reset(当前 batch_size)
     -> 每个 logits_processor.update_state(batch_update)
     -> Model forward 得到 logits
-    -> 每个 logits_processor.apply(logits)
+    -> Sampler 在 temperature 缩放前后执行对应组的 processor.apply(logits)
     -> Sampler 选择 sampled token
 ```
 
@@ -422,11 +421,7 @@ SchedulerOutput
 
 ## 当前 MVP 的边界
 
-当前代码已具备协议与状态收集器，但尚未实现以下内容：
-
-- `InputBatch` 尚未持有并调用 `BatchUpdateBuilder`。
-- 没有具体 `LogitsProcessor`，因此尚无 repetition penalty、min tokens、logit bias、grammar 等采样规则。
-- `Sampler` 仍直接根据 logits 和 temperature 选择 token，未调用 `LogitsProcessors`。
-- `SWAP` 已作为协议保留，但还没有实际的 `InputBatch` 槽位交换实现。
-
-因此下一阶段不是立刻实现复杂采样，而是先让 `InputBatch` 的删除、插入、压缩路径准确地产生 `removed`、`added`、`moved`，并在 ModelRunner 前向前把 `BatchUpdate` 传给一个暂时为空的 `LogitsProcessors` 容器。这样接口和状态流先稳定下来，具体采样 feature 可以逐个接入。
+- `InputBatch` 的删除、插入、交换与压缩已产生 `removed`、`added`、`moved` 事件，`refresh_metadata()` 在布局稳定后提交；空 batch 也会提交清理事件。
+- `Sampler` 先执行 `non_argmax_invariant` 组，再缩放 temperature，随后执行 `argmax_invariant` 组并随机采样。
+- 默认 `LogitsProcessors` 容器为空，尚无 repetition penalty、min tokens、logit bias、grammar 等具体规则。
+- 当前只支持正 temperature 的随机采样；槽位同步接口就绪并不意味着已经支持 greedy 或更多采样策略。

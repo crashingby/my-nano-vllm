@@ -1,6 +1,6 @@
 # InputBatch：Worker 的持久请求槽位工作区
 
-源码：[gpu_input_batch.py](/home/huangxy/Projects/my-nano-vllm/nanovllm/worker/gpu_input_batch.py)。
+源码：[gpu_input_batch.py](../../nanovllm/worker/gpu_input_batch.py)。
 
 ## 它解决什么问题
 
@@ -20,7 +20,7 @@ Scheduler 的请求真相来源，也不执行模型 forward；它是 `GPUModelR
 _req_ids:                 A             B             C
 token_ids_cpu:       A 的完整 token  B 的完整 token  C 的完整 token
 num_computed_tokens:      4             9             2
-temperature:             0.7           1.0           0.0
+temperature:             0.7           1.0           0.9
 block_table 行:        A 的 page 表   B 的 page 表   C 的 page 表
 processor 状态行:     A 的状态        B 的状态        C 的状态
 ~~~
@@ -48,7 +48,7 @@ processor 状态行:     A 的状态        B 的状态        C 的状态
 
 构造 `InputBatch` 时会一次性确定以下上限：
 
-| 参数 | 约束的对象 | 典型 buffer |
+| 参数或派生值 | 约束的对象 | 典型 buffer |
 | --- | --- | --- |
 | `max_num_reqs` | 持久 batch 最多可同时驻留多少 request。 | 所有按 request 行组织的 buffer 的第一维。 |
 | `max_model_len` | 单个 request 在 Worker 可保存的最长完整 token 序列。 | `token_ids_cpu_tensor` 的第二维。 |
@@ -83,7 +83,7 @@ decode 都重新复制整个 token 序列。
 
 | 成员 | shape / 类型 | 第 `i` 行或元素的含义 | 写入者 |
 | --- | --- | --- | --- |
-| `token_ids_cpu_tensor` | CPU `int32[max_num_reqs, max_model_len]` | request `i` 的 `prompt + 已确认输出` token 前缀。 | `add_request()`；未来追加输出后由 ModelRunner 补写新 token。 |
+| `token_ids_cpu_tensor` | CPU `int32[max_num_reqs, max_model_len]` | request `i` 的 `prompt + 已确认输出` token 前缀。 | `add_request()`；ModelRunner 采样后补写新 token。 |
 | `token_ids_cpu` | 上述 tensor 的 NumPy view。 | 供 Python 侧行拷贝和切片读取。 | 与 tensor 共享内存。 |
 | `num_prompt_tokens_cpu_tensor` | CPU `int32[max_num_reqs]` | request `i` 的 prompt 长度。 | `add_request()`、交换、压缩。 |
 | `num_computed_tokens_cpu_tensor` | CPU `int32[max_num_reqs]` | request `i` 已写入 KV cache 的 token 数。 | `add_request()`、SchedulerOutput 增量更新、交换、压缩。 |
@@ -113,7 +113,7 @@ positions = range(start, end)                    # [4, 5, 6]
 | `logitsprocs` | 已创建的 logits processor 分组。当前默认为空。 | `refresh_metadata()` 调用每个 processor 的 `update_state()`。 |
 
 `InputBatch` 负责令 `BlockTable` 的行和 token 行使用同一个 `req_index`，但**不负责**在
-每轮 forward 前提交 GPU page table 或生成 slot mapping。未来 `_prepare_inputs()` 应在
+每轮 forward 前提交 GPU page table 或生成 slot mapping。Runner 的 `_prepare_inputs()` 在
 所有行整理完成后调用：
 
 ~~~python
@@ -127,7 +127,7 @@ input_batch.block_table.compute_slot_mapping(
 
 其中 `query_start_loc` 与 `positions` 由 ModelRunner 根据每个槽位的
 `num_computed_tokens_cpu` 和 SchedulerOutput 生成。完整 page 转换与 Triton slot kernel
-说明见 [block_table.md](/home/huangxy/Projects/my-nano-vllm/docs/worker/block_table.md)。
+说明见 [block_table.md](block_table.md)。
 
 ## 稳定状态与更新状态
 
@@ -296,7 +296,7 @@ len(self._req_ids) == self.num_reqs
 收到删除事件并清理自己的状态。只有 temperature 的 GPU 拷贝可以跳过。
 
 `BatchUpdateBuilder` 的排序、复用和交付细节见
-[BatchUpdate.md](/home/huangxy/Projects/my-nano-vllm/docs/sample/BatchUpdate.md)。
+[BatchUpdate.md](../sample/BatchUpdate.md)。
 
 ## 完整时间线：删除、立即复用与 BlockTable 联动
 
@@ -307,7 +307,7 @@ len(self._req_ids) == self.num_reqs
 _req_ids:                A       B       C       D
 num_computed_tokens:     4       6       3       7
 block_table CPU 有效行: [8]   [2, 5]   [4]   [6, 1]
-temperature CPU:        0.7     1.0     0.0     0.8
+temperature CPU:        0.7     1.0     0.9     0.8
 Builder: removed=[], added=[], moved=[]
 ~~~
 
@@ -338,7 +338,7 @@ attention metadata 继续把槽位 1 解释成 `B`。
 _req_ids:                A       E       C       D
 num_computed_tokens:     4       0       3       7
 block_table CPU 有效行: [8]    [11]     [4]   [6, 1]
-temperature CPU:        0.7     0.6     0.0     0.8
+temperature CPU:        0.7     0.6     0.9     0.8
 Builder: removed=[], added=[(1, E.params, E.prompt, E.outputs)], moved=[]
 ~~~
 
@@ -422,11 +422,10 @@ query_start_loc        = [0, 2, 3, 6]
 这就是为什么 `InputBatch` 要持久维护 `num_computed_tokens`、token 行和 BlockTable 行；三者
 缺任意一个都无法从混合的 SchedulerOutput 恢复本轮的物理执行输入。
 
-## 当前实现的边界与下一步
+## 与 Runner 和采样器的分工
 
 `InputBatch` 自身已经具备固定槽位、行对齐、增删复用、压缩、BlockTable 联动和
-`BatchUpdateBuilder` 交付边界。它仍不是独立可执行的组件；以下工作属于
-`GPUModelRunner`，也是下一阶段需要接上的路径：
+`BatchUpdateBuilder` 交付边界。以下执行路径由 `GPUModelRunner` 编排，已与本类接通：
 
 - 在 `_update_states()` 中消费 `SchedulerOutput`，维护 `CachedRequestState`，并按正确
   顺序调用 `remove_request()`、`add_request()`、`condense()`、`refresh_metadata()`。
@@ -434,8 +433,9 @@ query_start_loc        = [0, 2, 3, 6]
   `input_ids`、`positions`、`query_start_loc` 与 logits 采样索引。
 - 在 forward 后将采样 token 追加到 `CachedRequestState.output_token_ids`，并把新 token
   写进对应 `token_ids_cpu` 行，使下一轮 decode 能读取它。
-- 在真正引入 repetition penalty、top-k/top-p、grammar 等 feature 时创建具体
-  `LogitsProcessor`，它们便可直接使用已经就绪的 `BatchUpdate` 生命周期。
+
+`Sampler` 已调用 processor 容器，默认容器为空。引入 repetition penalty、top-k/top-p、
+grammar 等规则时，还需要各自的实现与配置；现有 `BatchUpdate` 负责保持逐请求状态的槽位一致。
 
 ## 必须保持的不变量
 

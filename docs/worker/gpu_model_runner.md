@@ -3,8 +3,8 @@
 源码：[gpu_model_runner.py](../../nanovllm/worker/gpu_model_runner.py)。
 
 本文围绕每个接口的**输入、返回值和内部状态变化**介绍当前实现。示例中的小规模参数用于
-演示索引和内存布局，不是实际 Qwen3 模型配置。尚未接通的 forward 和采样路径会单独标注，
-不能把示例中的预期结果当成当前已经可以运行的推理结果。
+演示索引和内存布局，不是实际 Qwen3 模型配置。当前已接通同步 forward、采样、启动期
+profiling 与单 token decode 的 FULL CUDA Graph；混合 prefill/decode 使用 eager。
 
 ## 这个类负责什么
 
@@ -43,8 +43,8 @@
 | 同步请求 | `_update_states()` | `requests`、batch 槽位、进度和 block table。 |
 | 准备输入 | `_prepare_inputs()` 及其辅助方法 | 完整 token 行变成本轮 packed 输入和物理 slot。 |
 | 执行模型 | `execute_model()`、`_model_forward()` | hidden states、logits、`execute_model_state`。 |
-| 交付输出 | `sample_tokens()` | 尚未实现；需要回填输出 token 并清空执行状态。 |
-| profiling / 捕获 | `_dummy_run()`、`profile_run()`、`capture_model()` | 尚未实现；用于启动期显存规划与 CUDA Graph。 |
+| 交付输出 | `sample_tokens()`、`_bookkeeping_sync()` | 消费 logits，过滤中间 chunk 的候选，回填输出 token。 |
+| profiling / 捕获 | `_dummy_run()`、`profile_run()`、`profile_cudagraph_memory()`、`capture_model()` | 模拟执行、估算启动显存、捕获正式 decode 图。 |
 
 ## 状态成员与有效范围
 
@@ -53,10 +53,10 @@
 | 成员 | 初始化或更新时机 | 语义 |
 | --- | --- | --- |
 | `vllm_config` 及各领域配置 | `__init__()` 保存引用。 | 与 Worker 共享配置；这里没有为每种配置创建副本。 |
-| `device`、`dtype`、`pin_memory` | `__init__()`。 | 执行设备、模型精度和 CPU staging 是否锁页；当前 `pin_memory=True`。 |
+| `device`、`dtype`、`pin_memory` | `__init__()`。 | 执行设备、模型精度和 CPU staging 是否锁页；锁页能力由平台查询，WSL 下关闭。 |
 | `max_model_len` | 构造时从模型配置读取。 | 单个请求的上下文上限；`update_max_model_len()` 可以改变此成员。 |
 | `max_num_tokens`、`max_num_reqs` | 构造时从调度配置读取。 | 单轮 token 预算和请求槽位上限。 |
-| `model`、`model_memory_usage` | `load_model()` 成功后创建。 | 真实模型及加载造成的设备显存增量，单位是字节。 |
+| `model`、`model_memory_usage` | `load_model()` 成功后创建。 | 模型执行入口及加载造成的设备显存增量；启用 FULL 类策略时入口为 Graph Wrapper。 |
 | `kv_cache_config` | `initialize_kv_cache()`。 | Engine 下发方案的深拷贝；构造结束时此属性尚不存在。 |
 | `kv_caches` | 初始为空；绑定 cache 时追加 view。 | 各 Attention 层的 combined KV cache；以层名字典定位层更明确。 |
 | `attn_groups` | 初始为空；初始化后端时填充。 | 外层是 KV group，内层是按后端、规格和本地 Q head 数划分的组。 |
@@ -64,7 +64,8 @@
 | `_kernel_block_sizes` | KV 初始化时创建。 | 最终选定的各 group 的 kernel page 大小。 |
 | `requests` | 初始为空；`_update_states()` 修改。 | 已在 Worker 建档且尚未完成的请求镜像，不限于本轮调度请求。 |
 | `input_batch` | 构造时创建；布局不匹配时可能替换。 | 当前参与执行的紧凑请求槽位及其固定工作区。 |
-| `sampler` | `__init__()` 创建。 | 当前采样器读取 logits 和 temperature；尚未在 `sample_tokens()` 接通。 |
+| `sampler` | `__init__()` 创建。 | 根据 logits、正 temperature 与 processor 容器随机采样。 |
+| `cudagraph_dispatcher`、`cudagraph_batch_sizes` | 构造时创建；后端能力解析后更新。 | 保存合法图布局及捕获尺寸，供启动捕获与在线分派使用。 |
 | `execute_model_state` | 初始为 `None`；forward 成功后设置。 | forward 与采样之间的短生命周期状态。 |
 
 `model` 也不是构造时设置为 `None`：当前代码是在加载成功后才创建该属性，因此
@@ -82,6 +83,7 @@ CPU 修改不会自动传播到 GPU，仍需要执行拷贝。
 | `positions` | GPU `int64[T]`。 | 前 `num_tokens` 个请求内逻辑位置。 | `_prepare_inputs()` 在 GPU 计算。 |
 | `query_start_loc` | CPU/GPU `int32[R + 1]`。 | 前 `num_reqs + 1` 个 query 边界。 | 准备输入时填充；后缀重复最后一个边界。 |
 | `seq_lens` | GPU `int32[R]`。 | 前 `num_reqs` 个本轮执行结束后的目标长度。 | 已计算长度加本轮 token 数；后缀置零。 |
+| `optimistic_seq_lens_cpu` | CPU `int32[R]`。 | 有效请求的 KV 长度上界。 | metadata 构造时更新，避免从 GPU 同步读最大长度。 |
 | `num_computed_tokens` | GPU `int32[R]`。 | 前 `num_reqs` 个执行前进度。 | 从 InputBatch 的 CPU 进度上传。 |
 | `req_indices` | CPU/GPU `int64[T]`。 | 前 `num_tokens` 个 token 所属槽位。 | 按每请求调度数量重复槽位编号。 |
 | `num_scheduled_tokens` | CPU/GPU `int32[R]`。 | 前 `num_reqs` 个调度数量。 | 按 InputBatch 顺序写入并上传。 |
@@ -106,8 +108,8 @@ CPU 修改不会自动传播到 GPU，仍需要执行拷贝。
 max_num_reqs = 4       # 最多四个请求槽位。
 max_num_tokens = 16    # 单轮最多执行十六个真实 token。
 max_model_len = 64     # CPU token matrix 每行最多保存六十四个 token。
-block_size = 16       # 当前 manager block 与 kernel page 大小相同。
-kernel_block_size = 16
+block_size = 256       # 满足当前 FA2 的 256 倍数约束。
+kernel_block_size = 256
 ```
 
 构造后可以观察到：
@@ -160,11 +162,14 @@ layer_names = [
 Loader 的模型构造工具负责安装当前配置上下文；runner 不自己解析 checkpoint 名称。
 CUDA OOM 会记录错误并重新抛出，当前没有失败回滚协议。
 
+启用包含 FULL 的策略时，加载完成后用 `CUDAGraphWrapper` 包装模型入口；
+`get_model()` 仍返回原模型，普通 forward 则经 `self.model` 进入包装层。
+
 ### `get_model()`：查询已加载模型
 
 - 加载完成：返回 `self.model` 的引用，不创建副本。
 - 尚未加载：抛出 `ValueError`。
-- 当前没有 CUDA Graph wrapper 解包逻辑。
+- 启用 Graph 包装时通过 `unwrap()` 返回原模型；`self.model` 仍是实际 forward 执行入口。
 
 ### `get_kv_cache_spec()`：从静态层注册表读取存储需求
 
@@ -175,7 +180,7 @@ CUDA OOM 会记录错误并重新抛出，当前没有失败回滚协议。
 
 ```python
 spec = FullAttentionSpec(
-    block_size=16,
+    block_size=256,
     num_kv_heads=2,
     head_size=8,
     dtype=torch.bfloat16,
@@ -200,8 +205,8 @@ kv_cache_specs = {
 kv_cache_config = KVCacheConfig(
     num_blocks=16,  # 可用物理 block ID 范围为 [0, 16)。
     kv_cache_tensors=[
-        KVCacheTensor(size=16384, shared_by=[layer_names[0]]),
-        KVCacheTensor(size=16384, shared_by=[layer_names[1]]),
+        KVCacheTensor(size=262144, shared_by=[layer_names[0]]),
+        KVCacheTensor(size=262144, shared_by=[layer_names[1]]),
     ],
     kv_cache_groups=[
         KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=spec),
@@ -209,22 +214,22 @@ kv_cache_config = KVCacheConfig(
 )
 ```
 
-每层一个 block 的字节数为 `2 × 16 × 2 × 8 × 2 = 1024`：两个 K/V、十六个 token、
+每层一个 block 的字节数为 `2 × 256 × 2 × 8 × 2 = 16384`：两个 K/V、256 个 token、
 两个 KV heads、每 head 八个元素、每个 BF16 元素两字节。
-所以每层十六个 blocks 占 `16 × 1024 = 16384` 字节，两层共 `32768` 字节。
+所以每层十六个 blocks 占 `16 × 16384 = 262144` 字节，两层共 `524288` 字节。
 
 ```mermaid
 flowchart TD
     A["深拷贝 KV 分配方案"] --> B["initialize_attn_backend<br>建立层分组"]
-    B --> C["选择 kernel page 大小"]
+    B --> C["解析 Graph 能力与 keys<br>选择 kernel page 大小"]
     C --> D["initialize_metadata_builders<br>创建元数据构造器"]
     D --> E["may_reinitialize_input_batch<br>对齐页表布局"]
     E --> F["initialize_kv_cache_tensors<br>分配、重解释并绑定 cache"]
 ```
 
 顺序的含义是：先知道每层使用哪个后端，再确定它支持的 page 大小，最后才创建 builder、
-InputBatch 和真实 cache。上述例子结束后，`_kernel_block_sizes == [16]`，
-`kv_caches` 包含两个 `[16, 2, 16, 2, 8]` 的 view。
+InputBatch 和真实 cache。上述例子结束后，`_kernel_block_sizes == [256]`，
+`kv_caches` 包含两个 `[16, 2, 256, 2, 8]` 的 view。
 
 - `self.kv_cache_config` 是输入方案的**深拷贝**，不与输入对象共享同一份可变配置。
 - `is_profiling` 目前传给后端初始化，但不会改变初始化流程。
@@ -255,7 +260,7 @@ InputBatch 和真实 cache。上述例子结束后，`_kernel_block_sizes == [16
 - **状态变化**：各 `AttentionGroup.metadata_builders` 从空列表变成包含一个 builder 的列表。
 - **返回值**：`None`，builder 保存在组对象里。
 
-例子中传入 `[16]` 后，`attn_groups[0][0].get_metadata_builder()` 可以返回
+例子中传入 `[256]` 后，`attn_groups[0][0].get_metadata_builder()` 可以返回
 `FlashAttentionMetadataBuilder`。分组保留 manager block 的规格，builder 使用按 kernel
 page 大小调整过的规格。这里仅创建工厂对象，还没有生成任何本轮 metadata。
 
@@ -266,14 +271,14 @@ page 大小调整过的规格。这里仅创建工厂对象，还没有生成任
 - **布局相同**：继续使用原 `input_batch`。
 - **布局不同**：创建新 `InputBatch`，同时更新 `_init_block_sizes` 和 `_init_kernel_block_sizes`。
 
-例如占位 block size 为 `16`、正式方案改成 `32`，且后端也选用 `32`：
+例如占位 block size 为 `256`、正式方案改成 `512`，且后端也选用 `512`：
 
 | 状态 | 调用前 | 调用后 |
 | --- | --- | --- |
-| `_init_block_sizes` | `[16]` | `[32]` |
-| `_init_kernel_block_sizes` | `[16]` | `[32]` |
+| `_init_block_sizes` | `[256]` | `[512]` |
+| `_init_kernel_block_sizes` | `[256]` | `[512]` |
 | `input_batch` | 原工作区对象。 | 新工作区对象。 |
-| `input_batch.max_num_blocks_per_req` | `ceil(64 / 16) = 4` | `ceil(64 / 32) = 2` |
+| `input_batch.max_num_blocks_per_req` | `ceil(64 / 256) = 1` | `ceil(64 / 512) = 1` |
 | `input_batch.logitsprocs` | 原容器。 | 沿用原容器引用。 |
 
 **请求、token 行和槽位不会迁移到新工作区。** 这个接口应在接收真实请求前使用；
@@ -289,8 +294,8 @@ page 大小调整过的规格。这里仅创建工厂对象，还没有生成任
 
 | 字典 key | 值 | 含义 |
 | --- | --- | --- |
-| `layer_names[0]` | GPU `int8[16384]`。 | 第 0 层的完整 page pool。 |
-| `layer_names[1]` | GPU `int8[16384]`。 | 第 1 层的独立 page pool。 |
+| `layer_names[0]` | GPU `int8[262144]`。 | 第 0 层的完整 page pool。 |
+| `layer_names[1]` | GPU `int8[262144]`。 | 第 1 层的独立 page pool。 |
 
 - `int8` 是逐字节存储载体，不表示 K/V 被量化成 INT8。
 - 方法返回局部字典，此时不会直接修改 `self.kv_caches`。
@@ -305,13 +310,13 @@ page 大小调整过的规格。这里仅创建工厂对象，还没有生成任
 shape 与 stride order（步幅顺序）建立 view。
 
 ```python
-num_manager_blocks = 16384 // 1024       # 16 个 manager blocks。
-num_kernel_pages_per_block = 16 // 16   # 每 block 一个 kernel page。
+num_manager_blocks = 262144 // 16384     # 16 个 manager blocks。
+num_kernel_pages_per_block = 256 // 256 # 每 block 一个 kernel page。
 num_kernel_blocks = 16 * 1              # 16 个 kernel pages。
-logical_shape = (16, 2, 16, 2, 8)       # page、K/V、token、KV head、head 元素。
+logical_shape = (16, 2, 256, 2, 8)      # page、K/V、token、KV head、head 元素。
 ```
 
-转换后，字典的 key 不变，值从 `int8[16384]` 变成 BF16 `[16, 2, 16, 2, 8]`。
+转换后，字典的 key 不变，值从 `int8[262144]` 变成 BF16 `[16, 2, 256, 2, 8]`。
 `view(dtype)`、`view(shape)` 和 `permute()` **共享原存储，不复制 KV 内容**；
 实际物理排列来自后端，不能只根据逻辑 shape 假设所有切片都是连续的。
 
@@ -322,7 +327,7 @@ key = kv_cache[3, 0, 2]    # [2, 8]：这个 token 的所有 KV heads。
 value = kv_cache[3, 1, 2]  # 与 Key 属于同一个逻辑 slot。
 ```
 
-访问。后面的 slot `50 = 3 × 16 + 2` 是逻辑 token 格子编号，不能直接当成 raw byte
+访问。后面的 slot `770 = 3 × 256 + 2` 是物理 token 格子编号，不能直接当成 raw byte
 offset。当前方法要求 kernel page 大小整除 manager block 大小，并检查 raw 大小能被
 每 manager block 的字节数整除。
 
@@ -336,8 +341,8 @@ offset。当前方法要求 kernel page 大小整除 manager block 大小，并�
 | 第 0 层 `Attention.kv_cache` | 空 tensor。 | 指向返回字典中第 0 层的 view。 |
 | 第 1 层 `Attention.kv_cache` | 空 tensor。 | 指向返回字典中第 1 层的独立 view。 |
 
-**这里只绑定新的 `Attention.kv_cache`，没有同步旧的 `k_cache/v_cache` 字段。**
-后端执行重构尚未完成，所以“绑定完成”不能等同于当前旧 `Attention.forward()` 已经能使用它。
+`Attention.forward()` 通过统一接口读取绑定的 combined `kv_cache`，Impl 再用
+`unbind(1)` 取得 K/V 视图；执行路径无需维护旧的 `k_cache/v_cache` 字段。
 
 ## `_update_states()`：让请求镜像和 batch 与调度计划对齐
 
@@ -378,8 +383,7 @@ A 是尚未完成的 prompt，B 已生成两个 token，X 刚结束：
 
 C 是本轮才发送的新请求，表中的 C 状态来自 `NewRequestData`。
 本例 A 的进度 2 来自此前执行的 prompt chunk；B 的 token 25 尚未计算 K/V，
-本轮 decode 要把它送进模型。B 的历史输出和 CPU token 行假设已经同步，这是本例的输入前提，
-并非当前尚未实现的 `sample_tokens()` 已经完成了回填。
+本轮 decode 要把它送进模型。B 的历史输出和 CPU token 行已由此前的 `sample_tokens()` 同步回填。
 
 下面是本轮调度输入：
 
@@ -468,7 +472,7 @@ runner 会移除 A 的旧槽位，把 `requests["A"].block_ids` **替换**为 `[
 - `new_token_ids` 必须为空；Worker 输出长度必须等于下发的 `num_output_tokens`，否则断言失败。
 - `CachedRequestData.all_token_ids` 当前没有被读取，不能依靠它修复不同步的输出历史。
 - 对持续留在 batch 的请求，当前只更新进度和新增 blocks，**没有在这里补写新输出 token**。
-  CPU token matrix 的回填仍需要在采样路径或后续同步实现中补齐。
+  CPU token matrix 的新输出已由上一轮采样路径回填。
 
 ## `_prepare_inputs()`：从完整 token 行得到本轮 packed 输入
 
@@ -593,19 +597,19 @@ buffer = runner._make_buffer(16, dtype=torch.int32)
 
 ### 本例的物理 slot 如何得到
 
-准备输入已经调用 `BlockTable.compute_slot_mapping()`。当前 block 与 kernel page 都是 16，
+准备输入已经调用 `BlockTable.compute_slot_mapping()`。本例 block 与 kernel page 都是 256，
 所以 A/B/C 的有效 page table 分别是 `[3]`、`[7]`、`[9]`。
 
 | packed 下标 | 请求 | position | page ID | page 内 offset | slot |
 | ---: | --- | ---: | ---: | ---: | ---: |
-| 0 | A | 2 | 3 | 2 | `3 × 16 + 2 = 50` |
-| 1 | A | 3 | 3 | 3 | `51` |
-| 2 | A | 4 | 3 | 4 | `52` |
-| 3 | B | 4 | 7 | 4 | `116` |
-| 4 | C | 0 | 9 | 0 | `144` |
-| 5 | C | 1 | 9 | 1 | `145` |
+| 0 | A | 2 | 3 | 2 | `3 × 256 + 2 = 770` |
+| 1 | A | 3 | 3 | 3 | `771` |
+| 2 | A | 4 | 3 | 4 | `772` |
+| 3 | B | 4 | 7 | 4 | `1796` |
+| 4 | C | 0 | 9 | 0 | `2304` |
+| 5 | C | 1 | 9 | 1 | `2305` |
 
-于是 `block_table.slot_mapping.gpu[:6] == [50, 51, 52, 116, 144, 145]`。
+于是 `block_table.slot_mapping.gpu[:6] == [770, 771, 772, 1796, 2304, 2305]`。
 BlockTable 的 kernel 还会把固定容量 buffer 的剩余十项填为 `-1`。
 这个方法计算地址，尚未往 cache 写入真实 K/V。
 
@@ -640,10 +644,11 @@ by_group, by_layer = runner._get_slot_mappings(
 若独立演示 `num_tokens_padded=8`、`num_tokens_unpadded=6`，返回 view 的值会是：
 
 ```python
-slot_mapping_view = [50, 51, 52, 116, 144, 145, -1, -1]
+slot_mapping_view = [770, 771, 772, 1796, 2304, 2305, -1, -1]
 ```
 
-这个接口可以处理 slot 后缀，但不代表整条执行路径已经支持 CUDA Graph padding。
+本例是混合 batch，正常分派使用 eager；上述八行 view 用于说明 slot 后缀契约。
+实际 FULL padding 只用于兼容的单 token decode，完整例子见 [BatchDescriptor](../cudagraph/BatchDescriptor.md#完整例子三个请求怎样补到四槽图)。
 
 ### `_build_attention_metadata()`：把 buffer view 交给后端 builder
 
@@ -657,8 +662,8 @@ slot_mapping_view = [50, 51, 52, 116, 144, 145, -1, -1]
 | `seq_lens` | GPU `[5, 5, 2]` |
 | `num_reqs` / `num_actual_tokens` | `3` / `6` |
 | `max_query_len` / `max_seq_len` | `3` / `5` |
-| `block_table_tensor` | GPU `[3, 4]`，有效 page ID 前缀分别是 `[3]`、`[7]`、`[9]`。 |
-| `slot_mapping` | GPU `[50, 51, 52, 116, 144, 145]` |
+| `block_table_tensor` | GPU `[3, 1]`，有效 page ID 前缀分别是 `[3]`、`[7]`、`[9]`。 |
+| `slot_mapping` | GPU `[770, 771, 772, 1796, 2304, 2305]` |
 | `causal` | 默认 `True`；Builder 透传到后端，普通 decoder Query 不读取后续位置。 |
 
 `max_seq_len` 从 CPU 的执行前长度加本轮数量得到，避免从 GPU 读回标量。
@@ -673,9 +678,10 @@ attn_metadata = {
 
 - **返回值**：`(attn_metadata, None)`；第二项预留给投机解码，当前未返回公共 metadata。
 - **共享关系**：同组各层复用同一个后端 metadata 对象，内部 tensor 多为持久 buffer 的 view。
-- **状态变化**：创建本轮局部 metadata 对象，不复制 cache，也不推进请求状态。
+- **状态变化**：准备有效长度及无效后缀，创建本轮局部 metadata；不复制 cache，也不推进请求状态。
 - **生命周期**：下轮 buffer 更新会改变这些 view 看到的内容，不能把它们当作独立历史快照保存。
-- 当前没有 CUDA Graph request padding、cascade attention 或 micro-batch metadata 切分。
+- FULL 使用补齐后的请求/token 容量，重复尾部 query 边界、将无效序列长度置零、页表填空页、slot 填 `-1`；捕获时固定 `max_seq_len=max_model_len`。
+- 当前没有 cascade attention 或 micro-batch metadata 切分。
 
 ## 模型执行与采样接口
 
@@ -696,7 +702,7 @@ flowchart TD
     B --> C{"本轮是否有 token"}
     C -->|否| D["返回空 ModelRunnerOutput"]
     C -->|是| E["_prepare_inputs<br>准备 packed 输入"]
-    E --> F["构造 slot 字典和 attention metadata"]
+    E --> F["Dispatcher 选择模式与容量<br>构造 slot 和 attention metadata"]
     F --> G["安装 ForwardContext<br>调用 _model_forward"]
     G --> H["选取最后一个 query<br>计算 logits"]
     H --> I["保存 ExecuteModelState<br>返回 None"]
@@ -716,18 +722,19 @@ input_ids = runner.input_ids.gpu[:6]
 positions = runner.positions[:6]
 ```
 
-没有 CUDA Graph dispatcher、padding 选择或输入 embeddings 预处理；当前 Qwen3 文本路径
-只需要上述两个输入，所以这里没有 vLLM 多模态与 PP 场景下的 `_preprocess()`。
+本例各请求 query 长度为 `[3,1,2]`，Dispatcher 选择 NONE，因而只使用真实六行输入。
+兼容的单 token decode 则可选择 FULL 和补齐容量，再准备相应 metadata 与输入 view。
+当前 Qwen3 文本路径只使用 token IDs 和 positions，没有接入多模态与 PP 的 `_preprocess()`。
 
 `set_forward_context()` 已实现为创建并安装本轮 `ForwardContext`，作用域结束时恢复外层对象，
 异常退出也会恢复。上下文保存静态层注册表 `no_compile_layers`、`attn_metadata` 和
 `slot_mapping` 的引用，模型层通过 `get_forward_context()` 按完整层名查询。
-当前 `num_tokens` 仅保留调用兼容性，没有用来做计时、DP 协调或图分派。
+具体模式与描述符也由上下文传给模型 Wrapper。`num_tokens` 保留接口兼容性，
+当前未用于 DP 协调或计时；图分派已由 Runner 的 Dispatcher 完成。
 
 ### 本例的 hidden states 和 logits
 
-假设演示模型的 `hidden_size=32`、`vocab_size=128`，并且 ForwardContext 与 Attention
-执行依赖已经接通。则执行后半段的数据形状为：
+假设演示模型的 `hidden_size=32`、`vocab_size=128`，执行后半段的数据形状为：
 
 | 数据 | 形状 | 对应关系 |
 | --- | --- | --- |
@@ -737,7 +744,7 @@ positions = runner.positions[:6]
 | `logits` | `[3, 128]` | 按 A/B/C 槽位顺序，每请求一行词表分数。 |
 
 **当前 logits 行数等于 batch 请求数，不是最终可采样请求数。**
-A/C 的中间 prompt chunk 也经过 LM head；采样路径需要忽略这两行。
+A/C 的中间 prompt chunk 也经过 LM head；采样路径会丢弃这两行的候选。
 没有 prompt logprobs 时无需给全部六个 token 都计算词表 logits。
 
 ### `ExecuteModelState`：forward 与 sampling 之间保留什么
@@ -757,31 +764,32 @@ A/C 的中间 prompt chunk 也经过 LM head；采样路径需要忽略这两行
 | 方法返回值 | 尚无返回。 | `None` |
 | `requests` 中的输出列表 | A `[]`、B `[24, 25]`、C `[]`。 | 不变，此接口尚未采样。 |
 | CPU 请求进度 | `[2, 4, 0]` | 不变；本方法没有给 mirror 或 CPU 进度加调度数量。 |
-| 各层 KV cache | 包含此前已计算的历史。 | 接通后端后，本轮 K/V 写入 slots `[50, 51, 52, 116, 144, 145]`。 |
+| 各层 KV cache | 包含此前已计算的历史。 | 本轮 K/V 写入 slots `[770, 771, 772, 1796, 2304, 2305]`。 |
 
 runner 不把整批 hidden states 保存到 `execute_model_state`。
 `scheduler_output` 也没有深拷贝，因此下发后应按本轮快照使用，不应被调用方原地改动。
 
-**ForwardContext 的安装与恢复已接通，Attention 执行仍需改为读取新上下文和 combined cache。**
-以上 forward 后的 hidden states、KV 写入和状态保存，是接通 Attention 执行后
-这段编排代码应产生的结果；目前不能直接执行整轮验证。
+ForwardContext 的安装与恢复、Attention 的 combined cache 读取与计算均已接通。
+这些小数值展示索引关系；真实模型需由配置和加载器提供合法结构与权重。
 
 ### `_model_forward()`：直接转发两个模型输入
 
 当前方法本质上调用 `self.model(input_ids=input_ids, positions=positions)`。
-它不构造 metadata、不安装上下文、不计算 logits，也没有 CUDA Graph replay 分支。
+metadata 与上下文已由调用方准备；图捕获或回放由 `self.model` 的 Wrapper 处理，
+helper 本身只转发两个模型输入，不计算 logits。
 
 - **输入**：当前有效 packed token IDs 与 positions。
 - **返回值**：当前 Qwen3 模型返回的 hidden states，本例 shape 为 `[6, 32]`。
 - **副作用**：通过模型层执行产生 KV 写入，而不是 helper 自己计算 cache 地址。
 - 签名中的 `**model_kwargs` 目前没有继续传给模型；不能据此认为已经支持额外模型输入。
 
-### `sample_tokens()`：尚未实现的采样与回填接口
+### `sample_tokens()`：采样、过滤与回填输出
 
-**当前调用直接抛 `NotImplementedError`。** 以下说明接口需要完成的状态变化，
-不是已有执行结果。
+方法先取出并清空 `execute_model_state`，经 `_sample()` 调用 Sampler，再由
+`_bookkeeping_sync()` 将候选转成 CPU 列表，丢弃未完成 prompt 或恢复重算的请求行。
+没有待消费状态时抛 `RuntimeError`，避免重复使用同一份 logits。
 
-采样前，应以“执行前进度加本轮调度量”与完整已知 token 长度比较：
+bookkeeping 以“执行前进度加本轮调度量”与完整已知 token 长度比较：
 
 ```python
 num_computed_after = (
@@ -800,7 +808,7 @@ should_sample = num_computed_after == req_state.num_tokens
 这里使用 `req_state.num_tokens`，而非仅比较 prompt 长度：抢占恢复可能需要重算已有输出。
 正常调度还应保证计算后长度不超过已知长度；超过属于协议错误，不应继续采样。
 
-假设 B 采样得到 token 26，按 vLLM 式 batch 行对齐约定实现时，输出可以表示为：
+假设 B 采样得到 token 26，按 batch 行对齐后，输出为：
 
 ```python
 model_runner_output = ModelRunnerOutput(
@@ -810,12 +818,12 @@ model_runner_output = ModelRunnerOutput(
 )
 ```
 
-这只是待实现的输出约定示例。当前数据类的 `sampled_token_ids` 实际类型是
+当前数据类的 `sampled_token_ids` 类型是
 `list[list[int]]`；消费端需要按 `req_ids` / `req_id_to_index` 对齐，而不是对它调用 `.items()`。
 
-采样路径至少需要完成以下变化：
+有效 token 回填后，状态变化如下：
 
-| 状态 | 采样前 | 采样后应得到 |
+| 状态 | 采样前 | 采样后 |
 | --- | --- | --- |
 | `requests["B"].output_token_ids` | `[24, 25]` | `[24, 25, 26]` |
 | `input_batch.token_ids_cpu[1, 5]` | 无有效 token。 | `26`，供下一轮 CPU gather。 |
@@ -824,7 +832,7 @@ model_runner_output = ModelRunnerOutput(
 
 **新采样的 token 26 此时没有 K/V。** 它的逻辑位置是 5，需要下一轮再调度一个 token
 执行模型。届时 Scheduler 下发 B 的执行前进度 5，`_update_states()` 将 Worker 进度对齐，
-`_prepare_inputs()` 读取 `token_ids_cpu[1, 5]`，并生成 position 5 和 slot `7 × 16 + 5 = 117`。
+`_prepare_inputs()` 读取 `token_ids_cpu[1, 5]`，并生成 position 5 和 slot `7 × 256 + 5 = 1797`。
 
 ### 空批次与重复调用
 
@@ -843,26 +851,50 @@ model_runner_output = ModelRunnerOutput(
 
 这不是事务接口：即使 forward 失败，此前的请求同步和 buffer 改写也已经发生，当前没有自动回滚。
 
-## profiling、预热和 CUDA Graph 的占位接口
+## profiling、预热和 CUDA Graph
 
-以下三个接口都在源码中声明了用途，但当前方法体都抛 `NotImplementedError`。
+这些入口共用持久输入 buffer，要求 `InputBatch` 没有活跃请求。dummy 执行不构造真实请求、
+不推进 Scheduler 进度，也不创建待采样的 `execute_model_state`。
 
-| 方法 | 输入 / 返回约定 | 预期调用阶段 | 需要遵守的状态边界 |
-| --- | --- | --- | --- |
-| `_dummy_run(num_tokens)` | 输入模拟 packed token 数；签名返回两个 tensors，具体返回语义待实现时确认。 | profiling、预热或 graph capture 的公共执行 helper。 | 使用模拟数据，不混入真实 `requests`，不生成真实采样状态。 |
-| `profile_run()` | 无额外参数，返回 `None`。 | 权重加载后、正式 KV cache 分配前。 | 覆盖代表性的最大运行规模，供 Worker 统计 activation 峰值。 |
-| `capture_model()` | 无额外参数，约定返回图池新增显存字节数。 | 正式 KV cache 初始化和预热之后。 | 固定捕获用的输入与输出存储，不能覆盖真实请求的数据语义。 |
+### `_dummy_run()` 与 `profile_run()`：准备模拟负载
 
-不要把 `_dummy_run()` 简单实现为构造真实请求后调用 `execute_model()`：
-正式执行入口假定 KV cache 已初始化，还会修改请求镜像并创建待采样状态；
-profiling 则发生在正式 cache 分配前，两者前置条件不同。
+| 方法 | 输入与返回值 | 调用效果 |
+| --- | --- | --- |
+| `_dummy_run(num_tokens, ...)` | 返回 `(hidden_states, last_hidden_states)`；后者为每个有效 dummy 请求的最后一行。 | 构造模拟调度量、输入和 metadata，通过模型入口执行。 |
+| `profile_run()` | 无显式参数，返回 `None`。 | 以最大 token 预算执行 eager dummy，再运行 logits 与 sampler，供 Worker 统计 activation 峰值。 |
+| `_dummy_sampler_run(hidden_states)` | 返回模拟采样输出。 | 使用独立的采样 metadata，覆盖词表投影与采样负载。 |
 
-当前新 runner 的 `CompilationConfig` 没有捕获尺寸、dispatcher 或图实例管理。
-`_get_slot_mappings()` 中的 padded 参数只是局部接口准备，不代表图捕获已实现。
+`is_profile=True` 强制使用 NONE；默认不构造 Attention metadata，FA 的 profiling 分支填零，
+因此可在正式 KV 分配前执行。需要真实 FA 负载时，`force_attention=True` 要求已初始化 KV
+与 builder。dummy 页表指向保留空块 0，slot 全为 `-1`，不写真实请求的 K/V。
 
-未来若捕获尺寸 8 的图，而本轮只有 6 个 token，可以让图计算八个位置，使用前六个真实输出。
-但除了 slot 后缀 `-1`，还需要合法的 padding 输入、后端认可的长度与 query 边界、固定地址的
-metadata，以及图选择与 replay。**Scheduler 的进度仍只按六个真实 token 推进。**
+`uniform_decode=True` 将每个 dummy 请求组织为一个 Query。捕获时使用 builder 的 capture
+接口，把 `max_seq_len` 固定为 `max_model_len`，使图中的 Python 上界覆盖后续增长的 KV 长度。
+
+### `profile_cudagraph_memory()`：估算图显存预算
+
+该方法在正式 KV 分配前创建临时 cache，切换到独立 Graph pool，每种模式最多捕获最大的两档。
+用首次捕获占用加上其余图的增量估算完整计划；后续每图增量至少计 1 MiB，返回估算字节数。
+
+正常或异常退出捕获阶段时，都会关闭新增捕获、清理临时图、恢复原 pool，并释放临时 KV、
+builder 与层绑定。Dispatcher keys 也会清空，正式 `initialize_kv_cache()` 随后重新生成。
+清图使用全局 Wrapper 注册表，因此该流程按单个 Engine 的启动期使用。
+
+### `capture_model()`：捕获正式模型 forward
+
+正式 KV 初始化后，Runner 遍历 Dispatcher 给出的捕获计划。每种模式按容量降序执行，
+由 `_warmup_and_capture()` 先用 NONE 至少预热一次，再用 FULL 调用相同输入链。
+实际 `torch.cuda.graph()` 位于模型 Wrapper；图覆盖模型 forward，不包含 LM head 和 sampler。
+
+方法返回捕获前后的空闲显存差，单位为字节；禁用 Graph 时返回 0。捕获窗口结束后关闭新增
+捕获开关，在线执行只回放已有条目。部分图捕获成功后发生异常时，已有条目不会自动回滚。
+
+当前 FA2 仅捕获 uniform 单 token decode。比如六个真实 decode 请求选中八槽图，Runner
+将输入补零、无效长度置零、query 边界重复末值、页表填空页、slot 填 `-1`；模型执行八行，
+最终只选择六个真实请求的 hidden states。**Scheduler 的进度仍只按六个真实 token 推进。**
+
+模式与布局细节见 [CUDAGraphMode](../cudagraph/CUDAGraphMode.md)、
+[Dispatcher](../cudagraph/CudagraphDispatcher.md) 和 [Graph Wrapper](../cudagraph/CUDAGraphWrapper.md)。
 
 ## 生命周期与不变量
 
@@ -871,14 +903,14 @@ metadata，以及图选择与 replay。**Scheduler 的进度仍只按六个真�
 | 阶段 | 已具备的资源 | 可以调用什么 |
 | --- | --- | --- |
 | 构造结束 | 配置、空请求表、占位 batch、固定 buffer。 | 查询初始容量；尚不能执行模型。 |
-| 模型加载结束 | 模型权重、静态 Attention 注册表、加载显存统计。 | `get_model()`、`get_kv_cache_spec()`；profiling 接口待实现。 |
+| 模型加载结束 | 模型权重、静态 Attention 注册表、加载显存统计。 | `get_model()`、`get_kv_cache_spec()`、启动期 profiling。 |
 | Engine 完成 cache 规划 | 外部 `KVCacheConfig`，尚未变成 runner 的真实 cache。 | `initialize_kv_cache()`。 |
-| KV 初始化结束 | Attention groups、builders、cache views 和一致的页表布局。 | 接通后端后进行预热及正式执行。 |
-| 一轮 forward 完成 | 本轮 logits 和非空 `execute_model_state`。 | 接通采样后调用 `sample_tokens()`。 |
+| KV 初始化结束 | Attention groups、builders、cache views 和一致的页表布局。 | 启动预热、正式图捕获与后续模型执行。 |
+| 一轮 forward 完成 | 本轮 logits 和非空 `execute_model_state`。 | 调用一次 `sample_tokens()`。 |
 | 本轮采样完成 | 已回填输出 token，执行状态恢复为 `None`。 | 接受下一轮调度输出。 |
 
-`profile_run()` 目前阻断启动期显存规划，Attention 新旧执行接口尚未接通，
-`sample_tokens()` 阻断输出交付。因此当前主体结构已经形成，但尚未完成可运行的推理闭环。
+关闭执行端时，`shutdown()` 同步并释放 KV 引用与层绑定，清空静态层表、模型引用和 RoPE
+缓存。Engine、Executor 与 Worker 的调用顺序见 [UniProcExecutor](../executor/UniProcExecutor.md)。
 
 ### 请求行与 token 轴的对应关系
 
@@ -908,12 +940,12 @@ metadata，以及图选择与 replay。**Scheduler 的进度仍只按六个真�
 | --- | --- |
 | 配置与 buffer 初始化、模型加载、KV 规格收集 | 已有具体实现。 |
 | 后端分组、builder 创建、cache 分配与绑定 | 已有具体实现；正式执行布局限于单 group full attention。 |
-| 请求同步、packed 输入、slot 与 metadata 构造 | 已有具体实现；持续 decode 的 CPU token 回填尚待接通。 |
-| `execute_model()` 与 `_model_forward()` | 编排代码已有，但 forward 依赖尚未接通。 |
+| 请求同步、packed 输入、slot 与 metadata 构造 | 已接通；采样后同步回填 CPU token 行。 |
+| `execute_model()` 与 `_model_forward()` | 同步执行，兼容的 decode 走 FULL，其他 batch 走 eager。 |
 | `set_forward_context()` | 已实现上下文创建、安装与读取，正常或异常退出均恢复外层状态。 |
-| `Attention.forward()` / `FlashAttentionImpl.forward()` | 前者仍读取旧 context 与 cache 字段，后者尚未实现。 |
-| `sample_tokens()`、`_dummy_run()`、`profile_run()`、`capture_model()` | 均抛 `NotImplementedError`。 |
-| CUDA Graph、异步调度、投机解码、多模态、PP/DP/DCP、多 KV groups | 当前新执行路径未接入。 |
+| `Attention.forward()` / `FlashAttentionImpl.forward()` | 通过 ForwardContext 取得按层数据，先写入缓存，再执行 FA2。 |
+| 采样、dummy、profiling、Graph 显存估算与正式捕获 | 已实现；采样只支持正 temperature 的随机采样，默认 processor 为空。 |
+| PIECEWISE、异步调度、投机解码、多模态、PP/DP/DCP、多 KV groups | 当前执行路径未接入。 |
 
 阅读本类时，可以先从 A/B/C 示例追踪请求行如何变成 packed token，再看同一批数据如何
 提供历史 KV 读取页表、当前 K/V 写入 slot 和最后一个 query 的 logits。

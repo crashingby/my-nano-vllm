@@ -19,7 +19,7 @@ Worker BlockTable 的 kernel page table
     request 逻辑 kernel page 下标 -> kernel page ID
 ~~~
 
-当前本地实现位于 [block_table.py](/home/huangxy/Projects/my-nano-vllm/nanovllm/worker/block_table.py)。它已具备单进程所需的行更新、manager block 到 kernel page 的转换、CPU/GPU 提交和 slot mapping 计算；本文档解释这些接口必须维持的语义。
+当前本地实现位于 [block_table.py](../../nanovllm/worker/block_table.py)。它已具备单进程所需的行更新、manager block 到 kernel page 的转换、CPU/GPU 提交和 slot mapping 计算；本文档解释这些接口必须维持的语义。
 
 ## 为什么需要转换
 

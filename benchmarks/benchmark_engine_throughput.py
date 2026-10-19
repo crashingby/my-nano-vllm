@@ -17,12 +17,11 @@ from time import perf_counter
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from transformers import AutoTokenizer
-
 from benchmarks.config import BenchmarkConfig, parse_args
-from benchmarks.datasets import SampleRequest, get_dataset
+from benchmarks.datasets import SampleRequest
 from benchmarks.metrics import BenchmarkStats
-from benchmarks.utils import nvtx_range, set_random_seed
+from benchmarks.runner import run_benchmark as run_engine_benchmark
+from benchmarks.utils import nvtx_range
 from nanovllm import LLM, SamplingParams
 from nanovllm.logger import init_logger
 
@@ -129,34 +128,7 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkStats:
     创建的 Engine 在正常和异常路径都会关闭；返回统计可供其他脚本继续使用。
     原始文件读取、对话格式化和编码全部在模型创建与性能计时之前完成。
     """
-    dataset = get_dataset(config.dataset_config)
-    model_config = config.vllm_config.model_config
-    logger.info("Loading tokenizer from %s", model_config.model)
-    with nvtx_range("load_tokenizer"):
-        tokenizer = AutoTokenizer.from_pretrained(model_config.model, use_fast=True)
-    logger.info("Loading %s from %s", config.dataset_config.name, dataset.dataset_path)
-    with nvtx_range("load_prompts"):
-        requests = dataset.sample(
-            tokenizer=tokenizer,
-            num_requests=config.num_prompts,
-            output_len=config.sampling_params.max_tokens,
-            max_model_len=model_config.max_model_len,
-        )
-    max_active = config.vllm_config.scheduler_config.max_num_seqs
-    logger.info(
-        "Initializing LLM: model=%s num_prompts=%d max_active=%d max_tokens=%d",
-        model_config.model, len(requests), max_active, config.sampling_params.max_tokens,
-    )
-    with nvtx_range("init_llm"):
-        llm = LLM(vllm_config=config.vllm_config)
-    try:
-        # 启动 profiling 和 sampler 预热可能消耗 RNG，正式回放前统一重置初态。
-        set_random_seed(config.seed)
-        stats = replay_requests(llm, requests, config.sampling_params, max_active)
-        stats.log()
-        return stats
-    finally:
-        llm.close()
+    return run_engine_benchmark(config, replay_requests)
 
 
 def main() -> None:

@@ -156,12 +156,12 @@ class Qwen3MLP(nn.Module):
             bias=False,
         )
         assert hidden_act == "silu"
-        self.act_fn = SiluAndMul()
+        self.silu_and_mul = SiluAndMul()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """将 [num_tokens, hidden_size] 经 SwiGLU 映射回相同形状。"""
         gate_up = self.gate_up_proj(x)  # gate/up 合并为一次本地投影。
-        x = self.act_fn(gate_up)  # SiLU(gate) * up，继续使用现有编译算子。
+        x = self.silu_and_mul(gate_up)  # SiLU(gate) * up，使用构造时按 kernel_config 绑定的实现。
         x = self.down_proj(x)  # 恢复 hidden_size，TP 时归约各 rank 的贡献。
         return x
 

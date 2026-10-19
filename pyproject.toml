@@ -22,6 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 benchmark = ["pyarrow"] # Alpaca 本地 Parquet 读取；LongBench JSONL 只使用标准库。
+cutedsl = ["nvidia-cutlass-dsl>=4.8.1,<4.9"] # CuTe DSL kernel 的可选编译与运行依赖。
 
 [project.urls]
 Homepage="https://github.com/GeeeekExplorer/nano-vllm"

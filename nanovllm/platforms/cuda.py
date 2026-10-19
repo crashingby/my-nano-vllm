@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import torch
 
 from nanovllm.logger import init_logger
@@ -142,8 +144,17 @@ class CudaPlatformBase(Platform):
         return bool(is_integrated)
 
     @classmethod
+    @lru_cache(maxsize=None)
     def num_compute_units(cls, device_id: int = 0) -> int:
-        """返回指定逻辑 GPU 的 SM 数量，可供 kernel 并行度配置使用。"""
+        """查询并缓存指定逻辑 GPU 的 SM 数量，供各类 kernel 配置并行度。
+
+        按平台类和设备编号缓存成功结果，同一设备的查询可在多个算子间复用。
+        device_id 使用进程可见的逻辑编号，省略时固定查询设备 0；调用方应在
+        Worker 绑定设备后显式传入目标编号，并在进程内保持可见设备映射稳定。
+
+        首次调用由 PyTorch 查询设备属性，可能初始化 CUDA；模块导入时保持
+        延迟查询。设备不可用或编号无效时异常继续传播，失败结果不会进入缓存。
+        """
         return torch.cuda.get_device_properties(device_id).multi_processor_count
 
     @classmethod

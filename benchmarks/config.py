@@ -61,6 +61,7 @@ class BenchmarkConfig:
         default_factory=lambda: SamplingParams(temperature=0.6, max_tokens=128),
     )
     seed: int = 0  # 在 Engine 启动后重置生成随机数，避免启动预热消耗影响初态。
+    result_path: str | None = None  # 可选 JSON 报告路径，写入发生在性能计时结束后。
 
     def __post_init__(self) -> None:
         """检查回放规模与输出预算，避免模型加载后才发现无效工作量。"""
@@ -71,17 +72,22 @@ class BenchmarkConfig:
             raise ValueError("max_tokens must be less than max_model_len")
 
 
-def parse_args(argv: Sequence[str] | None = None) -> BenchmarkConfig:
+def parse_args(
+    argv: Sequence[str] | None = None,
+    *,
+    description: str = "Benchmark local Engine throughput.",
+) -> BenchmarkConfig:
     """解析共享 CLI，组装可直接传入 Engine 的总配置。
 
     Args:
         argv: 显式参数序列；None 读取当前进程命令行。
+        description: 当前吞吐或延迟入口在 --help 中显示的测试说明。
 
     Returns:
         已完成配置校验的 BenchmarkConfig；不读取数据集或创建 GPU 资源。
         ModelConfig 构造会读取本地 HF 结构配置。
     """
-    parser = argparse.ArgumentParser(description="Benchmark local Engine throughput.")
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--model-path", default=str(Path.home() / "models/Qwen3-0.6B"))
     parser.add_argument("--dataset-name", default="alpaca", help="注册的数据集名称。")
     parser.add_argument("--dataset-path", help="本地数据文件或目录，省略时使用适配器默认值。")
@@ -92,9 +98,14 @@ def parse_args(argv: Sequence[str] | None = None) -> BenchmarkConfig:
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--ignore-eos", action="store_true", help="忽略 EOS，测试固定输出长度。")
     parser.add_argument("--seed", type=int, default=0, help="生成随机种子，不保证跨模式逐字一致。")
+    parser.add_argument("--result-path", help="可选 JSON 报告路径，包含配置摘要与实际指标。")
     parser.add_argument("--enforce-eager", action="store_true", help="禁用 CUDA Graph。")
     parser.add_argument("--max-model-len", type=int, default=4096)
-    parser.add_argument("--max-num-batched-tokens", type=int, default=256)
+    # 提高单轮预算，让 512-token 输入减少分块和首批排队，仍允许 CLI 显式覆盖。
+    parser.add_argument(
+        "--max-num-batched-tokens", type=int, default=1024,
+        help="单轮共享 token 预算，默认 1024；增大可减少 prefill 分块轮数。",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--max-prompt-tokens", type=int, help="含 chat template 的输入 token 上限。")
     parser.add_argument(
@@ -131,6 +142,7 @@ def parse_args(argv: Sequence[str] | None = None) -> BenchmarkConfig:
                 ignore_eos=args.ignore_eos,
             ),
             seed=args.seed,
+            result_path=args.result_path,
         )
     except ValueError as exc:
         parser.error(str(exc))

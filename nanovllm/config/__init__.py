@@ -11,6 +11,7 @@ EOS、实际 KV block 数和编译统计等字段，则在 Engine 启动过程�
 from nanovllm.config.cache import CacheConfig
 from nanovllm.config.compilation import CompilationConfig,CUDAGraphMode
 from nanovllm.config.device import DeviceConfig
+from nanovllm.config.kernel import KernelConfig
 from nanovllm.config.load import LoadConfig
 from nanovllm.config.model import ModelConfig
 from nanovllm.config.parallel import ParallelConfig
@@ -28,6 +29,7 @@ __all__ = [
     "CompilationConfig",
     "CUDAGraphMode",
     "DeviceConfig",
+    "KernelConfig",
     "LoadConfig",
     "ModelConfig",
     "NanovllmConfig",

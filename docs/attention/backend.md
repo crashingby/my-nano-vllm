@@ -2,7 +2,7 @@
 
 源码入口：[backend.py](../../nanovllm/attention/backend.py)、[flash_attn.py](../../nanovllm/attention/backends/flash_attn.py)、[attention.py](../../nanovllm/model_executor/layers/attention/attention.py)、[attention_layer_base.py](../../nanovllm/model_executor/layers/attention_layer_base.py)、[forward_context.py](../../nanovllm/forward_context.py)、[gpu_model_runner.py](../../nanovllm/worker/gpu_model_runner.py)、[utils.py](../../nanovllm/worker/utils.py)。
 
-> **当前状态**：后端选择、分组、KV 布局、缓存绑定、metadata 构造和 Attention 包装层的调用流程已有实现；CUDA platform、FA2 调用与缓存写入基础接口也已移植，见 [fa_utils.md](fa_utils.md)。`FlashAttentionImpl` 的 `do_kv_cache_update()` 与 `forward()` 尚未完整接通，下文不把架构准备当成已经能够推理。
+后端选择、分组、KV 布局、缓存绑定、metadata 构造、缓存写入与 FA2 计算已接通。当前执行路径支持单 KV group 的普通 decoder Attention，以及单 token decode 的 FULL CUDA Graph；基础接口见 [fa_utils.md](fa_utils.md)，图执行范围见 [CUDA Graph 总览](../cudagraph/overview.md)。
 
 ## 为什么需要这些类
 
@@ -203,10 +203,10 @@ flowchart LR
     D --> E["层名到后端 metadata 的映射"]
     E --> F["ForwardContext<br>安装本轮按层数据"]
     F --> G["Attention.forward<br>整理形状并预分配输出"]
-    G -. "后端执行待实现" .-> H["Impl 更新 KV cache<br>执行 Attention"]
+    G --> H["Impl 更新 KV cache<br>执行 Attention"]
 ```
 
-虚线是当前实现边界：Runner 已经安装 ForwardContext，`Attention.forward()` 已通过统一接口读取本层数据、安排缓存更新与计算。FlashAttention 声明 `forward_includes_kv_cache_update=False`，所以正常写缓存路径会先进入 `unified_kv_cache_update()`；由于其 Impl 尚无 `do_kv_cache_update()`，此处会断言失败。缓存写入和 FA2 计算的基础入口已经具备，但还需要在 Impl 中调用；`forward()` 当前只完成部分准备与无 metadata 的 profiling 分支。
+Runner 安装 ForwardContext，`Attention.forward()` 通过统一接口读取本层数据、安排缓存更新与计算。FlashAttention 声明 `forward_includes_kv_cache_update=False`，所以先通过 `unified_kv_cache_update()` 调用 Impl 的 `do_kv_cache_update()`，再由 `forward()` 读取分页缓存并调用 FA2。两次 kernel 在当前 stream 上按顺序执行；没有 metadata 的 profiling 分支将输出填零。
 
 ## 基类的职责
 
@@ -220,7 +220,7 @@ Backend 是**后端类**，不保存某个 request 的状态。`get_name()` 给�
 | `get_kv_cache_shape(...)` | 声明**单层** KV tensor 的逻辑形状。 | `(num_blocks, 2, block_size, num_kv_heads, head_size)`。 |
 | `get_kv_cache_stride_order(...)` | 声明逻辑维度在内存中的排列，指导 raw storage 变成 view。 | 单层为 `(0, 1, 2, 3, 4)`，即按逻辑维度连续。 |
 | `get_kv_cache_block_dim(...)` | 找出形状中 `num_blocks` 所在维度。 | 维度 `0`。 |
-| `forward_includes_kv_cache_update` | 声明 Impl 的 forward 是否自行写入新 K/V。 | `False`，包装层在 forward 前调用 Impl 的独立缓存更新接口；实际更新方法尚未实现。 |
+| `forward_includes_kv_cache_update` | 声明 Impl 的 forward 是否自行写入新 K/V。 | `False`，包装层在 forward 前调用 Impl 的独立缓存更新接口。 |
 | `supported_dtypes`、`supported_kv_cache_dtypes` | 声明支持的计算类型和 KV 类型。 | 当前列出 FP16、BF16 及 `auto` 等值。 |
 
 `MultipleOf(256)` 是“page 大小必须是 256 的倍数”，**不是**“page 大小只能等于 256”。例如 manager block 为 256 token 时，256 自身符合约束，当前选择 `kernel_block_size=256`；若其他后端只接受固定的 64，manager block 才需要转换成四个 kernel page。参考 vLLM 的扩展允许 16 的倍数，但当前直接使用的上游 FA2 要求 256 的倍数。两种粒度的区别见 [block_table.md](../worker/block_table.md)。
@@ -233,7 +233,7 @@ Backend 是**后端类**，不保存某个 request 的状态。`get_name()` 给�
 | --- | --- |
 | `query_start_loc` / `query_start_loc_cpu` | 长度为 `num_reqs + 1` 的前缀和；相邻两项圈定一个 request 的 packed query 区间。 |
 | `seq_lens` | 按 request 排列；每个值是执行本轮 token **之后**的序列长度。 |
-| `num_reqs`、`num_actual_tokens` | 请求数和送入 Attention 的 packed token 数；当前没有 padding。 |
+| `num_reqs`、`num_actual_tokens` | 送入 Attention 的请求槽位数和 packed token 容量；eager 使用真实数量，FULL 使用补齐后的容量。 |
 | `max_query_len`、`max_seq_len` | 单请求本轮最多计算的 token 数、执行后的最大序列长度。 |
 | `block_table_tensor` | 第 `i` 行是第 `i` 个 request 的物理 **kernel page ID** 序列；用于定位历史 K/V。 |
 | `slot_mapping` | 按本轮 packed token 排列；每项是新 K/V 应写入的物理 slot。 |
@@ -292,13 +292,13 @@ FlashAttentionBackend.get_kv_cache_shape(
 
 第二维 `2` 是 **K/V 两份**，不是两个 request。每个 page 占 `2 * 256 * 2 * 128 * 2 = 262144` 字节；8 个 page 对**这一层**占 2 MiB。另一层即使也使用 page ID `2`，也访问它自己的 KV tensor。
 
-`FlashAttentionMetadataBuilder.build()` 将 `CommonAttentionMetadata` 变成 `FlashAttentionMetadata`：保留 `query_start_loc`、`seq_lens`、`slot_mapping` 等 tensor 引用，并把 `block_table_tensor` 映射到 `block_table` 字段。Runner 将这一对象放到对应层名下，并通过 ForwardContext 暴露给 Attention 包装层。至此**准备阶段**完成；实际后端尚未写入 K/V、调用 FA kernel，因此该数值例子不代表目前能够端到端运行。
+`FlashAttentionMetadataBuilder.build()` 将 `CommonAttentionMetadata` 变成 `FlashAttentionMetadata`：保留 `query_start_loc`、`seq_lens`、`slot_mapping` 等 tensor 引用，并把 `block_table_tensor` 映射到 `block_table` 字段。Runner 将这一对象放到对应层名下，通过 ForwardContext 暴露给 Attention 包装层。随后 Impl 按 slot 写入本轮 K/V，再由 FA2 读取历史与本轮缓存，计算四行 Query 的输出。
 
-## 当前边界与下一步
+## 当前执行范围
 
 - `initialize_attn_backend()`、`initialize_metadata_builders()`、`initialize_kv_cache_tensors()` 和 `_build_attention_metadata()` 已连接准备路径；当前 `_build_attention_metadata()` 只支持**一个 full-attention KV group**。
 - `Attention.forward()` 已整理输入形状和预分配输出，通过 `get_attention_context()` 按层名读取 metadata 与 combined `kv_cache`；不再直接调用 kernel 或维护 prefill/decode 分支。
-- `FlashAttentionImpl.do_kv_cache_update()` 尚未实现，`forward()` 尚未完成对移植基础接口的调用。独立更新流程是包装层安排调用、Impl 执行缓存写入；“在 forward 外更新”并不表示写入 kernel 属于包装层。
-- 后续应实现 Impl 的缓存写入与混合 P/D 计算，再做真实模型的端到端测试。
+- `FlashAttentionImpl.do_kv_cache_update()` 调用 Triton 写入接口，`forward()` 调用 FA2 的 varlen 接口；普通执行支持混合 prefill/decode。
+- FULL Graph 当前限于 uniform 单 token decode；prefill 与混合 batch 使用 eager。尚无 PIECEWISE 执行链、量化 KV、cascade attention 或多模态支持。
 
 记住一条主线即可：**Backend 决定“怎么存、选谁算”；Runner 决定“这一轮算谁”；Builder 翻译本轮数据；Impl 真正计算。**

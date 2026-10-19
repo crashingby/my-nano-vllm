@@ -2,7 +2,7 @@
 
 源码入口：[flash_attn.py](../../nanovllm/attention/backends/flash_attn.py)。后端抽象与对象关系见 [backend.md](backend.md)，CUDA、FA 适配层和 Triton 写入接口见 [fa_utils.md](fa_utils.md)。本文以当前源码为准，主要解释本文件的接口如何改变 metadata、KV cache 和 output。
 
-**当前后端已接通独立 KV 写入与 FA2 前向调用**：先把本轮新 K/V 写入当前层缓存，再用本轮 Query 读取包含历史和新增 token 的分页 K/V，结果写入包装层预分配的 output。后端接通不代表 Runner 的采样、CUDA Graph 或完整生成流程已经验证完成。
+**当前后端已接通独立 KV 写入与 FA2 前向调用**：先把本轮新 K/V 写入当前层缓存，再用本轮 Query 读取包含历史和新增 token 的分页 K/V，结果写入包装层预分配的 output。Runner 的采样、profiling 与 decode FULL Graph 编排见 [GPUModelRunner](../worker/gpu_model_runner.md)。
 
 ## 四个类分别负责什么
 
@@ -304,7 +304,7 @@ Query 使用 packed 前缀和分段；K/V 使用 page table 与实际长度定�
 | 版本已选定，`attn_metadata is None` | `output.fill_(0)` 后返回，不读取缓存，不调用 FA。 | 整个 output。 |
 | 版本已选定，有真实 metadata | 读取缓存并调用 FA。 | 前 `num_actual_tokens` 行；尾部保持调用前内容。 |
 
-例如接口层假设 Query/output 有 8 行，而有效 token 为 4，真实计算仅使用 `[0:4]`。若 output 来自 `torch.empty`，尾部四行仍是未初始化内容，不能当作有效结果读取。这个例子说明切片契约，**不表示 Runner 已经实现 CUDA Graph 补齐、捕获和回放**；当前普通批次没有尾部补齐时，`T == num_actual_tokens`。
+例如直接调用 Impl 时，Query/output 有 8 行而 `num_actual_tokens=4`，计算仅写入 `[0:4]`，尾部四行保持原值。当前 Runner 的 eager 路径使用真实数量；FULL decode 路径则将 `num_actual_tokens` 设为图的 token 容量。补齐请求通过重复 query 边界、零序列长度、空页和负 slot 表示，最终仅选择真实请求的 hidden states。不能仅凭该字段名把它理解为所有执行模式下的真实有效 token 数；完整例子见 [BatchDescriptor](../cudagraph/BatchDescriptor.md#完整例子三个请求怎样补到四槽图)。
 
 ## 包装层怎样保证先写缓存再计算
 
@@ -324,7 +324,7 @@ flowchart TD
 
 ## 与 vLLM 对齐的流程和当前裁剪
 
-参考源码为 `vllm/v1/attention/backends/flash_attn.py`，本地路径是 `/home/huangxy/Projects/vllm/vllm/v1/attention/backends/flash_attn.py`。
+参考源码为上游 [vllm/v1/attention/backends/flash_attn.py](https://github.com/vllm-project/vllm/blob/b5adb027ad03c29b46181752ba3b1cb84eff1dd4/vllm/v1/attention/backends/flash_attn.py)，链接固定到核对过的提交。
 
 | 环节 | 当前保留的流程 | 当前边界 |
 | --- | --- | --- |

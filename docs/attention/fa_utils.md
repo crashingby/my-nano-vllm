@@ -94,7 +94,7 @@ flowchart TD
 | `k`、`v` | `[num_blocks, 256, num_kv_heads, head_size]` | 当前层的缓存视图，不是仅本轮新投影的 Key/Value。 |
 | `out` | `[4, num_heads, head_size]` | 包装层预分配的输出视图，由扩展直接写入。 |
 
-下面展示后端接线时的调用形式。**这是一段接口示例；当前 FlashAttentionImpl 的完整执行方法仍待接通。**
+下面展示 `FlashAttentionImpl.forward()` 使用这些字段的调用形式；完整执行顺序见 [FlashAttention 后端](flash_attn.md)。
 
 ```python
 from nanovllm.attention.backends.fa_utils import flash_attn_varlen_func
@@ -152,4 +152,4 @@ offset = (
 - 上游扩展的 `varlen_fwd` 没有显式 `num_splits` 参数，因此当前仅接受 `num_splits=0`，由其内部选择执行策略。
 - 已安装并核对的扩展为 `flash-attn 2.8.3.post1`。项目依赖限定在 `2.8.3 <= version < 2.9`；这层 Python 适配不编译或安装 vLLM 的 `_vllm_fa2_C`。
 
-下一步在 `FlashAttentionImpl` 中调用这些入口，完成 `do_kv_cache_update()` 与混合 prefill/decode 的 `forward()`。基础接口可用不等于 Runner 的采样、profiling 或完整生成流程已经实现。
+`FlashAttentionImpl` 已通过这些入口完成缓存写入与混合 prefill/decode 计算。Runner 的采样、profiling 与 decode FULL Graph 执行流程见 [GPUModelRunner](../worker/gpu_model_runner.md)。
