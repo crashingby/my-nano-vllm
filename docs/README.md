@@ -35,6 +35,7 @@
 | 模型层 | [SiluAndMul 的原理与调用位置](model_executor/layers/activation.md)。 |
 | 算子 | [silu_and_mul 的三种后端与性能记录](ir/ops/activation.md)。 |
 | kernel | [Triton SiluAndMul 的持久化调度与自动调优](kernels/triton/activation/SiluAndMul.md)。 |
+| kernel | [CuTe DSL SiluAndMul 的线程映射、访存与官方调优](kernels/cute/activation/SiluAndMul.md)。 |
 
 端到端吞吐与延迟测试见 [Benchmark 文档](../benchmarks/README.md)。算子测试位于
 [`tests/test_ops`](../tests/test_ops)，在项目根目录运行：

@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | `torch` | `native` | 使用 PyTorch 的 `F.silu(gate) * up`，由[模型层](../../../nanovllm/model_executor/layers/activation.py)共享 `torch.compile` 包装。 |
 | `triton` | `triton` | 使用 [Triton 融合 kernel](../../../nanovllm/kernels/triton/activation.py)，通过 `triton.autotune` 选择行块、列块和 warp 数配置，详见[实现思路](../../kernels/triton/activation/SiluAndMul.md)。 |
-| `cutedsl` | `cutedsl` | 使用 [CuTe DSL 融合 kernel](../../../nanovllm/kernels/cute/activation.py)，通过 `from_dlpack` 接收 Tensor，使用官方 `autotune_jit` 搜索每 CTA 行数和每线程元素数。 |
+| `cutedsl` | `cutedsl` | 使用 [CuTe DSL 融合 kernel](../../../nanovllm/kernels/cute/activation.py)，通过 `from_dlpack` 接收 Tensor，使用官方 `autotune_jit` 搜索每 CTA 行数和每线程元素数，详见[实现思路](../../kernels/cute/activation/SiluAndMul.md)。 |
 
 - Triton 与 CuTe 都采用 **persistent kernel（持久化 kernel）**：网格上限为 SM 数的四倍，额外行块由 kernel 内循环处理。
 - 两个自定义后端当前支持连续的 CUDA FP16、BF16、FP32 输入，中间计算使用 FP32，写回时转换为输出精度。
