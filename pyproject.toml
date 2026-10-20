@@ -16,7 +16,12 @@ dependencies = [
     "triton>=3.0.0",
     "transformers>=4.51.0",
     "flash-attn>=2.8.3,<2.9",
-    "xxhash",
+    "numpy",
+    "pydantic>=2", # DeviceConfig 使用 SkipValidation。
+    "safetensors",
+    "tqdm",
+    "typing-extensions",
+    "cloudpickle", # Executor 的 callable 序列化入口。
     "ninja", # 为按需编译 LibTorch 扩展提供构建工具。
 ]
 
