@@ -18,7 +18,7 @@ logger = init_logger(__name__)
 def main() -> None:
     """读取模型目录和生成选项，输出结果后显式关闭 Engine。"""
     parser = argparse.ArgumentParser(description="Run nano-vLLM generation with local Qwen3.")
-    parser.add_argument("--model", default="/home/huangxy/models/Qwen3-0.6B", help="本地模型目录。")
+    parser.add_argument("--model", default="~/Models/Qwen3-0.6B", help="本地模型目录。")
     parser.add_argument("--max-tokens", type=int, default=64, help="每个请求最多生成的 token 数。")
     parser.add_argument(
         "--gpu-memory-utilization", type=float, default=0.9, help="当前实例的 GPU 显存预算比例。",

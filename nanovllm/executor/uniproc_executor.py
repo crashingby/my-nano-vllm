@@ -4,8 +4,9 @@ UniProcExecutor 通过 WorkerWrapperBase 延迟构造 rank 0 的 Worker，依次
 设备与加载权重。普通 RPC 用单元素列表保留 rank 维度；execute_model() 和
 sample_tokens() 使用 single_value=True，向调用方返回单个结果或单结果 Future。
 
-所有 Worker 方法都在当前线程调用。non_block=True 会在 Python 调用返回后封装
-已完成的 Future，不创建后台执行线程；GPU 工作的同步由 Worker / Runner 管理。
+所有 Worker 方法都在当前线程调用，不创建后台执行线程。non_block=True 时，
+普通结果封装为已完成的 Future；AsyncModelRunnerOutput 封装为 AsyncOutputFuture，
+由 result() 延后等待 GPU 到 CPU 的拷贝，使 CPU 调度可以与 GPU 工作重叠。
 """
 
 
@@ -22,12 +23,28 @@ from nanovllm.worker.worker_base import WorkerBase, WorkerWrapperBase
 from nanovllm.logger import init_logger
 from nanovllm.serial_utils import run_method
 from nanovllm.utils.network_utils import get_distributed_init_method, get_ip, get_open_port
-if TYPE_CHECKING:
-    from nanovllm.core.sched.output import SchedulerOutput
-    from nanovllm.outputs import ModelRunnerOutput
+from nanovllm.core.sched.output import SchedulerOutput
+from nanovllm.outputs import ModelRunnerOutput,AsyncModelRunnerOutput
 
 logger = init_logger(__name__)
 
+class AsyncOutputFuture(Future):
+    def __init__(self, async_output: AsyncModelRunnerOutput, single_value: bool):
+        self.async_output = async_output
+        self.single_value = single_value
+        super().__init__()
+
+    def result(self, timeout=None):
+        if timeout is not None:
+            raise RuntimeError("timeout not implemented")
+
+        if not super().done():
+            try:
+                output = self.async_output.get_output()
+                self.set_result(output if self.single_value else [output])
+            except Exception as e:
+                self.set_exception(e)
+        return super().result()
 
 class UniProcExecutor(Executor):
     """管理一个本地 driver Worker，提供同步执行及 Future 形式的结果包装。
@@ -152,9 +169,9 @@ class UniProcExecutor(Executor):
     ) -> Any:
         """在当前线程调用本地 Wrapper，并按两个标记包装 Worker 结果。
 
-        non_block=False 时返回 result 或 [result]；non_block=True 时在调用
-        结束后返回已完成的 Future，其结果仍由 single_value 决定。此处的
-        Future 表示 Python 调用结果已就绪，CUDA 同步仍由具体 Worker 方法管理。
+        non_block=False 时等待异步输出并返回 result 或 [result]；non_block=True
+        时将异步输出交给 AsyncOutputFuture 延后回收，普通结果或调用异常则保存
+        到已完成的 Future。两种路径均由 single_value 决定是否包装 rank 列表。
 
         Args:
             method: Wrapper / Worker 方法名，或接收 Wrapper 作为首参的 callable。
@@ -162,8 +179,8 @@ class UniProcExecutor(Executor):
             timeout: 保留公共 RPC 参数，当前不使用，不会中断已开始的本线程调用。
             args: 目标方法的位置参数，callable 的 Wrapper 首参由 run_method 补入。
             kwargs: 目标方法的关键字参数，None 时在本次调用中创建空字典。
-            non_block: 为 True 时将返回值或异常保存到 Future；实际调用仍在当前
-                线程执行，返回前不会提交后台任务。
+            non_block: 为 True 时返回 Future，并延后异步输出的 CPU 回收；Worker
+                的 Python 调用仍在当前线程执行，CUDA 工作可以继续异步运行。
             single_value: 为 True 时保留单个结果，为 False 时包装为单元素列表。
                 即使 Worker 返回 None，也分别保持 None 与 [None] 的区别。
 
@@ -189,11 +206,15 @@ class UniProcExecutor(Executor):
             # result 是 Wrapper 适配或 Worker 执行后的原始返回值，可能为 None。
             result=run_method(self.driver_worker,method,args,kwargs)
             # 普通 RPC 保留外层 rank 列表，single_value 调用直接使用原结果。
+            if isinstance(result, AsyncModelRunnerOutput):
+                result = result.get_output()
             return result if single_value else [result]
         # Future 分支也先在当前线程执行，只改变结果和异常的交付形式。
         try:
             result=run_method(self.driver_worker,method,args,kwargs)
-            # future 初始为 pending；set_result() 后变为已完成，包装规则与同步一致。
+            # 异步采样结果必须延后 get_output()，避免此处同步 D2H 阻塞下一轮调度。
+            if isinstance(result, AsyncModelRunnerOutput):
+                return AsyncOutputFuture(result, single_value)
             future = Future[Any]()
             future.set_result(result if single_value else [result])
         # e 是目标调用抛出的原异常，保存同一个异常对象以保留其错误信息与 traceback。
@@ -238,8 +259,7 @@ class UniProcExecutor(Executor):
             single_value=True,
         )
 
-        # 当前 Future 在创建后即完成；调用 result() 不改变成功返回值的包装，
-        # 只让已经发生的执行错误立即沿调用栈暴露给 Engine。
+        # 仅检查已经完成的 Future，让 Python 执行错误立即暴露，不提前等待异步输出。
         if non_block and output.done():
             output.result()
 
@@ -254,8 +274,8 @@ class UniProcExecutor(Executor):
         包装，正常调用不进入基类 sample_tokens() 的列表取首项路径。
 
         Args:
-            non_block: 是否返回单结果 Future。为 True 时，Worker 的 Python 调用
-                仍先执行完成，再将结果或异常保存到 Future。
+            non_block: 是否返回单结果 Future。异步 Runner 输出经 AsyncOutputFuture
+                延后等待 D2H；Worker 的 Python 调用仍在本线程完成。
 
         Returns:
             ModelRunnerOutput，或 result() 为该对象的 Future。输出包含请求 ID、
@@ -266,8 +286,8 @@ class UniProcExecutor(Executor):
                 Future 形式的该错误保存在 Future 内，调用 result() 时再抛出。
 
         Side Effects:
-            Worker 消费执行状态、进行采样与同步 CPU 结果，并回写有效 token 镜像；
-            Scheduler 的权威进度由外层随后提交。
+            Worker 消费执行状态、提交采样并更新 token 镜像；异步模式延后回收
+            CPU 结果，Scheduler 的权威输出历史由外层消费结果时更新。
         """
         # single_value=True 在 collective_rpc 内完成单结果适配，保留 Future 本身。
         return self.collective_rpc(
@@ -298,10 +318,9 @@ class UniProcExecutor(Executor):
 
     @classmethod
     def supports_async_scheduling(cls) -> bool:
-        """声明当前执行器不支持调度与模型执行重叠，返回 False。
+        """声明支持通过异步输出回收，使 CPU 调度与 GPU 工作重叠。
 
-        non_block=True 仅改变结果包装；当前没有后台调用或 AsyncModelRunnerOutput
-        的延迟结果协议。调用方仍需完成本轮 forward / sampling 状态消费后再推进
-        下一轮调度，不能因为收到 Future 就提前复用 Runner 的固定输入缓冲区。
+        Worker 在本线程提交 forward 和 sampling，AsyncOutputFuture 延后等待
+        D2H；Runner 通过 GPU token 回填准备下一轮输入，无需先取得 CPU token。
         """
-        return False
+        return True

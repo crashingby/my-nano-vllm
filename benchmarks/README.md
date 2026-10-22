@@ -272,13 +272,16 @@ TPOT 的均值对请求等权，ITL 的均值对 token 间隔等权。不同请�
 
 ### 时间戳怎样采集
 
-当前 `LLMEngine.step()` 返回本轮已完成请求的完整输出。延迟脚本在提交时取得
+当前 `LLMEngine.step()` 返回 `(dict[int, EngineCoreOutputs], 本轮调度 token 数)`。
+字典按 client 分组，每条输出的 `new_token_ids` 仅包含本轮增量，`finished`
+表示请求已经结束。吞吐脚本逐轮累计增量 token；`generate()` 自行累计完整结果。
+延迟脚本在提交时取得
 Scheduler 中的 Request 引用，每轮 `step()` 返回后立即采集一次时间，并检查各个
 活跃 Request 的 `num_output_tokens`。长度增加 1 时，追加一个 token 时间戳；
 中间 prefill chunk 长度保持不变，等待时间自然进入 TTFT 或下一次 ITL。
 
 请求完成时 Scheduler 会把它移出活跃表，benchmark 仍持有原来的 Request 引用，
-因此能在处理完成结果前记录最后一个 token。随后对照完整 completion 校验时间戳
+因此能在处理完成标记前记录最后一个 token。随后对照 Request 的实际输出长度校验时间戳
 数量，移除活跃引用并补充下一条请求。当前每请求每步最多产生一个 token，遇到
 多个新增 token 会直接报错，保留逐 token 间隔的明确含义。
 

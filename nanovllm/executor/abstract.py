@@ -230,7 +230,7 @@ class Executor(ABC):
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
         non_block: bool = False,
-    ) -> list[_R] | Future[list[_R]]:
+    ) :
         """由具体 Executor 调用 Worker，并组织普通 RPC 的 rank 有序结果。
 
         此抽象接口约定同步返回 list[_R]，Future 形式返回 Future[list[_R]]。

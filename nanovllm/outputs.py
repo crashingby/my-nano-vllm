@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-
+from nanovllm.compilation.cuda_graph import CUDAGraphStat
+from abc import ABC, abstractmethod
 import torch
 
 
@@ -37,5 +38,18 @@ class ModelRunnerOutput:
     # 这里不考虑投机解码，但是元素还是list[int]
     sampled_token_ids: list[list[int]] = field(default_factory=list)
 
+    cudagraph_stats: CUDAGraphStat | None = None
+
+# ModelRunnerOutput wrapper for async scheduling.
+class AsyncModelRunnerOutput(ABC):
+    @abstractmethod
+    def get_output(self) -> ModelRunnerOutput:
+        """Get the ModelRunnerOutput for this async output.
+
+        This is a blocking call that waits until the results are ready, which
+        might involve copying device tensors to the host.
+        This method should only be called once per AsyncModelRunnerOutput.
+        """
+        pass
 
 EMPTY_MODEL_RUNNER_OUTPUT = ModelRunnerOutput(req_ids=[], req_id_to_index={})

@@ -12,7 +12,7 @@ logger = init_logger(__name__)
 class BenchmarkStats:
     """记录一次回放的实际工作量与计时区间。
 
-    输入量按提交的逻辑 prompt 统计，输出量按 Engine 的完成结果统计。
+    输入量按提交的逻辑 prompt 统计，输出量按 Engine 实际生成的 token 统计。
     scheduled_tokens 来自 step() 的非负返回值，不包含 Graph padding。
     elapsed 只覆盖请求提交与执行，不包含数据准备、模型初始化和最终清理。
     """

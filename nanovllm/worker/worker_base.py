@@ -16,7 +16,7 @@ import torch
 from torch import nn
 
 from nanovllm.kv_cache_interface import KVCacheSpec
-from nanovllm.outputs import ModelRunnerOutput
+from nanovllm.outputs import ModelRunnerOutput,AsyncModelRunnerOutput
 from nanovllm.core.sched.output import SchedulerOutput
 from nanovllm.config import NanovllmConfig, set_current_config
 from nanovllm.kv_cache_interface import KVCacheConfig
@@ -232,7 +232,7 @@ class WorkerBase:
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
-    ) -> ModelRunnerOutput | None:
+    ) -> ModelRunnerOutput |AsyncModelRunnerOutput| None:
         """消费一轮调度计划，并按返回值指示是否需要继续采样。
 
         正式 KV 初始化和预热完成后调用；返回 None 时，调用方必须先调用
@@ -252,7 +252,7 @@ class WorkerBase:
             执行时写入 KV 并保存待采样状态；当前 Runner 会拒绝覆盖未消费的状态。
         """
         raise NotImplementedError
-    def sample_tokens(self) -> ModelRunnerOutput:
+    def sample_tokens(self) -> ModelRunnerOutput|AsyncModelRunnerOutput:
         """消费 execute_model() 返回 None 时暂存的 logits，完成本轮采样。
 
         每次待采样状态只消费一次。当前 GPU Worker 执行 temperature 采样，

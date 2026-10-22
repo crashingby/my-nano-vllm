@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import field
+
+from nanovllm.config.utils import config
 
 
-@dataclass(slots=True)
+@config(slots=True)
 class ParallelConfig:
     """描述模型执行时采用的并行策略。
 

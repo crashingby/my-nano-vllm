@@ -5,20 +5,24 @@ LLMEngine 是当前单进程、同步执行 MVP 中的中心编排层：
 1. 接收用户 prompt 并构造 Request。
 2. 调用 Scheduler 形成一次连续批处理的 SchedulerOutput。
 3. 通过 Executor / Worker 将 SchedulerOutput 交给 GPUModelRunner 执行模型。
-4. 在模型成功执行后提交 token 进度、写入 prefix cache。
-5. 追加采样 token，判断 EOS / 长度停止条件，并通知 Scheduler 释放资源。
+4. 将执行结果交给 Scheduler.update_from_output()，更新请求并清理结束状态。
+5. generate() 累计增量输出，按输入顺序返回完整生成结果。
 
 Engine 通过 Executor 初始化执行端、测量显存并下发 KV 分配方案；Scheduler
 负责调度策略和物理 KV block 生命周期，GPUModelRunner 负责 Worker 侧 request
 状态、输入张量准备和模型 forward。Engine 不直接维护第二份请求状态。
 
-启动、单步执行和关闭通过 Executor 访问 Worker；请求结果处理暂保留在本类。
+启动、单步执行和关闭通过 Executor 访问 Worker；逻辑状态处理统一由 Scheduler 负责。
 """
 
 from __future__ import annotations
 
 import atexit
+from collections import deque
+from concurrent.futures import Future
+from typing import cast
 from collections.abc import Callable
+from dataclasses import replace
 from itertools import count
 from time import perf_counter
 
@@ -32,13 +36,15 @@ from nanovllm.core.kv_cache_utils import (
     get_request_block_hasher,
     init_none_hash,
 )
-from nanovllm.core.sched.output import SchedulerOutput
 from nanovllm.core.sched.scheduler import Scheduler
+from nanovllm.core.sched.async_scheduler import AsyncScheduler
+from nanovllm.core.sched.output import SchedulerOutput
+from nanovllm.outputs import ModelRunnerOutput
 from nanovllm.distributed import cleanup_dist_env_and_memory
+from nanovllm.engine import EngineCoreOutputs
 from nanovllm.executor.abstract import Executor
 from nanovllm.kv_cache_interface import KVCacheConfig
 from nanovllm.logger import init_logger
-from nanovllm.outputs import ModelRunnerOutput
 from nanovllm.request import Request, RequestStatus
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.utils.hashing import get_hash_fn_by_name
@@ -87,7 +93,7 @@ class LLMEngine:
         # executor_class 是执行器类型；先选择类型，使不支持的 TP 配置在加载执行端前报错。
         executor_class = Executor.get_class(self.vllm_config)
         logger.info("Loading tokenizer from %s", self.vllm_config.model_config.model)
-        # EOS 必须在创建 Scheduler 前写入 NanovllmConfig，因为 Scheduler 保存 EOS 配置。
+        # 保存 tokenizer 的主 EOS，提交请求时再绑定到独立的采样参数。
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.vllm_config.model_config.model,
             use_fast=True,
@@ -118,11 +124,26 @@ class LLMEngine:
                 caching_hash_fn=caching_hash_fn,
             )
         )
-        # Scheduler 的 CPU block 池与 Worker 的 GPU pages 使用同一方案，包含保留空块 0。
-        self.scheduler: Scheduler = Scheduler(
+
+        self.async_scheduling = (
+            self.vllm_config.scheduler_config.async_scheduling
+        )
+        # 调度器和 Runner 使用同一个异步开关。
+        scheduler_cls = AsyncScheduler if self.async_scheduling else Scheduler
+        self.scheduler: Scheduler = scheduler_cls(
             vllm_config=self.vllm_config,
             kv_cache_config=kv_cache_config,
+            include_finished_set=True,
         )
+        # 当前只有单 Worker，异步模式先允许两批工作在途。
+        self.batch_queue_size = 2 if self.async_scheduling else 1
+        self.batch_queue: (
+            deque[tuple[Future[ModelRunnerOutput], SchedulerOutput]] | None
+        ) = None
+
+        if self.batch_queue_size > 1:
+            self.batch_queue = deque(maxlen=self.batch_queue_size)
+
         # 自动 ID 只需在当前 Engine 内唯一；调用者也可显式传入 request_id。
         self._request_id_counter = count()
         # close() 必须幂等，因为它既可能被用户调用，也会被 atexit 调用。
@@ -188,24 +209,20 @@ class LLMEngine:
         return scheduler_kv_cache_config
 
     def close(self) -> None:
-        """关闭执行端，再清理当前 Engine 使用的进程组和空闲设备缓存。
+        """等待在途结果，结束剩余请求，再关闭执行端和进程级资源。
 
-        用户调用和 atexit 回调共享该入口。沿用 vLLM EngineCore.shutdown() 的
-        核心顺序：先由 Executor / Worker 停止模型执行并清理模型、KV 引用，再
-        销毁进程内的 TP、WORLD 和默认 process group，最后回收空闲 allocator 缓存。
-        当前按同进程中一个 Engine 管理推理资源的生命周期组织关闭。
-
-        当前 Scheduler 只管理 CPU 请求队列和 KV block 元数据，没有 connector 或
-        事件发布器等需显式停止的外部资源，因此不额外增加 Scheduler.shutdown()。
+        用户调用和 atexit 回调共享该入口。关闭期间只回收已经提交的 Future，
+        不再调用 step() 提交新批次，也不向调用方交付生成结果。所有在途结果
+        处理完后，释放 Scheduler 请求，再清理 Worker、进程组和空闲设备缓存。
 
         Raises:
-            Exception: 执行端或进程组清理失败时继续向上传播。关闭开始后仍拒绝
-                新请求，重复 close() 不重试已经进入的关闭流程。
+            Exception: 在途结果失败时继续等待其余结果，完成清理后重新抛出首个
+                结果异常。执行端或进程组的清理异常也向上传播。
 
         Side Effects:
-            标记 Engine 已关闭，注销 atexit 回调，委托执行端清理并重置全局分布式
-            状态。未完成请求不再继续生成；仍被其他对象引用的 tensor 不会因清空
-            allocator 缓存而释放。调用方应在当前同步 step() 返回后调用。
+            标记 Engine 已关闭，注销 atexit 回调，排空在途队列并取消剩余请求，
+            重置全局分布式状态。调用方应在 step() 返回后调用；重复关闭不再执行
+            清理，仍被外部引用的 tensor 不会因清空 allocator 缓存而释放。
         """
         # 显式调用与退出回调可能重复进入；关闭流程只执行一次。
         if self._is_closed:
@@ -214,12 +231,29 @@ class LLMEngine:
         self._is_closed = True
         # 注册的 bound method 会持有 self；显式关闭时解除该引用，允许随后删除 Engine。
         atexit.unregister(self.close)
-        # Worker 先同步并清理执行资源，避免仍有模型任务依赖即将销毁的通信组。
-        self.model_executor.shutdown()
-        # 与 EngineCore 相同，由 Engine 层收尾进程级分布式状态和空闲设备缓存。
-        cleanup_dist_env_and_memory()
+        try:
+            pending_error: Exception | None = None
+            # 先等待旧批次的 D2H；不能在 GPU 仍引用输出时销毁 Runner 和通信组。
+            while self.batch_queue:
+                future, _ = self.batch_queue.pop()
+                try:
+                    future.result()
+                except Exception as error:
+                    # 一个失败结果不能阻止后续在途批次收尾，保留首个异常供调用方处理。
+                    if pending_error is None:
+                        pending_error = error
+            # 关闭不再继续生成，Worker 随后整体销毁，无需再调度完成通知批次。
+            self.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
+            if pending_error is not None:
+                raise pending_error
+        finally:
+            # 任一结果或请求清理报错后，仍须释放执行端与进程级资源。
+            try:
+                self.model_executor.shutdown()
+            finally:
+                cleanup_dist_env_and_memory()
 
-    def _get_next_request_id(self)->str:
+    def _get_next_request_id(self) -> str:
         """生成当前 Engine 内尚未使用的自动 request ID。
 
         Returns:
@@ -251,17 +285,17 @@ class LLMEngine:
             )
 
     def add_request(
-            self,
-            prompt: str | list[int],
-            sampling_params: SamplingParams,
-            request_id:str|None=None,
-            priority:int = 0
-        )->str:
+        self,
+        prompt: str | list[int],
+        sampling_params: SamplingParams,
+        request_id: str | None = None,
+        priority: int = 0,
+    ) -> str:
         """向 Engine 提交一个新的文本生成请求。
 
         Args:
             prompt: 原始字符串 prompt，或已由调用者编码好的 token IDs。
-            sampling_params: 本请求独占的采样配置。
+            sampling_params: 调用方的采样配置，Engine 复制后绑定本模型 EOS。
             request_id: 可选的调用方请求 ID；未提供时由 Engine 自动生成。
             priority: 预留给未来优先级调度的排序键；当前 Scheduler 仍采用 FCFS。
 
@@ -279,14 +313,21 @@ class LLMEngine:
         if self._is_closed:
             raise RuntimeError("Cannot add a request to a closed LLMEngine")
         # 字符串由 Engine 统一编码，避免调用者和 tokenizer 使用不同配置。
-        prompt_token_ids = (self.tokenizer.encode(prompt) if isinstance(prompt,str) else prompt)
+        prompt_token_ids = (
+            self.tokenizer.encode(prompt) if isinstance(prompt, str) else prompt
+        )
         self._validate_prompt(prompt_token_ids)
         # 自动 ID 方便 benchmark/example；服务端可传入自己的外部 request ID。
         if request_id is None:
             request_id = self._get_next_request_id()
+        # 对齐上游输入处理：复制请求参数，忽略 EOS 时不设置停止用的主 EOS。
+        sampling_params = replace(
+            sampling_params,
+            _eos_token_id=None if sampling_params.ignore_eos else self.vllm_config.eos,
+        )
         # Request 保存逻辑 token 序列和状态；物理 KV block 由 KVCacheManager 管理。
         request = Request(
-            request_id= request_id,
+            request_id=request_id,
             prompt_token_ids=prompt_token_ids,
             sampling_params=sampling_params,
             priority=priority,
@@ -294,7 +335,8 @@ class LLMEngine:
         )
         self.scheduler.add_request(request)
         return request_id
-    def abort_request(self,request_id:str)->bool:
+
+    def abort_request(self, request_id: str) -> bool:
         """取消一个仍处于 Engine 中的请求。
 
         Args:
@@ -312,177 +354,118 @@ class LLMEngine:
             finished_status=RequestStatus.FINISHED_ABORTED,
         )
         return True
-    def _cache_computed_blocks(
-        self,
-        scheduler_output:SchedulerOutput,
-    )->None:
-        """将本轮 forward 成功写入的完整 KV blocks 提交至 prefix cache。
 
-        Args:
-            scheduler_output: 刚刚成功执行完成的调度输出。
+    def step(self) -> tuple[dict[int, EngineCoreOutputs], int]:
+        """执行一轮同步调度，将结果交给 Scheduler 并返回各 client 的增量输出。
 
-        Side Effects:
-            通过 KVCacheManager 为已完整计算的逻辑 blocks 建立 hash 到物理 block 的
-            prefix-cache 映射。
-        """
-        # 只有实际进入 forward 的请求才可能写入新的 KV 内容。
-        for request_id in scheduler_output.num_scheduled_tokens:
-            request = self.scheduler.requests.get(request_id)
-            if request is None:
-                raise RuntimeError(
-                    f"Scheduled request disappeared before cache commit: "
-                    f"{request_id}"
-                )
-            # commit_scheduled_tokens 后，该数字正好表示本轮 forward 后的 KV 进度。
-            self.scheduler.kv_cache_manager.cache_blocks(
-                request=request,
-                num_tokens=request.num_computed_tokens
-            )
-    def _get_finished_status(
-        self,
-        request:Request,
-        output_token_id:int,
-    )->RequestStatus|None:
-        """根据追加后的输出 token 判断请求是否应结束。
-
-        Args:
-            request: 已追加本轮采样 token 的 Request。
-            output_token_id: 本轮刚生成并写入 Request 的 token ID。
+        执行顺序对应 vLLM EngineCore.step()，省略结构化输出和异步取消队列。
+        请求进度、前缀缓存、停止判断及资源回收均由 Scheduler 和 Manager 维护。
 
         Returns:
-            请求应结束时返回对应 ``FINISHED_*`` 状态；否则返回 ``None``.
+            第一个元素按 client_index 分组，每条输出只包含本轮新增 token。
+            第二个元素是实际调度 token 数，供 benchmark 累计计算工作量。
+            空闲时返回 ({}, 0)；零 token 清理批次仍会被送到 Worker。
 
         Side Effects:
-            请求结束时写入 ``request.stop_reason``。
-        """
-        # 总序列长度达到模型上下文上限后，不能再把后续 token 写入 KV cache。
-        if request.num_tokens >= self.vllm_config.model_config.max_model_len:
-            request.stop_reason = "length"
-            return RequestStatus.FINISHED_LENGTH_CAPPED
-        # max_tokens 只限制 completion，不包含 prompt token。
-        if request.num_output_tokens >= request.max_tokens:
-            request.stop_reason = "length"
-            return RequestStatus.FINISHED_LENGTH_CAPPED
-        # ignore_eos=True 时仍保留 EOS token，但继续将它作为普通 token 生成。
-        if not request.ignore_eos and output_token_id == self.scheduler.eos:
-            request.stop_reason = output_token_id
-            return RequestStatus.FINISHED_STOPPED
-
-        return None
-    def _process_model_output(
-        self,
-        model_runner_output:ModelRunnerOutput,
-    )->list[tuple[str,list[int]]]:
-        """将采样结果写回 Request，并收集本轮完成的请求。
-
-        Args:
-            model_runner_output: 按 req_ids 行序对齐的采样结果。中间 chunk 的行
-                是空列表，普通采样行只含一个 token ID。
-
-        Returns:
-            本轮结束请求的 ``(request_id, completion_token_ids)`` 列表。
-
-        Raises:
-            RuntimeError: ModelRunner 为不存在请求或未结束 chunked prefill 的请求返回
-                采样 token 时抛出，表示 Engine/Worker 协议不一致。
-        """
-        finished_outputs: list[tuple[str, list[int]]] = []
-        assert len(model_runner_output.sampled_token_ids) == len(model_runner_output.req_ids)
-        # 输出行与请求 ID 快照对齐；空行表示本轮只有 KV 写入，没有有效生成 token。
-        for request_id in model_runner_output.req_ids:
-            req_index = model_runner_output.req_id_to_index[request_id]
-            sampled_ids = model_runner_output.sampled_token_ids[req_index]
-            if not sampled_ids:
-                continue
-            assert len(sampled_ids) == 1  # 当前不支持投机解码或多分支采样。
-            output_token_id = sampled_ids[0]
-            request = self.scheduler.requests.get(request_id)
-            if request is None:
-                raise RuntimeError(
-                    f"ModelRunner returned a token for unknown request: "
-                    f"{request_id}"
-                )
-            # 中间 prefill chunk 只能写 KV，不能从不完整 prompt 的 logits 采样。
-            if request.is_prefill_chunk:
-                raise RuntimeError(
-                    "ModelRunner sampled an unfinished prefill request: "
-                    f"{request_id}"
-                )
-            # 新 token 尚未进入 KV；它会在下一次 step 作为待计算 token 被调度。
-            request.append_output_token_ids(output_token_id)
-            finished_status=self._get_finished_status(
-                request=request,
-                output_token_id=output_token_id,
-            )
-            if finished_status is None:
-                continue
-            # 先复制 completion；finish_requests 之后 Scheduler 可删除其权威 Request。
-            finished_outputs.append(
-                (request_id, request.output_token_ids.copy())
-            )
-            # Scheduler 统一处理队列移除、KV block 引用释放和 Worker 清理通知。
-            self.scheduler.finish_requests(
-                request_ids=[request_id],
-                finished_status=finished_status,
-            )
-        return finished_outputs
-    def step(self) -> tuple[list[tuple[str, list[int]]], int]:
-        """执行一次同步的调度、模型推理和结果提交。
-
-        沿用 vLLM EngineCore.step() 的执行顺序：检查是否还有请求或清理通知，
-        构造 SchedulerOutput，通过 Executor 执行模型，取得 Future 的结果，
-        必要时采样，最后提交 Scheduler 侧状态。当前结果提交仍由本类的
-        commit/cache/output 三个步骤组织，对应上游 Scheduler.update_from_output()。
-
-        Returns:
-            一个二元组：
-            - 第一个元素是本轮结束请求的 ``(request_id, completion_token_ids)``。
-            - 第二个元素是本轮实际执行的总 token 数，始终非负。仅处理 Worker
-              清理通知时返回 ``([], 0)``，并不意味着跳过了执行端调用。
-
-        Raises:
-            RuntimeError: Engine 已关闭，或请求与模型输出不符合执行协议。
-            Exception: 执行或采样失败时继续向上传播，不提交本轮计算进度。
-
-        Side Effects:
-            Scheduler 分配 KV blocks；Worker 更新请求镜像并执行模型与采样。
-            成功取得结果后，提交计算进度、缓存完整 KV blocks、追加生成 token，
-            并根据停止条件释放请求资源。当前没有执行失败后的自动回滚或重试。
-
-        Notes:
-            连续批处理中一个 batch 可同时含有 prefill、chunked prefill、decode 和
-            恢复请求，因此不再使用旧实现“正数代表 prefill、负数代表 decode”的
-            返回约定。non_block=True 只使用 Executor 的 Future 返回协议；当前
-            UniProcExecutor 在同线程完成调用，不产生调度与执行重叠。
+            调度时推进已承诺执行的进度，执行和采样后更新请求状态及完成通知。
+            执行失败直接向上传播，当前不支持进度回滚或原地重试。
         """
         if self._is_closed:
             raise RuntimeError("Cannot step a closed LLMEngine")
-        # 与 EngineCore 相同，待清理的已结束请求也算工作，不能只检查 waiting/running。
+        # 目前暂时用这个方式使用batch_queue()分支
+        if self.batch_queue is not None:
+            return self.step_with_batch_queue()
         if not self.scheduler.has_requests():
-            return [], 0
+            return {}, 0
 
-        # scheduler_output 固化本轮输入、KV 映射和生命周期事件，进度仍是 forward 前的值。
-        scheduler_output = self.scheduler.schedule()
-        # future 是单结果 Future。即使总 token 数为零，也要让 Runner 应用结束/抢占通知；
-        # Runner 会在同步状态后返回空输出，不执行模型 forward。
+        scheduler_output = self.scheduler.schedule()  # 已保存 forward 之前的输入快照。
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
-        # model_output 为 None 表示 forward 已完成、logits 待采样；空输出对象则无需采样。
-        model_output = future.result()
+        model_output = future.result()  # 同步消费本批结果，下一阶段再加入在途队列。
         if model_output is None:
-            # 当前仅有 temperature sampling，没有 grammar bitmask 或异步 abort 队列。
-            model_output = self.model_executor.sample_tokens()
+            model_output = self.model_executor.sample_tokens()  # 消费当前 forward 的 logits。
+        engine_core_outputs = self.scheduler.update_from_output(
+            scheduler_output, model_output,
+        )
+        return engine_core_outputs, scheduler_output.total_num_scheduled_tokens
 
-        # 对应上游 update_from_output() 的状态提交：执行和采样成功后才推进已计算 token 数；
-        # 零 token 调度也须提交，以轮换已经成功送达 Worker 的 finished_req_ids。
-        self.scheduler.commit_scheduled_tokens(scheduler_output)
-        # 已完成的 KV 进度先进入 prefix cache，不能把下面新生成、尚未 forward 的 token 算进去。
-        self._cache_computed_blocks(scheduler_output)
-        # finished_outputs 收集本轮完成的请求；新产生的结束通知由下一次调度下发给 Worker。
-        finished_outputs = self._process_model_output(model_output)
-        return finished_outputs, scheduler_output.total_num_scheduled_tokens
-    def is_finished(self):
-        """判断 Engine 是否已经没有等待或运行中的请求。"""
-        return self.scheduler.is_finish()
+    def step_with_batch_queue(
+        self,
+    ) -> tuple[dict[int, EngineCoreOutputs], int]:
+        """提前提交批次，并按提交顺序回收最旧结果。
+
+        每次调用最多提交一个批次。队列尚未填满时优先继续提交；
+        队列达到容量或没有新的调度工作时，等待最旧批次并更新 Scheduler。
+
+        Returns:
+            第一个元素是本次回收结果产生的增量输出，尚未回收时为空字典。
+            第二个元素是本次新提交的 token 数，纯回收调用返回零。
+
+        Side Effects:
+            提交 forward 和 sampling，维护在途队列，并在结果回收后更新
+            Scheduler。每批 forward 返回后的临时 logits 都会立即交给采样。
+        """
+        batch_queue = self.batch_queue
+        assert batch_queue is not None
+
+        # 本方法返回前始终保留至少一个空位，防止有界 deque 覆盖旧结果。
+        assert len(batch_queue) < self.batch_queue_size
+        # 返回值统计本次提交量，与本次回收的是哪一批结果分开。
+        num_scheduled_tokens = 0
+        if self.scheduler.has_requests():
+            scheduler_output = self.scheduler.schedule()
+
+            # 当前 UniProcExecutor 在本线程完成 forward 的 Python 调用，
+            # GPU 工作可以继续执行；调用错误会在这里立即暴露。
+            exec_future = self.model_executor.execute_model(
+                scheduler_output,
+                non_block=True,
+            )
+            num_scheduled_tokens = (
+                scheduler_output.total_num_scheduled_tokens
+            )
+            if num_scheduled_tokens > 0:
+                # 立即消费本轮 logits 并提交采样，延后的是 CPU 结果回收。
+                future = cast(
+                    Future[ModelRunnerOutput],
+                    self.model_executor.sample_tokens(non_block=True),
+                )
+            else:
+                # 零 token 批次已经完成 Worker 状态清理，不需要采样。
+                future = cast(Future[ModelRunnerOutput], exec_future)
+
+            # 左侧加入新批次，右侧回收旧批次，保持 FIFO。
+            batch_queue.appendleft((future, scheduler_output))
+
+            if len(batch_queue) < self.batch_queue_size and (
+                num_scheduled_tokens > 0
+                or self.scheduler.has_requests()
+            ):
+                # 先填充流水线，本次可以没有用户输出。
+                return {}, num_scheduled_tokens
+
+        elif not batch_queue:
+            # Scheduler 和在途队列均为空，没有结果需要继续回收。
+            return {}, 0
+        # 队列已满或没有新的调度工作，主动等待最旧结果。
+        future, scheduler_output = batch_queue.pop()
+        model_output = future.result()
+
+        # 必须使用该结果对应的原始快照，不能使用刚提交的新批次。
+        engine_core_outputs = self.scheduler.update_from_output(
+            scheduler_output,
+            model_output,
+        )
+        return engine_core_outputs, num_scheduled_tokens
+
+    def has_requests(self) -> bool:
+        """判断是否还有调度、结果回收或 Worker 清理工作。"""
+        return self.scheduler.has_requests() or bool(self.batch_queue)
+    def is_finished(self) -> bool:
+        """判断用户请求和在途结果是否均已结束。
+
+        Worker 完成通知仍由 has_requests() 判断，保持原有清理语义。
+        """
+        return self.scheduler.is_finish() and not self.batch_queue
 
     def generate(
         self,
@@ -494,7 +477,8 @@ class LLMEngine:
 
         先编码并校验整批 prompt，避免后面的无效输入使前面的请求滞留队列。
         各请求可有不同 temperature 和 max_tokens，也可因 EOS 或模型总长度
-        上限提前完成。中间 prefill chunk 没有生成结果时继续执行下一轮。
+        上限提前完成。每轮累计 EngineCoreOutputs 的增量 token；中间 prefill
+        chunk 没有生成结果时继续执行，取消请求返回此前已产生的 token。
 
         Args:
             prompts: 字符串 prompts，或每项均为 token IDs 的 prompts。
@@ -524,7 +508,7 @@ class LLMEngine:
                 )
             sampling_params_list = sampling_params
         else:
-            # 同一个 SamplingParams 可安全供多个不可变语义的 Request 共享。
+            # add_request() 为每个请求复制并绑定采样参数，不修改调用方的共享对象。
             sampling_params_list = [sampling_params] * len(prompts)
 
         # prompt_token_ids_list 保留每个 prompt 的编码结果；token IDs 输入不重复编码。
@@ -540,9 +524,9 @@ class LLMEngine:
             self.add_request(prompt=prompt_token_ids, sampling_params=params)
             for prompt_token_ids, params in zip(prompt_token_ids_list, sampling_params_list)
         ]
-        # 集合用于筛选本次调用的结果；列表仍用于最终按输入顺序组装返回值。
-        request_id_set = set(request_ids)
-        completed_token_ids: dict[str, list[int]] = {}
+        # 累计状态只属于本次 generate()，不再从已被 Scheduler 删除的 Request 取结果。
+        output_token_ids: dict[str, list[int]] = {req_id: [] for req_id in request_ids}
+        finished_request_ids: set[str] = set()  # 完成顺序独立于输入顺序。
         progress_bar = tqdm(
             total=len(request_ids),
             desc="Generating",
@@ -550,9 +534,9 @@ class LLMEngine:
             disable=not use_tqdm,
         )
         try:
-            while len(completed_token_ids) < len(request_ids):
+            while len(finished_request_ids) < len(request_ids):
                 step_start_time = perf_counter()
-                step_outputs, num_scheduled_tokens = self.step()
+                engine_core_outputs, num_scheduled_tokens = self.step()
                 step_elapsed = perf_counter() - step_start_time
                 # 展示本轮 packed token 吞吐；零 token 清理轮与零时间间隔不计算速率。
                 if num_scheduled_tokens > 0 and step_elapsed > 0:
@@ -560,25 +544,39 @@ class LLMEngine:
                     progress_bar.set_postfix(
                         {"Engine": f"{int(step_throughput)}tok/s"}
                     )
-                for request_id, token_ids in step_outputs:
-                    # Engine 可能同时服务 generate() 外部提交的请求；这里只收集本次
-                    # generate 调用自身的输出。
-                    if request_id in request_id_set:
-                        completed_token_ids[request_id] = token_ids
-                        progress_bar.update(1)
+                for client_outputs in engine_core_outputs.values():
+                    for output in client_outputs.outputs:
+                        if output.request_id not in output_token_ids:
+                            continue  # 仅收集本次调用提交的请求。
+                        output_token_ids[output.request_id].extend(
+                            output.new_token_ids
+                        )
+                        if output.finished:
+                            finished_request_ids.add(output.request_id)
+                            progress_bar.update(1)
+                    # 外部取消可能只有完成通知，保留该请求此前已产生的 token。
+                    for req_id in client_outputs.finished_requests or ():
+                        if (
+                            req_id in output_token_ids
+                            and req_id not in finished_request_ids
+                        ):
+                            finished_request_ids.add(req_id)
+                            progress_bar.update(1)
 
             # 最后一批请求结束后不会自然出现下一轮 forward，显式送达剩余清理通知。
             # 仍有其他活跃请求时，由后续正常 step() 一并处理，不额外推进它们的生成。
-            if self.scheduler.is_finish() and self.scheduler.has_requests():
-                self.step()
+            if self.scheduler.is_finish():
+                # 所有逻辑请求均已结束，排空迟到结果和 Worker 清理批次。
+                while self.has_requests():
+                    self.step()
         finally:
             progress_bar.close()
         return [
             {
                 "text": self.tokenizer.decode(
-                    completed_token_ids[request_id], skip_special_tokens=True,
+                    output_token_ids[request_id], skip_special_tokens=True,
                 ),
-                "token_ids": completed_token_ids[request_id],
+                "token_ids": output_token_ids[request_id],
             }
             for request_id in request_ids
         ]

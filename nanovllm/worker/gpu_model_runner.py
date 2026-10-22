@@ -60,6 +60,7 @@ from nanovllm.model_executor.layers.rotary_embedding import get_rope
 from nanovllm.logger import init_logger
 from nanovllm.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
+    AsyncModelRunnerOutput,
     ModelRunnerOutput,
     SamplerOutput,
 )
@@ -69,6 +70,47 @@ from nanovllm.compilation.monitor import (
 )
 from nanovllm.distributed.parallel_state import graph_capture
 logger = init_logger(__name__)
+
+# Wrapper for ModelRunnerOutput to support overlapped execution.
+class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
+    def __init__(
+        self,
+        model_runner_output: ModelRunnerOutput,
+        sampled_token_ids: torch.Tensor,
+        invalid_req_indices: list[int],
+        async_output_copy_stream: torch.cuda.Stream,
+        vocab_size: int,
+    ):
+        self._model_runner_output = model_runner_output
+        self._invalid_req_indices = invalid_req_indices
+
+        self.async_copy_ready_event = torch.Event()
+        self._sampled_token_ids = sampled_token_ids
+        self.vocab_size = vocab_size
+        default_stream = torch.cuda.current_stream()
+        with torch.cuda.stream(async_output_copy_stream):
+            async_output_copy_stream.wait_stream(default_stream)
+            self.sampled_token_ids_cpu = self._sampled_token_ids.to(
+                "cpu", non_blocking=True
+            )
+            self.async_copy_ready_event.record()
+    def get_output(self) -> ModelRunnerOutput:
+        """Copy the device tensors to the host and return a ModelRunnerOutput.
+
+        This function blocks until the copy is finished.
+        """
+        max_gen_len = self.sampled_token_ids_cpu.shape[-1]
+        self.async_copy_ready_event.synchronize()
+
+        del self._sampled_token_ids
+        if max_gen_len == 1:
+            valid_sampled_token_ids = self.sampled_token_ids_cpu.tolist()
+            for i in self._invalid_req_indices:
+                valid_sampled_token_ids[i].clear()
+        # 这里的else是干嘛的
+        output = self._model_runner_output
+        output.sampled_token_ids = valid_sampled_token_ids
+        return output
 
 class ExecuteModelState(NamedTuple):
     """保存 forward 与采样之间必须短暂保留的运行时状态。
@@ -180,6 +222,8 @@ class GPUModelRunner:
         # TODO:Attention计算的选项，例如alibi等
 
         # 采样器本身不持有请求状态；temperature 等请求级数据属于 InputBatch。
+
+        self.use_async_scheduling = self.scheduler_config.async_scheduling
         # TODO:Sampler以后还有参数
         self.sampler = Sampler()
 
@@ -209,6 +253,15 @@ class GPUModelRunner:
             kernel_block_size=placeholder_block_size,
             logitsprocs=LogitsProcessors()
         )
+        # Separate cuda stream for overlapping transfer of sampled token ids from
+        # GPU to CPU when async scheduling is enabled.
+        self.async_output_copy_stream: torch.cuda.Stream | None = None
+        # cuda event to synchronize use of reused CPU tensors between steps
+        # when async scheduling is enabled.
+        self.prepare_inputs_event: torch.Event | None = None
+        if self.use_async_scheduling:
+            self.async_output_copy_stream = torch.cuda.Stream()
+            self.prepare_inputs_event = torch.Event()
         # 沿用上游：保存升序候选尺寸；后端解析后再生成实际合法的捕获 keys。
         self.cudagraph_batch_sizes = (
             sorted(self.compilation_config.cudagraph_capture_sizes)
@@ -245,6 +298,8 @@ class GPUModelRunner:
         )
         # packed token -> request 槽位的映射，用于批量生成位置和元数据。
         self.req_indices = self._make_buffer(self.max_num_tokens, dtype=torch.int64)
+        # 当前请求槽位到上一轮采样行号的映射；-1 表示没有可复用的上一轮结果。
+        self.prev_positions = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
         # 每个 request 本轮执行多少 token。
         self.num_scheduled_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int32
@@ -1063,48 +1118,36 @@ class GPUModelRunner:
         self.model = None  # type: ignore[assignment]
         get_rope.cache_clear()
 
+    def _get_or_create_async_output_copy_stream(self) -> torch.cuda.Stream:
+        """获取异步输出拷贝流，首次使用时创建并保存。"""
+        stream = self.async_output_copy_stream
+        if stream is None:
+            # 同一个 Runner 复用该流，避免每轮采样重复创建。
+            stream = torch.cuda.Stream()
+            self.async_output_copy_stream = stream
+        return stream
     def _update_states(
         self,
         scheduler_output: SchedulerOutput,
     ) -> Callable | None:
-        """将 SchedulerOutput 同步到 Worker 侧请求镜像和持久 InputBatch。
+        """更新 Worker 请求镜像和持久 InputBatch。
 
-        Scheduler 的 ``Request`` 是逻辑请求、调度进度和 KV block 所属关系的权威；
-        本方法维护的 ``self.requests`` 只是 ModelRunner 的执行镜像。每轮 forward 前，
-        Worker 必须先将这份镜像与 SchedulerOutput 对齐，才能从 InputBatch 中正确
-        gather token IDs、block table 和采样参数。
+        沿用官方实现的处理顺序：清理完成请求，移出未调度请求，
+        建立新请求镜像，更新运行中或恢复请求，最后重新入批并刷新 metadata。
 
-        当前 MVP 沿用 vLLM 的核心处理顺序：
-
-        1. 清除已经完成的 Worker 请求与持久 batch 槽位；
-        2. 将本轮未调度、抢占或需要重新恢复的请求移出 InputBatch；
-        3. 创建首次下发的新请求镜像；
-        4. 更新已经存在的 running/resumed 请求镜像；
-        5. 将本轮实际调度的请求重新加入持久 batch；
-        6. 压缩 batch 槽位并同步采样 metadata。
-
-        当前不支持投机解码，因此不像 vLLM 原版那样返回“forward 后延迟修正状态”的
-        回调；保留返回类型只是为了后续接入该扩展时不改变调用协议。
-
-        当前没有 vLLM 的 prev_sampled_token_ids GPU 快路径：上一轮采样已由
-        _bookkeeping_sync() 写回 CPU token matrix；移出 batch 后再加入的请求，
-        由 InputBatch.add_request() 从 output_token_ids 重建完整 token 行。
+        连续执行的异步请求通过 GPU 采样结果准备下一轮输入；重新入批的
+        异步请求则通过 Scheduler 提供的完整 token 快照恢复 CPU 输入。
 
         Args:
-            scheduler_output: 当前 engine step 的调度快照。它描述本轮需要执行的请求、
-                请求进度、KV block table 增量、抢占恢复和完成通知。
+            scheduler_output: 本轮调度快照，包含请求进度、block table 更新、
+                新请求、恢复请求和完成通知。
 
         Returns:
-            当前 MVP 始终返回 ``None``。未来投机解码或 hybrid model 可能返回一个
-            forward 后执行的状态修正回调。
-
-        Raises:
-            RuntimeError: SchedulerOutput 与 Worker 请求镜像不一致时抛出，例如
-                已存在请求的输出 token 数不匹配，或恢复请求仍残留在 InputBatch 中。
-            ValueError: 收到未知 cached request、重复 new request，或 token 进度非法时抛出。
+            当前不支持投机解码，不需要 forward 后的延迟修正回调，返回 None。
 
         Side Effects:
-            修改 ``self.requests``、``self.input_batch`` 及其 CPU/GPU staging metadata。
+            修改 requests、InputBatch 请求槽位、CPU token 行、block table
+            和采样 metadata，并提交相应 metadata 的设备拷贝。
         """
         # ------------------------------------------------------------------
         # 第一阶段：先完成全部删除。
@@ -1114,11 +1157,15 @@ class GPUModelRunner:
         # 因此必须保证所有 remove_request() 都发生在任意 add_request() 之前。
         # ------------------------------------------------------------------
 
-        # finished request 的 Worker 镜像已经不再可能恢复，可以彻底删除。
+        # 先删除已完成请求的 Worker 镜像。
         for req_id in scheduler_output.finished_req_ids:
-            self.requests.pop(req_id,None)
-            # 若该请求当前就在持久 batch 中，同时释放其物理槽位。
+            self.requests.pop(req_id, None)
+
+        # 再从持久 batch 中移除完成请求。
+        # 若同一 ID 同时出现在完成集合和新请求中，后续会重新建立镜像。
+        for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
+
         # 本轮真正要进入模型 forward 的 request 集合。
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
         cached_req_ids = self.input_batch.req_id_to_index.keys()
@@ -1189,14 +1236,12 @@ class GPUModelRunner:
             
             # 更新缓存状态
             req_state.num_computed_tokens = num_computed_tokens
-            # 当前同步单 Worker 中，sample_tokens() 会在上一轮直接更新
-            # req_state.output_token_ids；因此它必须已与 Scheduler 输出长度一致。
-            assert len(req_state.output_token_ids) == num_output_tokens, (
-                "Worker request mirror is out of sync with Scheduler: "
-                f"req_id={req_id!r}, "
-                f"worker_outputs={len(req_state.output_token_ids)}, "
-                f"scheduler_outputs={num_output_tokens}."
-            )
+            # 对齐 Scheduler 已经丢弃的输出后缀；原地截断以保留共享列表引用。
+            if num_output_tokens < len(req_state.output_token_ids):
+                del req_state.output_token_ids[num_output_tokens:]
+
+                # 当前总长度由 prompt 长度和 output 列表长度推导，
+                # 无需额外更新官方实现中的 num_tokens_no_spec 数组。
             
             # 更新 Worker mirror 中的逻辑 block table。
             if not resumed_from_preemption:
@@ -1210,8 +1255,16 @@ class GPUModelRunner:
                 req_state.block_ids = new_block_ids
 
             if req_index is None:
-                # 请求此前不在持久 batch：可能是抢占恢复，也可能只是上一轮未被调度。
-                # add_request() 会写入完整 token 行和完整 block table。
+                # 请求此前未在持久 batch 中，可能被暂停，也可能被抢占后恢复。
+                if self.use_async_scheduling and num_output_tokens > 0:
+                    # 旧 Worker 输出列表可能含有 -1，必须从真实历史快照恢复。
+                    resumed_token_ids = req_data.all_token_ids[req_id]
+                    req_state.output_token_ids = resumed_token_ids[
+                        -num_output_tokens:
+                    ]
+
+                # 当前没有活跃槽位引用该列表，add_request() 会建立新的引用，
+                # 同时重建完整 CPU token 行、block table 和采样参数。
                 reqs_to_add.append(req_state)
                 continue
             # 请求持续留在 InputBatch 中，只更新会随调度轮次变化的 metadata。
@@ -1329,6 +1382,8 @@ class GPUModelRunner:
         self.query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
         self.query_start_loc.copy_to_gpu()
 
+        prev_req_id_to_index = self.input_batch.prev_req_id_to_index
+        self._compute_prev_positions(num_reqs)
 
         self.num_computed_tokens[:num_reqs].copy_(
                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
@@ -1510,7 +1565,7 @@ class GPUModelRunner:
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
-    ) -> ModelRunnerOutput | None:
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         """同步调度状态、执行 packed forward，并暂存下一步采样需要的 logits。
 
         prefill、decode 和 chunked prefill 共用同步 packed token 输入。
@@ -1543,75 +1598,75 @@ class GPUModelRunner:
                 "after execute_model() returns None."
             )
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        self._update_states(scheduler_output)
-        if not num_scheduled_tokens:
-            return EMPTY_MODEL_RUNNER_OUTPUT
-        # 当前 InputBatch 只维护一张 BlockTable，因此只接受一个 KV group。
-        assert len(self.kv_cache_config.kv_cache_groups) == 1, (
-            "execute_model() requires exactly one KV cache group."
-        )
-        # _update_states() 已经完成删除、添加和 condense；这里读取稳定槽位顺序。
-        num_reqs = self.input_batch.num_reqs
-        req_ids = self.input_batch.req_ids
-        # 必须使用 InputBatch 的槽位顺序，不能直接使用调度字典的 values()。
-        # token 行、block table、temperature 和 logits 都按这个顺序对齐。
-        tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
-        num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
-        # Attention kernel 需要单条请求的最大 query 长度；直接从 CPU 数组计算。
-        max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
-        
-        num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
-        # 整理 packed token IDs、positions、长度和 block-table slot mapping。
-        # 返回每条请求最后一个 query token 在 packed hidden states 中的位置。
-        logits_indices = self._prepare_inputs(
-            scheduler_output,
-            num_scheduled_tokens_np,
-        )
-        (
-            cudagraph_mode,
-            batch_desc,
-            _,
-            _,
-            _,
-        ) = self._determine_batch_execution_and_padding(
-            num_tokens=num_tokens_unpadded,
-            num_reqs=num_reqs,
-            num_scheduled_tokens_np=num_scheduled_tokens_np,
-            max_num_scheduled_tokens=max_num_scheduled_tokens,
-        )
-        num_tokens_padded = batch_desc.num_tokens
-        num_reqs_padded = (
-            batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
-        )
-        pad_attn = cudagraph_mode == CUDAGraphMode.FULL
-        # group 映射用于构造 metadata；layer 映射用于 forward context。
-        slot_mappings_by_group, slot_mappings_by_layer = (
-            self._get_slot_mappings(
-                num_tokens_padded=num_tokens_padded
-                if pad_attn
-                else num_tokens_unpadded,
-                num_reqs_padded=(
-                    num_reqs_padded if pad_attn else num_reqs
-                ),
-                num_tokens_unpadded=num_tokens_unpadded,
-                ubatch_slices=None,
+        with self.synchronize_input_prep():
+            self._update_states(scheduler_output)
+            if not num_scheduled_tokens:
+                return EMPTY_MODEL_RUNNER_OUTPUT
+            # 当前 InputBatch 只维护一张 BlockTable，因此只接受一个 KV group。
+            assert len(self.kv_cache_config.kv_cache_groups) == 1, (
+                "execute_model() requires exactly one KV cache group."
             )
-        )
-        # 当前不使用投机解码，所以只消费按 Attention 层名组织的 metadata。
-        attn_metadata, _ = self._build_attention_metadata(
-            num_tokens=num_tokens_unpadded,
-            num_tokens_padded=num_tokens_padded if pad_attn else None,
-            num_reqs=num_reqs,
-            num_reqs_padded=num_reqs_padded if pad_attn else None,
-            max_query_len=max_num_scheduled_tokens,
-            slot_mappings=slot_mappings_by_group,
-        )
-        # TODO:_preprocess是干啥的
-        # 固定缓冲区只取本轮有效前缀，避免把上轮残留 token 送入模型。
-        input_ids = self.input_ids.gpu[:num_tokens_padded]
-        positions = self.positions[:num_tokens_padded]
-        # 模型加载前调用会由 get_model() 明确报错。
-        model = self.get_model()
+            # _update_states() 已经完成删除、添加和 condense；这里读取稳定槽位顺序。
+            num_reqs = self.input_batch.num_reqs
+            req_ids = self.input_batch.req_ids
+            # 必须使用 InputBatch 的槽位顺序，不能直接使用调度字典的 values()。
+            # token 行、block table、temperature 和 logits 都按这个顺序对齐。
+            tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
+            num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
+            # Attention kernel 需要单条请求的最大 query 长度；直接从 CPU 数组计算。
+            max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
+            
+            num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+            # 整理 packed token IDs、positions、长度和 block-table slot mapping。
+            # 返回每条请求最后一个 query token 在 packed hidden states 中的位置。
+            logits_indices = self._prepare_inputs(
+                scheduler_output,
+                num_scheduled_tokens_np,
+            )
+            (
+                cudagraph_mode,
+                batch_desc,
+                _,
+                _,
+                _,
+            ) = self._determine_batch_execution_and_padding(
+                num_tokens=num_tokens_unpadded,
+                num_reqs=num_reqs,
+                num_scheduled_tokens_np=num_scheduled_tokens_np,
+                max_num_scheduled_tokens=max_num_scheduled_tokens,
+            )
+            num_tokens_padded = batch_desc.num_tokens
+            num_reqs_padded = (
+                batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
+            )
+            pad_attn = cudagraph_mode == CUDAGraphMode.FULL
+            # group 映射用于构造 metadata；layer 映射用于 forward context。
+            slot_mappings_by_group, slot_mappings_by_layer = (
+                self._get_slot_mappings(
+                    num_tokens_padded=num_tokens_padded
+                    if pad_attn
+                    else num_tokens_unpadded,
+                    num_reqs_padded=(
+                        num_reqs_padded if pad_attn else num_reqs
+                    ),
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    ubatch_slices=None,
+                )
+            )
+            # 当前不使用投机解码，所以只消费按 Attention 层名组织的 metadata。
+            attn_metadata, _ = self._build_attention_metadata(
+                num_tokens=num_tokens_unpadded,
+                num_tokens_padded=num_tokens_padded if pad_attn else None,
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs_padded if pad_attn else None,
+                max_query_len=max_num_scheduled_tokens,
+                slot_mappings=slot_mappings_by_group,
+            )
+            # TODO:_preprocess是干啥的
+            # 固定缓冲区只取本轮有效前缀，避免把上轮残留 token 送入模型。
+            input_ids = self.input_ids.gpu[:num_tokens_padded]
+            positions = self.positions[:num_tokens_padded]
+
         # Attention 层通过运行时上下文取得本轮 metadata 和 KV 写入位置。
         # 上下文必须在正常退出和异常退出时都恢复，避免污染下一轮执行。
         with set_forward_context(
@@ -1637,22 +1692,23 @@ class GPUModelRunner:
         # 保持 vLLM V1 的 forward / sampling 分离协议。
         return None
     @torch.inference_mode()
-    def sample_tokens(self) -> ModelRunnerOutput:
-        """对最近一次 forward 暂存的 logits 执行请求级采样。
+    def sample_tokens(self) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        """消费最近一次 forward 的 logits，执行采样并交付结果。
 
-        沿用 vLLM 的顺序：取出并清空临时执行状态，调用 _sample()，再通过
-        _bookkeeping_sync() 过滤候选并更新 Worker 状态，最后构造输出对象。
-        新 token 尚未进入 KV cache，已计算进度仍由下一轮调度快照同步。
+        执行顺序与 vLLM 保持一致：消费临时执行状态，执行采样，
+        清除上一轮 GPU token 引用，完成 bookkeeping，最后构造输出。
 
         Returns:
-            包含 request ID、batch index 与 sampled token IDs 的输出对象。
+            同步模式返回已经包含 CPU token 列表的 ModelRunnerOutput。
+            异步模式返回 AsyncGPUModelRunnerOutput，由 get_output()
+            等待设备到主机的拷贝完成后取得实际结果。
 
         Raises:
-            RuntimeError: 在 ``execute_model()`` 前调用，或重复调用时抛出。
+            RuntimeError: 没有待消费的 forward 结果时抛出。
 
         Side Effects:
-            消费并清空 execute_model_state，追加有效 output token，更新下一轮
-            CPU 输入；转换设备 tensor 到 list 时发生同步。
+            清空 execute_model_state，更新 Worker 输出列表和 CPU token 行。
+            异步模式追加占位 token，并保存本轮 GPU 结果供下一轮输入准备使用。
         """
         if self.execute_model_state is None:
             raise RuntimeError(
@@ -1662,12 +1718,19 @@ class GPUModelRunner:
         scheduler_output, logits = self.execute_model_state
         # 与 vLLM 一致，先消费短暂状态，防止同一份 logits 被重复采样。
         self.execute_model_state = None
+        # Sampler 只生成设备端候选，不在这里转换成 CPU token 列表。
         sampler_output = self._sample(logits)
-        # bookkeeping 只返回有效结果和请求映射，不负责创建对外输出对象。
+
+        # 上一轮 GPU token 已在本轮输入准备中使用完毕。
+        # bookkeeping 随后会保存当前轮结果，供下一轮输入准备使用。
+        self.input_batch.prev_sampled_token_ids = None
+
+        # 同步模式回写真实 token；异步模式回写占位并保存 GPU 结果。
         (
             valid_sampled_token_ids,
             req_ids_output_copy,
             req_id_to_index_output_copy,
+            invalid_req_indices,
         ) = self._bookkeeping_sync(scheduler_output, sampler_output)
 
         # 与 vLLM 一样，在采样与状态回写完成后统一构造 ModelRunnerOutput。
@@ -1676,7 +1739,18 @@ class GPUModelRunner:
             req_id_to_index=req_id_to_index_output_copy,
             sampled_token_ids=valid_sampled_token_ids,
         )
-        return output
+        # 同步模式在 bookkeeping 中已经取得 CPU 结果，直接返回即可。
+        if not self.use_async_scheduling:
+            return output
+        # 异步包装器在独立拷贝流上提交 D2H，保存完成事件和设备 tensor 引用。
+        async_output = AsyncGPUModelRunnerOutput(
+            model_runner_output=output,
+            sampled_token_ids=sampler_output.sampled_token_ids,
+            invalid_req_indices=invalid_req_indices,
+            async_output_copy_stream=self._get_or_create_async_output_copy_stream(),
+            vocab_size=self.input_batch.vocab_size,
+        )
+        return async_output
 
     def _sample(self, logits: torch.Tensor) -> SamplerOutput:
         """使用与 logits 行顺序一致的 InputBatch metadata 调用 Sampler。"""
@@ -1686,27 +1760,28 @@ class GPUModelRunner:
         self,
         scheduler_output: SchedulerOutput,
         sampler_output: SamplerOutput,
-    ) -> tuple[list[list[int]], list[str], dict[str, int]]:
-        """过滤无效 chunk 候选，并同步生成 token 的 Worker 状态。
+    ) -> tuple[
+        list[list[int]],
+        list[str],
+        dict[str, int],
+        list[int],
+    ]:
+        """过滤无效采样行，并更新 Worker 的输出状态。
 
-        保留 vLLM 同步路径的处理顺序：取得无效请求下标，复制请求映射，将
-        候选转换成 CPU 列表，先清空全部无效行，再回写有效 token。最后返回
-        sample_tokens() 构造输出所需的数据，不在本方法中创建输出对象。
+        同步模式取得真实 CPU token；异步模式保存 GPU token 和请求映射，
+        并通过 -1 占位维护 Worker 的逻辑输出长度。
 
         Args:
-            scheduler_output: 产生这些候选的调度计划。
-            sampler_output: ``[num_reqs, 1]`` 的设备端 token IDs。
+            scheduler_output: 本轮 forward 对应的调度快照。
+            sampler_output: 按当前请求槽位排列的设备端采样结果。
 
         Returns:
-            三元组，顺序对应 vLLM 返回值中当前支持的三项：
-            - valid_sampled_token_ids：按槽位排列的 CPU token 列表，无效行为 []。
-            - req_ids_output_copy：本轮请求 ID 列表的独立快照。
-            - req_id_to_index_output_copy：请求 ID 到输出行下标的独立快照。
+            依次返回 CPU token 列表、请求 ID 快照、请求到输出行的映射快照，
+            以及异步输出需要过滤的无效行下标。异步模式的 CPU token 列表为空。
 
         Side Effects:
-            同步拷贝采样 tensor 到 CPU，追加 CachedRequestState.output_token_ids，
-            并写入 InputBatch.token_ids_cpu。共享的 req_output_token_ids 列表随之
-            更新；不推进 num_computed_tokens，不写 KV cache。
+            更新 CPU token 行和 CachedRequestState.output_token_ids。
+            异步模式额外保存本轮 GPU 采样结果及其有效请求映射。
         """
         num_reqs = self.input_batch.num_reqs
         req_ids = self.input_batch.req_ids  # 所有长度和候选行均使用稳定槽位顺序。
@@ -1733,15 +1808,37 @@ class GPUModelRunner:
         sampled_token_ids = sampler_output.sampled_token_ids
         # 当前没有投机解码，每个请求必须恰好有一个设备端候选。
         assert sampled_token_ids.shape == (num_reqs, 1)
-        valid_sampled_token_ids = sampled_token_ids.tolist()  # 当前使用同步 D2H 路径。
-        # 先过滤所有无效行；后面的回写循环只需判断该行是否为空。
-        for i in discard_sampled_tokens_req_indices:
-            valid_sampled_token_ids[int(i)].clear()
+        invalid_req_indices: list[int] = []
+        if not self.use_async_scheduling:
+            # 同步模式在这里等待设备结果，并过滤未完成 prefill 的候选。
+            valid_sampled_token_ids = sampled_token_ids.tolist()
+            for i in discard_sampled_tokens_req_indices:
+                valid_sampled_token_ids[int(i)].clear()
+        else:
+            # CPU 结果由异步输出包装器延后提供，此处只读取 CPU 下标数组。
+            valid_sampled_token_ids = []
+            invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
+            invalid_req_indices_set = set(invalid_req_indices)
+
+            # 当前没有投机解码，本轮候选直接作为下一轮 GPU 回填来源。
+            self.input_batch.prev_sampled_token_ids = sampled_token_ids
+            # 无效行不参与下一轮 GPU 回填，避免使用未完成 prefill 的候选。
+            self.input_batch.prev_req_id_to_index = {
+                req_id: i
+                for i, req_id in enumerate(req_ids)
+                if i not in invalid_req_indices_set
+            }
 
         # 将有效 token 缓存在 Worker 中，Scheduler 下一轮只需同步输出数量。
         for req_idx in range(num_sampled_tokens):
-            sampled_ids = valid_sampled_token_ids[req_idx]
-            num_sampled_ids = len(sampled_ids)
+            if self.use_async_scheduling:
+                sampled_ids = (
+                    [-1] if req_idx not in invalid_req_indices_set else []
+                )
+            else:
+                sampled_ids = valid_sampled_token_ids[req_idx]
+
+            # 无效采样不增加输出长度，也不在 CPU 输入行中追加占位。
             if not sampled_ids:
                 continue
 
@@ -1749,7 +1846,7 @@ class GPUModelRunner:
             req_state = self.requests[req_id]
             # 无投机解码时，镜像的 num_tokens 等价于 vLLM 的 num_tokens_no_spec。
             start_idx = req_state.num_tokens  # 在完整 prompt + output 序列末尾追加。
-            end_idx = start_idx + num_sampled_ids
+            end_idx = start_idx + len(sampled_ids)
             assert end_idx <= self.max_model_len, (
                 "Sampled token IDs exceed the max model length: "
                 f"req_id={req_id!r}, num_tokens={end_idx}, "
@@ -1762,6 +1859,7 @@ class GPUModelRunner:
             valid_sampled_token_ids,
             req_ids_output_copy,
             req_id_to_index_output_copy,
+            invalid_req_indices,
         )
 
     
@@ -1943,73 +2041,73 @@ class GPUModelRunner:
         self.num_computed_tokens.zero_()
         self.seq_lens.zero_()
         self.optimistic_seq_lens_cpu.zero_()
-
-        # force_attention 用于 eager FA 预热，FULL 则必须把真实 Attention 纳入图。
-        if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
-            # 真实 FA 必须已有 KV 规格与 Builder；group 是唯一 KV group 内共享
-            # 后端和规格的一组 Attention 层，不能只有组信息而没有 Builder 实例。
-            if (
-                slot_mappings_by_group is None
-                or not self.attn_groups
-                or any(not group.metadata_builders for group in self.attn_groups[0])
-            ):
-                raise RuntimeError(
-                    "Attention dummy execution requires initialized KV cache and builders"
-                )
-            # max_scheduled_tokens 是本次实际最长 query，用于校验模拟 KV 能覆盖它。
-            max_scheduled_tokens = int(num_scheduled_tokens.max())
-            # 显式长度用于长上下文 workspace profiling；所有 dummy 请求共用此值。
-            if profile_seq_lens is not None:
-                if not max_scheduled_tokens <= profile_seq_lens <= self.max_model_len:
-                    raise ValueError(
-                        f"profile_seq_lens must be between {max_scheduled_tokens} "
-                        f"and {self.max_model_len}, got {profile_seq_lens}"
+        with self.synchronize_input_prep():
+            # force_attention 用于 eager FA 预热，FULL 则必须把真实 Attention 纳入图。
+            if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
+                # 真实 FA 必须已有 KV 规格与 Builder；group 是唯一 KV group 内共享
+                # 后端和规格的一组 Attention 层，不能只有组信息而没有 Builder 实例。
+                if (
+                    slot_mappings_by_group is None
+                    or not self.attn_groups
+                    or any(not group.metadata_builders for group in self.attn_groups[0])
+                ):
+                    raise RuntimeError(
+                        "Attention dummy execution requires initialized KV cache and builders"
                     )
-                # seq_lens 可以是一个标量，也可以是每请求的 CPU 长度 tensor。
-                seq_lens: int | torch.Tensor = profile_seq_lens
-            # 混合布局模拟短 decode 和 prefill 后一个 token 的上下文，沿用上游布局。
-            elif create_mixed_batch:
-                seq_lens = torch.tensor(
-                    [1] * num_decode_tokens
-                    + [min(num_prefill_tokens + 1, self.max_model_len)],
-                    dtype=torch.int32,
+                # max_scheduled_tokens 是本次实际最长 query，用于校验模拟 KV 能覆盖它。
+                max_scheduled_tokens = int(num_scheduled_tokens.max())
+                # 显式长度用于长上下文 workspace profiling；所有 dummy 请求共用此值。
+                if profile_seq_lens is not None:
+                    if not max_scheduled_tokens <= profile_seq_lens <= self.max_model_len:
+                        raise ValueError(
+                            f"profile_seq_lens must be between {max_scheduled_tokens} "
+                            f"and {self.max_model_len}, got {profile_seq_lens}"
+                        )
+                    # seq_lens 可以是一个标量，也可以是每请求的 CPU 长度 tensor。
+                    seq_lens: int | torch.Tensor = profile_seq_lens
+                # 混合布局模拟短 decode 和 prefill 后一个 token 的上下文，沿用上游布局。
+                elif create_mixed_batch:
+                    seq_lens = torch.tensor(
+                        [1] * num_decode_tokens
+                        + [min(num_prefill_tokens + 1, self.max_model_len)],
+                        dtype=torch.int32,
+                    )
+                # 普通布局沿用 max_query_len 上界，但读取长度不得超过固定页表容量。
+                else:
+                    seq_lens = min(max_query_len, self.max_model_len)
+                # 太长的单请求 query 无法用当前上下文容量表示，不能让 FA 越界读取页表。
+                if max_scheduled_tokens > self.max_model_len:
+                    raise ValueError("Dummy query length exceeds max_model_len")
+                # optimistic_seq_lens_cpu 为 metadata 提供无 GPU 同步的长度上界。
+                self.optimistic_seq_lens_cpu[:num_reqs] = seq_lens
+                self.seq_lens.copy_(self.optimistic_seq_lens_cpu, non_blocking=True)
+
+                # cum_num_tokens 是每个 dummy 请求的 packed query 终点，示例 [1,1,3]
+                # 得到 [1,2,5]；query_pos 是共用 helper 顺便填好的 query 内位置工作区。
+                cum_num_tokens = self._get_cumsum_and_arange(
+                    num_scheduled_tokens, self.query_pos.np,
                 )
-            # 普通布局沿用 max_query_len 上界，但读取长度不得超过固定页表容量。
-            else:
-                seq_lens = min(max_query_len, self.max_model_len)
-            # 太长的单请求 query 无法用当前上下文容量表示，不能让 FA 越界读取页表。
-            if max_scheduled_tokens > self.max_model_len:
-                raise ValueError("Dummy query length exceeds max_model_len")
-            # optimistic_seq_lens_cpu 为 metadata 提供无 GPU 同步的长度上界。
-            self.optimistic_seq_lens_cpu[:num_reqs] = seq_lens
-            self.seq_lens.copy_(self.optimistic_seq_lens_cpu, non_blocking=True)
+                # 起点显式置零；补齐请求是空 query，所以尾部重复最后一个有效终点。
+                self.query_start_loc.np[0] = 0
+                self.query_start_loc.np[1:num_reqs + 1] = cum_num_tokens
+                self.query_start_loc.np[num_reqs + 1:].fill(num_tokens_unpadded)
 
-            # cum_num_tokens 是每个 dummy 请求的 packed query 终点，示例 [1,1,3]
-            # 得到 [1,2,5]；query_pos 是共用 helper 顺便填好的 query 内位置工作区。
-            cum_num_tokens = self._get_cumsum_and_arange(
-                num_scheduled_tokens, self.query_pos.np,
-            )
-            # 起点显式置零；补齐请求是空 query，所以尾部重复最后一个有效终点。
-            self.query_start_loc.np[0] = 0
-            self.query_start_loc.np[1:num_reqs + 1] = cum_num_tokens
-            self.query_start_loc.np[num_reqs + 1:].fill(num_tokens_unpadded)
-
-            # 页表只读取保留空块；清除 CPU/GPU 旧页号，不改变页表 storage。
-            self.input_batch.block_table.block_table.cpu.fill_(NULL_BLOCK_ID)
-            self.input_batch.block_table.num_blocks_per_row.fill(0)
-            self.input_batch.block_table.commit_block_table(num_reqs_padded)
-            # pad_attn 表示是否使用 FULL 的固定 Attention 容量；NONE 使用有效尺寸。
-            pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
-            attn_metadata, _ = self._build_attention_metadata(
-                num_tokens=num_tokens_unpadded,
-                num_reqs=num_reqs,
-                max_query_len=max_query_len,
-                num_tokens_padded=num_tokens_padded if pad_attn else None,
-                num_reqs_padded=num_reqs_padded if pad_attn else None,
-                # FULL 首次调用可能自动捕获，也必须固定 max_seq_len 为最大上下文。
-                for_cudagraph_capture=is_graph_capturing or pad_attn,
-                slot_mappings=slot_mappings_by_group,
-            )
+                # 页表只读取保留空块；清除 CPU/GPU 旧页号，不改变页表 storage。
+                self.input_batch.block_table.block_table.cpu.fill_(NULL_BLOCK_ID)
+                self.input_batch.block_table.num_blocks_per_row.fill(0)
+                self.input_batch.block_table.commit_block_table(num_reqs_padded)
+                # pad_attn 表示是否使用 FULL 的固定 Attention 容量；NONE 使用有效尺寸。
+                pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
+                attn_metadata, _ = self._build_attention_metadata(
+                    num_tokens=num_tokens_unpadded,
+                    num_reqs=num_reqs,
+                    max_query_len=max_query_len,
+                    num_tokens_padded=num_tokens_padded if pad_attn else None,
+                    num_reqs_padded=num_reqs_padded if pad_attn else None,
+                    # FULL 首次调用可能自动捕获，也必须固定 max_seq_len 为最大上下文。
+                    for_cudagraph_capture=is_graph_capturing or pad_attn,
+                    slot_mappings=slot_mappings_by_group,
+                )
 
         # 当前尚无上游的异步 input-prep event 协议；启动 dummy 同步当前 stream，
         # 保证 pinned CPU metadata 的 H2D 已完成，也保证捕获 stream 能读取完整输入。
@@ -2165,7 +2263,28 @@ class GPUModelRunner:
             out=arange_out[:total_num_tokens],
         )
         return cu_num_tokens
+    def _compute_prev_positions(self, num_reqs: int) -> None:
+        """构建当前请求槽位到上一轮采样行号的映射。
 
+        请求的删除、加入和 batch 压缩可能改变当前槽位，因此必须通过
+        request ID 查找上一轮输出行，不能直接复用当前槽位下标。
+
+        Args:
+            num_reqs: 当前持久 batch 中的活跃请求数。
+
+        Side Effects:
+            更新 prev_positions 的 CPU 活跃前缀；没有上一轮有效结果的
+            请求填为 -1，不修改上一轮请求映射。
+        """
+        prev_req_id_to_index = self.input_batch.prev_req_id_to_index
+        prev_positions = self.prev_positions.np[:num_reqs]
+        # 首轮执行或上一轮没有有效采样时，所有请求均使用 CPU 输入。
+        if not prev_req_id_to_index:
+            prev_positions.fill(-1)
+            return
+        # 用请求 ID 连接两轮 batch，允许当前槽位顺序与上一轮不同。
+        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            prev_positions[i] = prev_req_id_to_index.get(req_id, -1)
     def _prepare_input_ids(
         self,
         scheduler_output: SchedulerOutput,
@@ -2173,20 +2292,92 @@ class GPUModelRunner:
         total_num_scheduled_tokens: int,
         cu_num_tokens: np.ndarray,
     ) -> None:
-        """将本轮 packed token IDs 从 CPU staging buffer 上传到 GPU。
+        """准备本轮 GPU 输入，并回填上一轮尚未同步到 CPU 的采样 token。
 
-        当前不支持异步调度、PP 或投机解码，因此不需要 vLLM 中依据
-        ``prev_sampled_token_ids`` 做 GPU scatter 的复杂路径。
+        没有上一轮 GPU 采样结果时，直接上传 CPU 输入。否则，根据
+        prev_positions 将上一轮结果复制到当前请求对应的 packed 输入位置。
+
+        当前仅支持单 token 采样，因此每个连续请求最多回填一个 token，
+        目标位置是该请求本轮 query 在 packed 输入中的最后一个位置。
 
         Args:
-            scheduler_output: 当前调度快照。保留参数以对齐 vLLM 接口。
-            num_reqs: 本轮活跃 request 数。当前保留以对齐 vLLM 接口。
-            total_num_scheduled_tokens: packed token 的实际数量。
-            cu_num_tokens: 各 request 的 packed query 累计长度。当前保留以对齐
-                vLLM 接口。
-        """
-        self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
+            scheduler_output: 当前调度快照。保留参数以对齐 vLLM 接口，
+                当前无投机解码，不需要读取其中的 draft token 信息。
+            num_reqs: 当前 batch 的活跃请求数。
+            total_num_scheduled_tokens: 本轮 packed 输入的有效 token 数。
+            cu_num_tokens: 各请求 query 长度的累计和，不包含起始零。
+                例如 query 长度为 [2, 3] 时，该数组为 [2, 5]。
 
+        Side Effects:
+            更新 input_ids.gpu 的有效区域。GPU 回填与后续 forward
+            使用同一计算流排序，不在此等待采样结果回传 CPU。
+        """
+        if self.input_batch.prev_sampled_token_ids is None:
+            # 普通路径：CPU staging 已包含本轮所需的全部输入。
+            self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
+            return
+        # 异步路径：部分 CPU 输入仍是占位，需要用上一轮 GPU 结果覆盖。
+        prev_positions = self.prev_positions.np[:num_reqs]
+        sample_flattened_indices: list[int] = []
+        prev_indices: list[int] = []
+        common_indices_match = True
+        max_flattened_index = -1
+
+        # 收集回填目标位置，以及对应的上一轮采样来源行。
+        for cur_index in range(num_reqs):
+            prev_index = prev_positions[cur_index]
+            if prev_index < 0:
+                # 新请求或上一轮未产生有效输出的请求使用 CPU 输入。
+                continue
+
+            prev_indices.append(int(prev_index))
+
+            # 无投机解码时，上一轮采样 token 位于本轮 query 的末尾。
+            flattened_index = int(cu_num_tokens[cur_index]) - 1
+            sample_flattened_indices.append(flattened_index)
+
+            # 来源行与目标位置一致时，可能使用连续切片拷贝。
+            common_indices_match &= prev_index == flattened_index
+            max_flattened_index = max(max_flattened_index, flattened_index)
+        num_common_tokens = len(sample_flattened_indices)
+        if num_common_tokens < total_num_scheduled_tokens:
+            # 存在 prefill 等 CPU 输入时先整体上传，随后覆盖其中的占位。
+            self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
+        if num_common_tokens == 0:
+            # 本轮没有可复用的上一轮结果，CPU 上传已经完成输入准备。
+            return
+        if (
+            common_indices_match
+            and max_flattened_index == num_common_tokens - 1
+        ):
+            # 来源行和目标位置恰好覆盖相同的连续前缀，可以省去索引构造和 scatter。
+            self.input_ids.gpu[:num_common_tokens].copy_(
+                self.input_batch.prev_sampled_token_ids[:num_common_tokens, 0],
+                non_blocking=True,
+            )
+            return
+        # batch 重排或目标位置不连续时，上传 packed 输入的目标下标。
+        sampled_tokens_index_tensor = torch.tensor(
+            sample_flattened_indices,
+            dtype=torch.int64,
+            pin_memory=self.pin_memory,
+        ).to(self.device, non_blocking=True)
+
+        # 上传上一轮采样 tensor 的来源行号，保持与目标下标逐项对应。
+        prev_common_req_indices_tensor = torch.tensor(
+            prev_indices,
+            dtype=torch.int64,
+            pin_memory=self.pin_memory,
+        ).to(self.device, non_blocking=True)
+
+        # 直接从 GPU 采样结果取值，覆盖 CPU staging 上传的占位 token。
+        self.input_ids.gpu.scatter_(
+            dim=0,
+            index=sampled_tokens_index_tensor,
+            src=self.input_batch.prev_sampled_token_ids[
+                prev_common_req_indices_tensor, 0
+            ],
+        )
     def _get_slot_mappings(
         self,
         num_tokens_padded:int,
@@ -2460,6 +2651,21 @@ class GPUModelRunner:
                     )
 
         return kv_caches
+    
+    @contextmanager
+    def synchronize_input_prep(self):
+        if self.prepare_inputs_event is None:
+            yield
+            return
+
+        # Ensure prior step has finished with reused CPU tensors.
+        # This is required in the async scheduling case because
+        # the CPU->GPU transfer happens async.
+        self.prepare_inputs_event.synchronize()
+        try:
+            yield
+        finally:
+            self.prepare_inputs_event.record()
 
     def _model_forward(
         self,

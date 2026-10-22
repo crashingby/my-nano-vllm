@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import field
 from typing import TYPE_CHECKING
 
 import torch
+from pydantic import ConfigDict
 from transformers import AutoConfig, PretrainedConfig
+
+from nanovllm.config.utils import config
 
 if TYPE_CHECKING:
     from nanovllm.config.parallel import ParallelConfig
     from nanovllm.model_executor.models.registry import _ModelRegistry
 
 
-@dataclass(slots=True)
+# torch.dtype 与 HF 配置是运行时对象，保留实例类型而不要求 Pydantic 展开其结构。
+@config(config=ConfigDict(arbitrary_types_allowed=True), slots=True)
 class ModelConfig:
     """描述一个已选择语言模型的结构和执行方式。
 

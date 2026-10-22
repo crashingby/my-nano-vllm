@@ -7,9 +7,10 @@ Graph 或探测 GPU。当前 FA2 连续批处理执行链已接入 FULL_DECODE_O
 """
 
 import enum
-from dataclasses import dataclass, field
+from dataclasses import field
 from typing import TYPE_CHECKING, Any
 
+from nanovllm.config.utils import config
 from nanovllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -104,7 +105,7 @@ class CUDAGraphMode(enum.Enum):
         return self != CUDAGraphMode.NONE
 
 
-@dataclass(slots=True)
+@config(slots=True)
 class CompilationConfig:
     """保存 CUDA Graph 配置，以及模型构建期间登记的静态 module 表。
 
@@ -141,16 +142,16 @@ class CompilationConfig:
             由 Attention 构造函数登记自身，供 Runner 查询后端和 KV 规格，并供
             ForwardContext 引用已构造的层。字典持有实际 module，不是请求 metadata。
     """
-    # 保留上游的 None 初始值与字段类型；总配置解析完成后再交给运行时组件。
-    cudagraph_mode: CUDAGraphMode = None  # type: ignore[assignment]
+    # None 表示等待总配置解析；显式传入 None 时也应通过构造期类型校验。
+    cudagraph_mode: CUDAGraphMode | None = None
     # 默认请求 0 次；当前 Runner 会提升到至少 1 次，独立 kernel warmup 另行执行。
     cudagraph_num_of_warmups: int = 0
     # None 等待 NanovllmConfig 推导；显式列表随后统一排序和验证容量约束。
-    cudagraph_capture_sizes: list[int] = None  # type: ignore[assignment]
+    cudagraph_capture_sizes: list[int] | None = None
     # 当前 Runner 自己维护固定地址 buffer；此预留字段尚无 piecewise 使用者。
     cudagraph_copy_inputs: bool = False
     # 这是 token 维度的捕获上限，不是最大上下文长度，也不是 KV cache block 数。
-    max_cudagraph_capture_size: int = None  # type: ignore[assignment]
+    max_cudagraph_capture_size: int | None = None
     # Worker 返回该模型级统计，Executor 汇总后回写；当前不累计局部 JIT 耗时。
     compilation_time: float = field(default=0.0, init=False)
     # 每个配置独立持有注册表；init=False 防止调用方注入外部 module 映射。

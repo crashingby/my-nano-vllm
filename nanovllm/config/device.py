@@ -1,16 +1,19 @@
 """模型执行设备配置；配置构造阶段不探测或初始化 CUDA。"""
 
-from dataclasses import dataclass, field
+from dataclasses import field
 from typing import Literal
 
 import torch
-from pydantic import SkipValidation
+from pydantic import ConfigDict, SkipValidation
+
+from nanovllm.config.utils import config
 
 # 沿用 vLLM 的设备类型别名，只保留当前支持的自动选择与 CUDA 后端。
 Device = Literal["auto", "cuda"]
 
 
-@dataclass(slots=True)
+# 设备对象交由 __post_init__ 规范化；Pydantic 仅建立其类型边界。
+@config(config=ConfigDict(arbitrary_types_allowed=True), slots=True)
 class DeviceConfig:
     """保存模型执行设备，保留 vLLM 的 device/device_type 两个成员。
 

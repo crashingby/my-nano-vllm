@@ -254,6 +254,10 @@ class InputBatch:
         # metadata 只引用活跃前缀；空 batch 初始化时 temperature 的形状为 [0]。
         self.sampling_metadata = self._make_sampling_metadata()
 
+        # 保存上一轮的设备端结果，下一轮输入准备直接读取它。
+        self.prev_sampled_token_ids: torch.Tensor | None = None
+        # 保存上一轮输出的行号，避免请求删除、加入或槽位移动后取错 token。
+        self.prev_req_id_to_index: dict[str, int] | None = None
     @property
     def req_ids(self) -> list[str]:
         """返回当前稳定 batch 中按物理槽位排序的 request IDs.
@@ -422,7 +426,8 @@ class InputBatch:
         # 删除槽位的排序、最小空槽位复用和最终 processor 更新均由同一个 builder
         # 维护，避免 InputBatch 私有状态与 processor 观察到的事件不一致。
         self.batch_update_builder.removed_append(req_index)
-
+        if self.prev_req_id_to_index is not None:
+            self.prev_req_id_to_index.pop(req_id, None)
         return req_index
 
     def swap_states(

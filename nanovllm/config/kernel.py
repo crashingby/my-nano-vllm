@@ -1,13 +1,13 @@
 """指定模型层构造时绑定的算子实现，不保存请求级执行状态。"""
 
-from dataclasses import dataclass
 from typing import Literal
 
+from nanovllm.config.utils import config
 
 SiluAndMulBackend = Literal["torch", "triton", "cutedsl"]
 
 
-@dataclass
+@config
 class KernelConfig:
     """选择算子后端，由模型层在构造时读取并固定本实例的执行入口。
 

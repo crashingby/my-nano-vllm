@@ -16,6 +16,7 @@ from nanovllm.config.load import LoadConfig
 from nanovllm.config.model import ModelConfig
 from nanovllm.config.parallel import ParallelConfig
 from nanovllm.config.scheduler import SchedulerConfig
+from nanovllm.config.utils import config
 from nanovllm.config.vllm import (
     NanovllmConfig,
     get_current_config,
@@ -35,6 +36,7 @@ __all__ = [
     "NanovllmConfig",
     "ParallelConfig",
     "SchedulerConfig",
+    "config",
     "get_current_config",
     "get_current_config_or_none",
     "get_layers_from_nanovllm_config",

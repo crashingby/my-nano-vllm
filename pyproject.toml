@@ -21,6 +21,7 @@ dependencies = [
     "safetensors",
     "tqdm",
     "typing-extensions",
+    "msgspec", # EngineCoreOutput / EngineCoreOutputs 的数据结构。
     "cloudpickle", # Executor 的 callable 序列化入口。
     "ninja", # 为按需编译 LibTorch 扩展提供构建工具。
 ]

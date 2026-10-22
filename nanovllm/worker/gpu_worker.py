@@ -22,7 +22,7 @@ from nanovllm.distributed import (
 from nanovllm.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from nanovllm.logger import init_logger
 from nanovllm.model_executor.warmup.kernel_warmup import kernel_warmup
-from nanovllm.outputs import ModelRunnerOutput
+from nanovllm.outputs import ModelRunnerOutput,AsyncModelRunnerOutput
 from nanovllm.platforms import current_platform
 from nanovllm.worker.gpu_model_runner import GPUModelRunner
 from nanovllm.worker.worker_base import WorkerBase,CompilationTimes
@@ -383,7 +383,7 @@ class Worker(WorkerBase):
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
-    ) -> ModelRunnerOutput | None:
+    ) -> ModelRunnerOutput|AsyncModelRunnerOutput | None:
         """执行一轮调度计划；返回 None 时由调用方继续触发 sample_tokens()。
 
         Args:
@@ -406,7 +406,7 @@ class Worker(WorkerBase):
         return self.model_runner.execute_model(scheduler_output)
 
     @torch.inference_mode()
-    def sample_tokens(self) -> ModelRunnerOutput:
+    def sample_tokens(self) -> ModelRunnerOutput|AsyncModelRunnerOutput:
         """消费最近一次 forward 的 logits，返回已按请求过滤的 CPU 采样结果。
 
         在 execute_model() 返回 None 后调用一次。Runner 完成 temperature

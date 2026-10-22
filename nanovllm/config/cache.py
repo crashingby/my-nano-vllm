@@ -1,7 +1,9 @@
 """KV cache 的分配策略及正式初始化后的容量镜像。"""
 
-from dataclasses import dataclass, field
+from dataclasses import field
 from typing import Literal
+
+from nanovllm.config.utils import config
 # 保留缓存精度的类型别名；当前未提供独立 dtype 字段，实际 KV 精度跟随模型。
 CacheDType = Literal[
     "auto",
@@ -9,7 +11,7 @@ CacheDType = Literal[
     "bfloat16",
 ]
 
-@dataclass(slots=True)
+@config(slots=True)
 class CacheConfig:
     """保存 KV cache 的配置策略和少量初始化后的运行时统计镜像。
 

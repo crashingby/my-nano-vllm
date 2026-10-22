@@ -1,7 +1,8 @@
 """模型权重加载策略配置，不负责模型构造或 checkpoint 文件读取。"""
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+
+from nanovllm.config.utils import config
 
 # 这些类型只供静态检查，运行时不导入 model_executor，避免加载器工厂循环依赖。
 if TYPE_CHECKING:
@@ -12,7 +13,7 @@ else:
     TensorizerConfig = Any
 
 
-@dataclass
+@config
 class LoadConfig:
     """描述权重加载方式，供已接入的 Loader 工厂和 BaseModelLoader 使用。
 

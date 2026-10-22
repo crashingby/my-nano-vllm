@@ -14,6 +14,10 @@ from typing import TYPE_CHECKING, Any,Callable
 from nanovllm.sampling_params import SamplingParams
 if TYPE_CHECKING:
     from nanovllm.core.kv_cache_utils import BlockHash
+from nanovllm.engine import(
+    FinishReason,
+    PrefillStats
+)
 
 class RequestStatus(IntEnum):
     """描述一个 :class:`Request` 在调度器中的生命周期状态。
@@ -51,6 +55,9 @@ class RequestStatus(IntEnum):
             运行和抢占状态均返回 ``False``。
         """
         return status > RequestStatus.PREEMPTED
+    @staticmethod
+    def get_finished_reason(status: "RequestStatus") -> FinishReason | None:
+        return _FINISHED_REASON_MAP.get(status)
 
 
 class Request:
@@ -75,8 +82,8 @@ class Request:
         _all_token_ids: ``prompt_token_ids + _output_token_ids``，是 KV cache
             逻辑位置和模型输入使用的完整 token 序列。
         num_prompt_tokens: prompt 的 token 数，在请求创建后保持不变。
-        num_computed_tokens: 已成功写入 KV cache 的逻辑 token 数；这是请求
-            进度的唯一真相来源。
+        num_computed_tokens: 已命中缓存或已承诺执行的逻辑进度。GPU 是否完成由
+            执行结果确认，不能单独依据这个数字判断。
         is_prefill_chunk: 本轮调度后是否仍有 prompt 或重算 token 未完成；它只
             是执行提示，不是 P/D 逻辑状态机。
         num_preemptions: 请求被抢占的累计次数，可供后续统计或策略使用。
@@ -91,6 +98,7 @@ class Request:
         prompt_token_ids: list[int],
         sampling_params: SamplingParams,
         priority: int = 0,
+        client_index: int = 0,
         arrival_time: float | None = None,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
     ) -> None:
@@ -120,6 +128,7 @@ class Request:
 
         # request_id 是逻辑请求跨 Scheduler、KVCacheManager 和 Worker 的共同身份。
         self.request_id: str = request_id
+        self.client_index: int = client_index
         # 当前 MVP 仍使用 FCFS；该字段提前保留，使未来可替换为优先级队列。
         self.priority: int = priority
         # 未传入时间时在创建点采样，避免排序时多次读取系统时钟。
@@ -144,9 +153,17 @@ class Request:
         # KV cache 的逻辑位置基于完整序列，因此单独维护 prompt + output 的拼接表。
         self._all_token_ids: list[int] = prompt_token_ids.copy()
 
+        # Used in async scheduling.
+        self.num_output_placeholders = 0
+        # Tokens of output in flight when the request was preempted: delivered
+        # on return, but must not mutate the reset counters.
+        self.num_stale_output_tokens = 0
+        self.num_in_flight_tokens = 0
+        
+        self.last_sched_seq = 0
         # prompt 长度在构造后不变，常用于判断 prefill 与生成长度上限。
         self.num_prompt_tokens: int = len(self.prompt_token_ids)
-        # 唯一的请求进度真相：已写入 KV cache 的 token 数。
+        # schedule() 返回前推进的调度进度，可能包含尚未完成的 GPU 写入。
         self.num_computed_tokens: int = 0
 
         # 仅用于标记“本轮之后仍有 prompt/recompute token 没算完”。
@@ -155,6 +172,8 @@ class Request:
 
         # 记录抢占次数，后续可用于统计和调度策略。
         self.num_preemptions: int = 0
+
+        self.prefill_stats: PrefillStats | None = PrefillStats()
         # 每项对应一个完整逻辑 token block 的 prefix hash。
         # 它与物理 block table 分离，抢占释放 KV 后仍可保留。
         self.block_hashes:list[BlockHash] =[]
@@ -208,6 +227,8 @@ class Request:
             当 ``self.status`` 为任意 ``FINISHED_*`` 状态时返回 ``True``。
         """
         return RequestStatus.is_finished(self.status)
+    def get_finished_reason(self) -> FinishReason | None:
+        return RequestStatus.get_finished_reason(self.status)
     def update_block_hashes(self)->None:
         """增量记录 Request 新出现的完整逻辑 token block hashes。
 
@@ -228,8 +249,8 @@ class Request:
         """追加模型本轮确认生成的一个或多个输出 token。
 
         此方法必须在模型采样结果确认后调用。它同时更新输出序列和完整序列，但
-        不推进 ``num_computed_tokens``：新 token 只有在下一次模型 forward 将其
-        写入 KV cache 后，才由 Scheduler 推进为已计算状态。
+        不推进 ``num_computed_tokens``：新 token 在下一次被调度时，才由
+        Scheduler 计入已承诺执行的进度。
 
         Args:
             token_ids: 单个采样 token，或同一轮确认的一组 token。投机解码接入后
@@ -248,7 +269,12 @@ class Request:
             self._output_token_ids.extend(token_ids)
             self._all_token_ids.extend(token_ids)
         self.update_block_hashes()
-
+    def take_prefill_stats(self) -> PrefillStats | None:
+        if self.prefill_stats is None:
+            return None
+        prefill_stats = self.prefill_stats
+        self.prefill_stats = None
+        return prefill_stats
     def __lt__(self, other: "Request") -> bool:
         """为未来的优先级队列定义稳定的请求排序。
 
@@ -270,3 +296,10 @@ class Request:
             return self.request_id < other.request_id
         # 极端情况下用对象身份打破平局，保证严格弱序关系。
         return id(self) < id(other)
+
+
+_FINISHED_REASON_MAP = {
+    RequestStatus.FINISHED_STOPPED: FinishReason.STOP,
+    RequestStatus.FINISHED_LENGTH_CAPPED: FinishReason.LENGTH,
+    RequestStatus.FINISHED_ABORTED: FinishReason.ABORT,
+}

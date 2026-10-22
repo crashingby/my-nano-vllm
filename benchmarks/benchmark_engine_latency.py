@@ -1,6 +1,6 @@
 """闭环回放本地同步 Engine，测量 TTFT、TPOT、ITL 和输出 TPS。
 
-当前 Engine 在请求完成时才返回 completion。本脚本保留活跃 Request 引用，
+当前 Engine 返回每轮增量 token 和完成标记。本脚本保留活跃 Request 引用，
 每轮 step() 返回后观察实际输出长度的增长，完成请求即使已从 Scheduler 移除，
 也能记录最后一个 token。测量包含 Engine 排队、执行和结果提交的本地耗时。
 """
@@ -71,7 +71,7 @@ def replay_requests(
     """持续补充请求并记录逐 token 时间，返回实际工作量及完整延迟记录。
 
     Args:
-        llm: 已加载模型并完成启动预热的空闲同步 Engine，由调用方负责关闭。
+        llm: 已加载模型并完成启动预热的空闲 Engine，由调用方负责关闭。
         requests: 已编码且 ID 唯一的请求，每条带有独立目标输出长度。
         sampling_params: temperature、ignore_eos 等公共生成选项。
         max_active: 闭环回放的活跃请求数上限，包含 Engine 中排队的已提交请求。
@@ -81,7 +81,7 @@ def replay_requests(
 
     Side Effects:
         提交并执行请求，更新模型 KV、采样 RNG 和 prefix cache。计时结束后额外
-        调用一次 step()，送达最后一批完成通知。不会额外调用 CUDA synchronize。
+        排空在途结果和完成通知，收尾不纳入计时。不会额外调用 CUDA synchronize。
         每请求每步最多新增一个 token；超出当前能力时抛错，避免制造虚假的 ITL。
     """
     if not requests or max_active < 1:
@@ -107,7 +107,7 @@ def replay_requests(
         )
     with nvtx_range("benchmark_loop"):
         while active_requests or next_request_idx < len(requests):
-            step_outputs, num_tokens = llm.step()
+            engine_core_outputs, num_tokens = llm.step()
             step_time = perf_counter() - start_time  # 返回后立即取时，同轮 token 共用此值。
             stats.num_engine_steps += 1
             stats.num_scheduled_tokens += num_tokens
@@ -121,15 +121,20 @@ def replay_requests(
                         f"Expected at most one new token per step for {request.request_id!r}, "
                         f"got {num_new_tokens}"
                     )
-            # 记录完本轮 token 后再移除完成请求，空 prefill step 不会制造 token 时间戳。
-            for request_id, completion_token_ids in step_outputs:
-                state = active_requests.pop(request_id, None)
-                if state is None:
-                    raise RuntimeError(f"Unexpected completion for {request_id!r}")
-                _, latency = state  # 对照完成列表校验实际输出长度，支持 EOS 提前结束。
-                latency.finish(step_time, len(completion_token_ids))
-                stats.num_finished += 1
-                stats.num_output_tokens += len(completion_token_ids)
+            # 增量输出的完成标记替代旧完成列表，保留真实 Request 校验时间戳数量。
+            for client_outputs in engine_core_outputs.values():
+                for output in client_outputs.outputs:
+                    if not output.finished:
+                        continue
+                    state = active_requests.pop(output.request_id, None)
+                    if state is None:
+                        raise RuntimeError(
+                            f"Unexpected completion for {output.request_id!r}"
+                        )
+                    request, latency = state
+                    latency.finish(step_time, request.num_output_tokens)
+                    stats.num_finished += 1
+                    stats.num_output_tokens += request.num_output_tokens
             # 释放出的容量在下一步执行前补满，后续请求拥有各自真实的提交时间。
             next_request_idx = _submit_requests(
                 llm, requests, request_sampling_params, stats, active_requests,
@@ -149,7 +154,9 @@ def replay_requests(
     stats.elapsed = perf_counter() - start_time  # 包含观察、补充请求和循环内日志的开销。
     if stats.num_finished != len(requests):
         raise RuntimeError("Latency replay did not complete every request")
-    llm.step()  # 最终 Worker 清理单独执行，不计入吞吐和请求延迟。
+    # 异步队列和最终 Worker 清理全部收尾，不计入吞吐和请求延迟。
+    while llm.has_requests():
+        llm.step()
     return stats
 
 

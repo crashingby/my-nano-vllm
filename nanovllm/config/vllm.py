@@ -9,8 +9,10 @@ from __future__ import annotations
 
 from collections.abc import Generator, Iterable
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import field
 from typing import TypeVar
+
+from pydantic import ConfigDict
 
 from nanovllm.config.cache import CacheConfig
 from nanovllm.config.compilation import CUDAGraphMode, CompilationConfig
@@ -20,12 +22,14 @@ from nanovllm.config.load import LoadConfig
 from nanovllm.config.model import ModelConfig
 from nanovllm.config.parallel import ParallelConfig
 from nanovllm.config.scheduler import SchedulerConfig
+from nanovllm.config.utils import config
 from nanovllm.logger import init_logger
 
 logger = init_logger(__name__)
 
 
-@dataclass(slots=True)
+# 聚合配置允许子配置持有 torch 和 Transformers 对象，并保留原实例引用。
+@config(config=ConfigDict(arbitrary_types_allowed=True), slots=True)
 class NanovllmConfig:
     """聚合一次 nano-vLLM Engine 实例所需的全部推理配置。
 

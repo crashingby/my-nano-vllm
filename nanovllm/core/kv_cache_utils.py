@@ -164,6 +164,8 @@ class KVCacheBlock:
             队列，但仍可保留 hash，作为可复用的 prefix cache。
         _block_hash: 完整逻辑 block 的前缀相关 hash。``None`` 表示该 block 尚
             未提交到 prefix cache，或已经被重新分配并清理旧缓存身份。
+        prev_free_block: 空闲队列中的前驱，仅由 FreeKVCacheBlockQueue 维护。
+        next_free_block: 空闲队列中的后继，分配出队后与前驱一起清空。
         is_null: 是否为永久保留的空块；该块不分配给请求，也不参与 prefix cache。
     """
 
@@ -173,6 +175,9 @@ class KVCacheBlock:
     ref_cnt: int = 0
     # _block_hash 只能在一个 block 首次被缓存时设置，重用时通过 reset_hash 清理。
     _block_hash: BlockHash  | None = None
+    # 仅由 FreeKVCacheBlockQueue 维护，支持 O(1) 移除命中的空闲缓存块。
+    prev_free_block: KVCacheBlock | None = None
+    next_free_block: KVCacheBlock | None = None
     is_null: bool = False  # 对齐 vLLM，物理 block 0 被 KVCacheManager 标记为空块。
 
 
@@ -194,7 +199,7 @@ class KVCacheBlock:
 
         Raises:
             AssertionError: 当前 block 已经关联其他 hash 时抛出。覆盖旧 hash 会让
-                ``hash_to_block_id`` 映射与物理内容不一致，因此必须先完成 eviction。
+                缓存 hash 索引与物理内容不一致，因此必须先完成 eviction。
 
         Side Effects:
             设置 ``_block_hash``。清理旧 hash 必须调用 :meth:`reset_hash`，而不是
@@ -208,7 +213,7 @@ class KVCacheBlock:
     def reset_hash(self) -> None:
         """在物理 block 被驱逐或重新分配前清理其 prefix cache 身份。
 
-        调用方必须先从 ``KVCacheManager.hash_to_block_id`` 删除旧映射；否则 hash
+        调用方必须先从 ``cached_block_hash_to_block`` 删除旧映射；否则 hash
         仍会指向已经被新 token 覆写的物理内存。
 
         Side Effects:
@@ -216,6 +221,140 @@ class KVCacheBlock:
             新 hash。
         """
         self._block_hash = None
+
+    def __repr__(self) -> str:
+        """只显示相邻块编号，避免双向链表递归打印整个空闲队列。"""
+        prev_block_id = (
+            self.prev_free_block.block_id if self.prev_free_block else None
+        )
+        next_block_id = (
+            self.next_free_block.block_id if self.next_free_block else None
+        )
+        return (
+            f"KVCacheBlock(block_id={self.block_id}, ref_cnt={self.ref_cnt}, "
+            f"_block_hash={self._block_hash!r}, "
+            f"prev_free_block={prev_block_id}, next_free_block={next_block_id})"
+        )
+
+
+class FreeKVCacheBlockQueue:
+    """按 vLLM 的双向链表维护空闲块及缓存驱逐顺序。
+
+    队首优先分配。块上的前后指针使 prefix 命中时的中间移除保持 O(1)，
+    队列本身不修改引用计数，也不拥有请求到物理块的映射。
+    """
+
+    def __init__(self, blocks: list[KVCacheBlock]) -> None:
+        """按物理编号串联空闲块，并设置永不分配的头尾哨兵。"""
+        self.num_free_blocks: int = len(blocks)  # 仅统计真实空闲块。
+        for i in range(self.num_free_blocks):
+            if i > 0:
+                blocks[i].prev_free_block = blocks[i - 1]
+            if i < self.num_free_blocks - 1:
+                blocks[i].next_free_block = blocks[i + 1]
+        self.fake_free_list_head = KVCacheBlock(block_id=-1)  # 不进入物理块池。
+        self.fake_free_list_tail = KVCacheBlock(block_id=-1)
+        if self.num_free_blocks > 0:
+            self.fake_free_list_head.next_free_block = blocks[0]
+            blocks[0].prev_free_block = self.fake_free_list_head
+            self.fake_free_list_tail.prev_free_block = blocks[-1]
+            blocks[-1].next_free_block = self.fake_free_list_tail
+        else:
+            self.fake_free_list_head.next_free_block = self.fake_free_list_tail
+            self.fake_free_list_tail.prev_free_block = self.fake_free_list_head
+
+    def popleft(self) -> KVCacheBlock:
+        """移除并返回队首真实块，同时减少空闲块数量。"""
+        first_block = self.fake_free_list_head.next_free_block
+        if first_block is self.fake_free_list_tail or first_block is None:
+            assert self.num_free_blocks == 0, "Free block count is out of sync"
+            raise ValueError("No free blocks available")
+        if first_block.next_free_block is None:
+            raise RuntimeError("Invalid block without next_free_block")
+        self.fake_free_list_head.next_free_block = first_block.next_free_block
+        first_block.next_free_block.prev_free_block = self.fake_free_list_head
+        first_block.prev_free_block = first_block.next_free_block = None
+        self.num_free_blocks -= 1  # 已取出的块不再属于空闲链表。
+        return first_block
+
+    def popleft_n(self, n: int) -> list[KVCacheBlock]:
+        """批量取出队首 n 个块，返回值保持原有驱逐顺序。"""
+        if n == 0:
+            return []
+        assert self.num_free_blocks >= n  # 分配前由 Manager 检查整体容量。
+        self.num_free_blocks -= n
+        curr_block = self.fake_free_list_head.next_free_block
+        ret: list[KVCacheBlock] = []
+        for _ in range(n):
+            assert curr_block is not None
+            ret.append(curr_block)
+            last_block = curr_block
+            curr_block = curr_block.next_free_block
+            last_block.prev_free_block = last_block.next_free_block = None
+        if curr_block is not None:
+            self.fake_free_list_head.next_free_block = curr_block
+            curr_block.prev_free_block = self.fake_free_list_head
+        return ret
+
+    def remove(self, block: KVCacheBlock) -> None:
+        """从链表中间移除一个命中的空闲缓存块，复杂度为 O(1)。"""
+        if block.prev_free_block is None or block.next_free_block is None:
+            raise RuntimeError(f"remove() called on an invalid block: {block}")
+        block.prev_free_block.next_free_block = block.next_free_block
+        block.next_free_block.prev_free_block = block.prev_free_block
+        block.prev_free_block = block.next_free_block = None
+        self.num_free_blocks -= 1
+
+    def append(self, block: KVCacheBlock) -> None:
+        """将一个缓存块放回队尾，延后它的驱逐优先级。"""
+        last_block = self.fake_free_list_tail.prev_free_block
+        if last_block is None:
+            raise RuntimeError("prev_free_block of fake tail should exist")
+        last_block.next_free_block = block
+        block.prev_free_block = last_block
+        block.next_free_block = self.fake_free_list_tail
+        self.fake_free_list_tail.prev_free_block = block
+        self.num_free_blocks += 1
+
+    def prepend_n(self, blocks: list[KVCacheBlock]) -> None:
+        """将未缓存的空闲块按给定顺序放到队首，优先重新分配。"""
+        if not blocks:
+            return
+        first_block = self.fake_free_list_head.next_free_block
+        assert first_block is not None
+        prev_block = self.fake_free_list_head
+        for block in blocks:
+            block.prev_free_block = prev_block
+            prev_block.next_free_block = block
+            prev_block = block
+        prev_block.next_free_block = first_block
+        first_block.prev_free_block = prev_block
+        self.num_free_blocks += len(blocks)
+
+    def append_n(self, blocks: list[KVCacheBlock]) -> None:
+        """将已缓存的空闲块按给定顺序放回队尾。"""
+        if not blocks:
+            return
+        last_block = self.fake_free_list_tail.prev_free_block
+        assert last_block is not None
+        for block in blocks:
+            block.prev_free_block = last_block
+            last_block.next_free_block = block
+            last_block = block
+        last_block.next_free_block = self.fake_free_list_tail
+        self.fake_free_list_tail.prev_free_block = last_block
+        self.num_free_blocks += len(blocks)
+
+    def get_all_free_blocks(self) -> list[KVCacheBlock]:
+        """返回按驱逐顺序排列的空闲块快照，供状态检查使用。"""
+        ret: list[KVCacheBlock] = []
+        curr_block = self.fake_free_list_head.next_free_block
+        if curr_block is None:
+            raise RuntimeError("next_free_block of fake head should exist")
+        while curr_block.next_free_block is not None:
+            ret.append(curr_block)
+            curr_block = curr_block.next_free_block
+        return ret
 
 def create_kv_cache_group_specs(
     kv_cache_spec: dict[str, KVCacheSpec],

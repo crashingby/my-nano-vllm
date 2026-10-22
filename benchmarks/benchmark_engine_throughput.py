@@ -72,7 +72,7 @@ def replay_requests(
 
     Side Effects:
         向 Engine 提交并执行请求，消耗采样随机数，更新 KV 和 prefix cache。
-        正常完成后额外下发一次零 token 清理通知，该调用不纳入吞吐计时。
+        正常完成后排空在途结果和 Worker 清理通知，收尾调用不纳入吞吐计时。
     """
     if not requests or max_active < 1:
         raise ValueError("Replay requires non-empty requests and positive max_active")
@@ -83,7 +83,7 @@ def replay_requests(
     ]
     stats = BenchmarkStats(num_prompts=len(requests))
     next_request_idx = 0  # 下一个尚未提交的请求下标。
-    num_active = 0  # 已提交且尚未收到完整 completion 的请求数。
+    num_active = 0  # 已提交且尚未收到完成标记的请求数。
     last_reported_finished = 0  # 进度按完成数量推进，允许一个 step 同时结束多条请求。
     start_time = perf_counter()  # 数据准备、模型加载和采样参数构造已全部完成。
 
@@ -94,14 +94,16 @@ def replay_requests(
         )
     with nvtx_range("benchmark_loop"):
         while next_request_idx < len(requests) or not llm.is_finished():
-            step_outputs, num_tokens = llm.step()
+            engine_core_outputs, num_tokens = llm.step()
             stats.num_engine_steps += 1
             stats.num_scheduled_tokens += num_tokens
-            # 完成结果包含实际输出；EOS 提前结束时不按目标长度虚增 token 数。
-            for _, completion_token_ids in step_outputs:
-                stats.num_finished += 1
-                stats.num_output_tokens += len(completion_token_ids)
-                num_active -= 1
+            # 增量 token 每轮只累计一次，完成标记单独用于释放回放并发名额。
+            for client_outputs in engine_core_outputs.values():
+                for output in client_outputs.outputs:
+                    stats.num_output_tokens += len(output.new_token_ids)
+                    if output.finished:
+                        stats.num_finished += 1
+                        num_active -= 1
             next_request_idx, num_active = _submit_requests(
                 llm, requests, request_sampling_params, stats,
                 max_active, next_request_idx, num_active,
@@ -118,7 +120,9 @@ def replay_requests(
     stats.elapsed = perf_counter() - start_time
     if num_active != 0 or stats.num_finished != len(requests):
         raise RuntimeError("Engine finished without returning all replayed requests")
-    llm.step()  # 下发最后一批 finished_req_ids，回收 Worker 请求镜像。
+    # 异步模式可能仍有提前提交的结果和完成通知，必须排空后才能复用 Engine。
+    while llm.has_requests():
+        llm.step()
     return stats
 
 
