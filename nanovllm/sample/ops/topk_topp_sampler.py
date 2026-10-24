@@ -18,7 +18,7 @@ def compiled_random_sample(logits: torch.Tensor) -> torch.Tensor:
         logits: 已完成 temperature 缩放的 ``[num_reqs, vocab_size]`` 分数。
 
     Returns:
-        ``[num_reqs]`` 的 int64 token IDs；输入 logits 不会被修改。
+        sampled_token_ids: ``[num_reqs]`` 的 int64 token IDs；输入 logits 不会被修改。
 
     Side Effects:
         消耗所在设备的默认随机数生成器状态；不支持每请求独立 seed。

@@ -10,6 +10,9 @@ def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
     """逐行读取 JSON 对象，出错时保留文件名和物理行号。
 
     空白行不产生记录；不下载数据、不修改文件、不提前加载整个数据集。
+
+    Yields:
+        record: 从本地 JSONL 解码的一条非空 JSON 对象，文件错误保留物理行号。
     """
     with path.open(encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, 1):
@@ -30,6 +33,9 @@ def iter_parquet(path: Path, columns: list[str]) -> Iterator[dict[str, Any]]:
     Args:
         path: 本地 Parquet 文件。
         columns: 适配器需要的列；不读取参考答案等无关列。
+
+    Yields:
+        record: 从本地 Parquet 批次逐条转换的行字典，只包含请求的列。
 
     Raises:
         ImportError: 未安装可选 benchmark 依赖 pyarrow。

@@ -10,19 +10,19 @@ from nanovllm.config.cache import CacheDType
 
 from nanovllm.kv_cache_interface import AttentionSpec
 class AttentionType(str, Enum):
-    """
-    Attention type.
-    Use string to be compatible with `torch.compile`.
+    """区分 Attention 的 Q/K/V 来源，使用字符串值以兼容 torch.compile。
+
+    当前模型只使用 DECODER，其余值保留公共后端接口的命名约定。
     """
 
     DECODER = "decoder"
-    """Decoder attention between previous layer Q/K/V."""
+    """decoder 的因果自注意力，Q/K/V 来自当前层输入及其历史缓存。"""
     ENCODER = "encoder"
-    """Encoder attention between previous layer Q/K/V for encoder-decoder."""
+    """encoder-decoder 模型中 encoder 部分的自注意力。"""
     ENCODER_ONLY = "encoder_only"
-    """Encoder attention between previous layer Q/K/V."""
+    """纯 encoder 模型的自注意力。"""
     ENCODER_DECODER = "encoder_decoder"
-    """Attention between dec. Q and enc. K/V for encoder-decoder."""
+    """交叉注意力，Query 来自 decoder，Key/Value 来自 encoder。"""
 
 class MultipleOf:
     """表示 kernel page size 必须是指定整数的倍数。
@@ -58,17 +58,29 @@ class AttentionBackend(ABC):
     @staticmethod
     @abstractmethod
     def get_name() -> str:
-        """返回用于识别后端的稳定名称。"""
+        """返回用于识别后端的稳定名称。
+
+        Returns:
+            backend_name: 后端稳定名称字符串，供选择、日志和能力匹配使用。
+        """
         raise NotImplementedError
     @staticmethod
     @abstractmethod
     def get_impl_cls() -> type["AttentionImplBase"]:
-        """返回实际执行 attention kernel 的实现类。"""
+        """返回实际执行 attention kernel 的实现类。
+
+        Returns:
+            impl_cls: 执行单层 Attention 的 AttentionImpl 子类。
+        """
 
     @staticmethod
     @abstractmethod
     def get_builder_cls() -> type["AttentionMetadataBuilder"]:
-        """返回将公共批次数据转换成后端元数据的 Builder 类。"""
+        """返回将公共批次数据转换成后端元数据的 Builder 类。
+
+        Returns:
+            builder_cls: 将公共批次数据转换为后端元数据的 Builder 类。
+        """
         raise NotImplementedError
 
     @staticmethod
@@ -90,7 +102,7 @@ class AttentionBackend(ABC):
             cache_dtype_str: KV cache 数据类型名称；当前仅使用 auto。
 
         Returns:
-            包含 num_blocks 维度的逻辑 tensor 形状。
+            kv_cache_shape: 包含 num_blocks 维度的逻辑 tensor 形状。
         """
         raise NotImplementedError
 
@@ -105,13 +117,17 @@ class AttentionBackend(ABC):
                 当前每层独立分配 KV cache，因此调用时应为 False。
 
         Returns:
-            描述物理维度顺序的排列。
+            stride_order: 描述物理维度顺序的排列。
         """
         raise NotImplementedError
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        """返回 kernel page size 的约束；默认接受任意正整数倍数。"""
+        """返回 kernel page size 的约束；默认接受任意正整数倍数。
+
+        Returns:
+            supported_kernel_block_sizes: 允许的 kernel page token 数约束，元素为整数或 MultipleOf。
+        """
         return [MultipleOf(1)]
 
     @classmethod
@@ -131,7 +147,7 @@ class AttentionBackend(ABC):
             cache_dtype_str: KV cache 数据类型名称。
 
         Returns:
-            num_blocks 在逻辑 KV cache 形状中的维度下标。
+            block_dim: num_blocks 在逻辑 KV cache 形状中的维度下标。
         """
         _S = 1234567
         shape = cls.get_kv_cache_shape(
@@ -144,7 +160,13 @@ class AttentionBackend(ABC):
         return shape.index(_S)
     @classmethod
     def full_cls_name(cls) -> tuple[str, str]:
-        """返回可区分不同后端类的模块名和限定类名。"""
+        """返回可区分不同后端类的模块名和限定类名。
+
+        Returns:
+            (module_name, qualname):
+                module_name: 后端类所属的 Python 模块名，对应 cls.__module__。
+                qualname: 类的限定名称，对应 cls.__qualname__。
+        """
         return cls.__module__, cls.__qualname__
 
 class AttentionMetadata:
@@ -267,7 +289,7 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
                 默认实现保留这两个上游参数，但不读取它们。
 
         Returns:
-            AttentionCGSupport 等级；不表示某个 batch 已有可回放的 Graph 条目。
+            cudagraph_support: AttentionCGSupport 等级；不表示某个 batch 已有可回放的 Graph 条目。
         """
         return cls._cudagraph_support
 
@@ -287,7 +309,7 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
             fast_build: 是否优先降低构建开销；当前正常执行传 False。
 
         Returns:
-            后端的 AttentionImpl.forward 能直接读取的元数据。
+            attn_metadata: 后端的 AttentionImpl.forward 能直接读取的元数据。
         """
         raise NotImplementedError
 
@@ -310,8 +332,8 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
                 padding 和各字段一致性均需在调用前准备好。
 
         Returns:
-            类型 M 的后端 metadata，供捕获期间的 AttentionImpl.forward 使用。
-            默认实现遵循子类 build 的引用和分配行为，不保证复制输入 tensor。
+            attn_metadata: 类型 M 的后端 metadata，供捕获期间的 AttentionImpl.forward 使用。
+                默认实现遵循子类 build 的引用和分配行为，不保证复制输入 tensor。
 
         Side Effects:
             默认入口仅委托 build；后端的 buffer 分配等行为由具体 build 决定。
@@ -330,7 +352,7 @@ class AttentionLayer(Protocol):
     具体实现可以通过 layer 读取层级状态；当前普通 BF16 Attention
     暂时不需要 vLLM 用于量化的 q/k/v scale 字段。
     """
-    #TODO:很难理解vllm源码里这里的成员
+    # 后端通过该属性取得已绑定的 combined KV view，不拥有独立的分配池。
     kv_cache: torch.Tensor
 
 
@@ -403,6 +425,6 @@ class AttentionImpl(AttentionImplBase[T], Generic[T]):
             output: 调用方预分配的输出 tensor。
 
         Returns:
-            本层的 Attention 结果，通常是写入后的 output。
+            output: 本层的 Attention 结果，通常是写入后的 output。
         """
         raise NotImplementedError

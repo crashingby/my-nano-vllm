@@ -7,8 +7,8 @@ from enum import Enum
 import torch
 from typing_extensions import Self
 
-# TODO:这个枚举量要怎么用？
 class KVCacheSpecKind(str, Enum):
+    """保留 KV 规格的类型名称；当前分派按规格类判断，尚未使用此枚举。"""
     FULL_ATTENTION = "full_attention"
     MLA_ATTENTION = "mla_attention"
 
@@ -23,17 +23,35 @@ class KVCacheSpec:
     block_size:int
     @property
     def page_size_bytes(self)->int:
-        """返回该层一个物理 KV page 占用的字节数。"""
+        """返回该层一个物理 KV page 占用的字节数。
+
+        Returns:
+            page_size_bytes: 该层一个物理 KV page 的存储大小，单位为字节。
+        """
         raise NotImplementedError
     @property
     def storage_block_size(self) -> int:
+        """返回物理存储 page 的 token 容量，当前与逻辑 block_size 一致。
+
+        Returns:
+            storage_block_size: 物理存储 page 的 token 容量，当前等于逻辑 block_size。
+        """
         return self.block_size
     def max_memory_usage_bytes(self, max_model_len: int) -> int:
-        """返回单个最大长度请求在该层最多占用的缓存字节数。"""
+        """返回单个最大长度请求在该层最多占用的缓存字节数。
+
+        Returns:
+            max_memory_usage_bytes: 单个最大长度请求在该层最多使用的 KV 字节数。
+        """
         raise NotImplementedError
     def copy_with_new_block_size(self, block_size: int) -> Self:
-        """
-        Create a new KVCacheSpec from self but replacing the block size.
+        """创建替换 block_size 的同类型规格，其他字段保持原值。
+
+        Args:
+            block_size: 新规格中一个 page 容纳的 token 数。
+
+        Returns:
+            kv_cache_spec: 新的不可变 dataclass 实例，不修改原规格，也不重新分配 KV tensor。
         """
         return replace(self, block_size=block_size)
     @classmethod
@@ -42,6 +60,9 @@ class KVCacheSpec:
 
         当前只支持完全相同的 FullAttentionSpec。若模型包含不同类型或不同
         page size 的 Attention，应在这里拒绝，直到实现 hybrid KV cache。
+
+        Returns:
+            merged_spec: 所有一致规格的深拷贝，不修改输入规格或分配 KV tensor。
         """
         if not specs:
             raise ValueError("Cannot merge an empty KV cache spec list")
@@ -72,7 +93,11 @@ class AttentionSpec(KVCacheSpec):
     dtype:torch.dtype
     @property
     def page_size_bytes(self)->int:
-        """计算该 Attention 层一个 KV page 的字节数。"""
+        """计算该 Attention 层一个 KV page 的字节数。
+
+        Returns:
+            page_size_bytes: K、V 两份缓存及该层精度共同决定的单 page 字节数。
+        """
         dtype_size = torch.empty((), dtype=self.dtype).element_size()
         # 2 分别代表 key cache 和 value cache。
         return (
@@ -92,7 +117,12 @@ class FullAttentionSpec(AttentionSpec):
     """
 
     def max_memory_usage_bytes(self, max_model_len: int) -> int:
-        """计算一个最大长度请求在该层最多使用的 KV cache 字节数。"""
+        """计算一个最大长度请求在该层最多使用的 KV cache 字节数。
+
+        Returns:
+            max_memory_usage_bytes: 覆盖一个最大长度请求所需的全部物理 KV page 字节数。
+        """
+        # 最后一页即使没有填满也要完整分配，因此先向上取整得到 page 数。
         num_required_blocks = (
             max_model_len + self.block_size - 1
         ) // self.block_size

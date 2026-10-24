@@ -60,7 +60,11 @@ class BenchmarkResult:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    """解析大输入尺寸和测量参数，默认运行三个实现的完整性能对比。"""
+    """解析大输入尺寸和测量参数，默认运行三个实现的完整性能对比。
+
+    Returns:
+        args: 解析并校验后的测试 CLI 参数 Namespace。
+    """
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -93,7 +97,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def reference(x_cpu: torch.Tensor) -> torch.Tensor:
-    """分块计算 CPU FP64 参考值，按输出精度保存结果以限制内存占用。"""
+    """分块计算 CPU FP64 参考值，按输出精度保存结果以限制内存占用。
+
+    Returns:
+        expected: 由 CPU FP64 分块计算、再转换为输出精度的参考 tensor。
+    """
     num_tokens, input_width = x_cpu.shape
     expected = torch.empty((num_tokens, input_width // 2), dtype=x_cpu.dtype)
     for begin in range(0, num_tokens, REFERENCE_CHUNK_ROWS):
@@ -106,7 +114,11 @@ def reference(x_cpu: torch.Tensor) -> torch.Tensor:
 def check_output(
     output: torch.Tensor, x: torch.Tensor, expected: torch.Tensor,
 ) -> float:
-    """在计时前检查元数据、独立显存和全部输出元素，返回最大绝对误差。"""
+    """在计时前检查元数据、独立显存和全部输出元素，返回最大绝对误差。
+
+    Returns:
+        max_error: 全部元素相对参考值的最大绝对误差。
+    """
     assert output.shape == (x.shape[0], x.shape[1] // 2), output.shape
     assert output.dtype == x.dtype, (output.dtype, x.dtype)
     assert output.device == x.device, (output.device, x.device)
@@ -131,6 +143,9 @@ def prepare_benchmark(
 
     使用与计时一致的输入形状，提前完成 JIT、Triton autotune 和 CuTe 编译。
     所有调用使用当前 PyTorch stream，返回前同步以暴露异步执行错误。
+
+    Returns:
+        output: 完成编译、预热及同步后的最后一次模型层输出，供数值检查。
     """
     for _ in range(args.warmup):
         output = layer(x)
@@ -141,7 +156,11 @@ def prepare_benchmark(
 def summarize(
     backend: SiluAndMulBackend, samples_us: list[float], logical_bytes: int,
 ) -> BenchmarkResult:
-    """汇总每调用耗时，带宽按逻辑字节数计算，单位为十进制 GB/s。"""
+    """汇总每调用耗时，带宽按逻辑字节数计算，单位为十进制 GB/s。
+
+    Returns:
+        result: 包含后端名、微秒耗时与逻辑有效带宽的 BenchmarkResult。
+    """
     median_us = statistics.median(samples_us)
     if median_us <= 0:
         raise RuntimeError("CUDA Event measured nonpositive time; increase --iters")
@@ -165,6 +184,9 @@ def measure(
     每轮每个实现各测一次，减少固定顺序带来的温度和频率变化偏差。
     结束时等待 end Event，再读取 GPU 时间线上的区间；区间可能包含 host
     发射不及时造成的空闲，不能将结果等同于隔离后的单 kernel 执行时间。
+
+    Returns:
+        results: 按 layers 顺序排列的各后端测量汇总列表。
     """
     samples: dict[SiluAndMulBackend, list[float]] = {layer.backend: [] for layer in layers}
     order = list(layers)

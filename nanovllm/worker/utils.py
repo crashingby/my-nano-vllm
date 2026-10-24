@@ -71,7 +71,7 @@ class AttentionGroup:
             ubatch_id: 要取得的 Builder 下标。
 
         Returns:
-            与此 AttentionGroup 关联的元数据 Builder。
+            metadata_builder: 与此 AttentionGroup 关联的元数据 Builder。
         """
         return self.metadata_builders[ubatch_id]
 
@@ -87,7 +87,7 @@ def select_common_block_size(
         backends: 此 KV group 中各 AttentionGroup 的后端类。
 
     Returns:
-        能整除逻辑 block 大小的 kernel page token 数。
+        kernel_block_size: 能整除逻辑 block 大小的 kernel page token 数。
 
     Raises:
         ValueError: 组内没有后端或不存在共同支持的 page 大小时抛出。
@@ -96,7 +96,11 @@ def select_common_block_size(
         raise ValueError("Attention KV cache group has no backend")
 
     def supports_all(block_size: int) -> bool:
-        """检查候选 page 大小是否满足全部后端约束。"""
+        """检查候选 page 大小是否满足全部后端约束。
+
+        Returns:
+            is_supported: 候选 block_size 满足全部 Attention 后端的 page 约束时为 True。
+        """
         for backend in backends:
             sizes = backend.get_supported_kernel_block_sizes()
             if not any(
@@ -138,7 +142,7 @@ def prepare_kernel_block_sizes(
         attn_groups: 按 KV group 编号组织的 AttentionGroup 列表。
 
     Returns:
-        与 kv_cache_groups 一一对齐的 kernel page 大小列表。
+        kernel_block_sizes: 与 kv_cache_groups 一一对齐的 kernel page 大小列表。
     """
     kernel_block_sizes: list[int] = []
     for group_id, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
@@ -168,9 +172,9 @@ def request_memory(
         cache_config: 包含 ``gpu_memory_utilization`` 的静态缓存策略配置。
 
     Returns:
-        当前 Worker 可使用的 GPU 总显存预算，单位为字节。它包含模型权重、forward
-        峰值激活、非 PyTorch 内存、CUDA Graph 内存和最终 KV cache，而不只是 KV
-        cache 自身。
+        requested_memory: 当前 Worker 可使用的 GPU 总显存预算，单位为字节。它包含模型权重、forward
+            峰值激活、非 PyTorch 内存、CUDA Graph 内存和最终 KV cache，而不只是 KV
+            cache 自身。
 
     Raises:
         ValueError: 启动时设备空闲显存低于用户请求的总预算时抛出。
@@ -211,6 +215,5 @@ def bind_kv_cache(
     for layer_name, kv_cache in kv_caches.items():
         runner_kv_caches.append(kv_cache)
         attention_layer = forward_context[layer_name]
-        # TODO:之后要改掉它：旧 Attention.forward 仍使用 k_cache/v_cache；
-        # 新的 combined KV cache 已绑定，待 forward 重构时移除旧字段。
+        # Attention.forward 通过该 combined view 调用后端，与 Runner 共享底层存储。
         attention_layer.kv_cache = kv_cache

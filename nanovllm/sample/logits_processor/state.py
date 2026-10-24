@@ -86,6 +86,9 @@ class BatchUpdateBuilder:
 
         访问该属性会冻结本轮的删除注册阶段；之后若仍调用 `removed_append()`，
         会抛出异常以保护排序和槽位复用顺序。
+
+        Returns:
+            removed: 按降序排列的本轮删除槽位列表，访问后冻结本轮删除注册阶段。
         """
 
         self._ensure_removed_sorted()
@@ -111,7 +114,11 @@ class BatchUpdateBuilder:
         self.batch_changed = True
 
     def has_removed(self) -> bool:
-        """返回本轮是否至少登记了一个待回收槽位。"""
+        """返回本轮是否至少登记了一个待回收槽位。
+
+        Returns:
+            has_removed: 本轮至少登记过一个待删除槽位时为 True。
+        """
 
         return bool(self._removed)
 
@@ -124,7 +131,7 @@ class BatchUpdateBuilder:
         槽位”的不变量。
 
         Returns:
-            最小的删除槽位下标；若本轮没有删除请求则返回 `None`。
+            req_index: 最小的删除槽位下标；若本轮没有删除请求则返回 `None`。
         """
 
         if not self.has_removed():
@@ -137,7 +144,7 @@ class BatchUpdateBuilder:
         """取走数值最小的待回收槽位，用于立刻安放一个新请求。
 
         Returns:
-            被取走的最小删除槽位下标；若本轮没有删除请求则返回 `None`。
+            req_index: 被取走的最小删除槽位下标；若本轮没有删除请求则返回 `None`。
         """
 
         if not self.has_removed():
@@ -153,7 +160,7 @@ class BatchUpdateBuilder:
         前向路径应使用 `get_and_reset()`，以免丢失 processor 的状态同步。
 
         Returns:
-            清空前 `batch_changed` 的值。
+            batch_changed: 清空前 `batch_changed` 的值。
         """
 
         self._is_removed_sorted = False
@@ -176,8 +183,8 @@ class BatchUpdateBuilder:
             batch_size: 本轮所有增删和移动处理完后，持久 batch 的逻辑大小。
 
         Returns:
-            有槽位变化时返回 `BatchUpdate`；仅有连续 decode、布局未改变时
-            返回 `None`。
+            batch_update: 有槽位变化时返回 `BatchUpdate`；仅有连续 decode、布局未改变时
+                返回 `None`。
         """
 
         # 新 step 可以重新登记删除；旧 step 的排序状态不应泄漏到下一轮。
@@ -234,6 +241,10 @@ class LogitsProcessors:
 
     @property
     def all(self) -> Iterator["LogitsProcessor"]:
-        """按 sampler 的执行分组顺序遍历所有 processor。"""
+        """按 sampler 的执行分组顺序遍历所有 processor。
+
+        Returns:
+            processors: 按 sampler 分组执行顺序读取全部 logits processor 的迭代器。
+        """
 
         return chain(self.argmax_invariant, self.non_argmax_invariant)

@@ -112,8 +112,8 @@ class BaseModelLoader(ABC):
                 initialize_model() 负责将它与当前配置传给模型构造路径。
 
         Returns:
-            权重加载与后处理完成的 nn.Module，所有子模块均已切换到 eval 模式。
-            eval() 不等同于 inference_mode()；执行推理时仍由调用方控制梯度模式。
+            model: 权重加载与后处理完成的 nn.Module，所有子模块均已切换到 eval 模式。
+                eval() 不等同于 inference_mode()；执行推理时仍由调用方控制梯度模式。
 
         Side Effects:
             构造模型参数并分配设备内存；initialize_model() 应在配置上下文中

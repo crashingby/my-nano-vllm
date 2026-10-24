@@ -94,8 +94,8 @@ class CudagraphDispatcher:
                 策略不包含 FULL 时会归一为 False。
 
         Returns:
-            padded token 数、请求槽位容量和归一化 uniform 标记的描述符。
-            num_reqs 不是从本轮真实请求列表中统计的数量。
+            batch_descriptor: padded token 数、请求槽位容量和归一化 uniform 标记的描述符。
+                num_reqs 不是从本轮真实请求列表中统计的数量。
         """
         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs  # 请求容量。
         uniform_decode_query_len = self.uniform_decode_query_len  # 当前固定为 1。
@@ -247,17 +247,12 @@ class CudagraphDispatcher:
                 None/空集合不排除模式；过滤不修改调用方的集合或已登记的 key。
 
         Returns:
-            二元组 (runtime_mode, batch_descriptor)：
-            - FULL：描述符包含 padded token 数、请求槽位容量和归一化 uniform
-              标记，可作为完整图的精确 key；num_reqs 包含 padding 槽位，
-              不表示本轮真实请求数。
-            - PIECEWISE：保留 padded token 数，num_reqs=None、uniform=False，
-              表示分段计算不按 Attention 请求结构区分 key，不表示零个请求。
-            - NONE：返回 BatchDescriptor(num_tokens)，保留未 padding 的有效
-              token 数，num_reqs=None、uniform=False，不要求准备 Graph padding。
+            (runtime_mode, batch_descriptor):
+                runtime_mode: 本批选定的 NONE、PIECEWISE 或 FULL 具体运行模式。
+                batch_descriptor: 对应执行容量的描述符。FULL 包含 padded token 数、请求容量和
+                    uniform 标记；PIECEWISE 只使用 padded token 数；NONE 保留原始 token 数。
 
-            Runner 应保留原始有效 token/请求数量，用于选择有效 logits 行及回写
-            请求状态；不能把返回的 padded 执行容量当成真实调度数量。
+            Runner 应保留真实 token 和请求数量，用于选择 logits 行及回写状态，不能把补齐后的执行容量当成真实调度量。
 
         Raises:
             AssertionError: 模式过滤后集合为空；或已经进入 key 匹配阶段却没有
@@ -329,8 +324,8 @@ class CudagraphDispatcher:
         """返回捕获计划：PIECEWISE 在前、FULL 在后，各模式尺寸降序。
 
         Returns:
-            (具体模式, 描述符列表) 的列表，未初始化、禁用或无 key 时为空。
-            decode 捕获尺寸 [1, 2, 4] 返回 FULL 下的 4、2、1 三个描述符。
+            result: (具体模式, 描述符列表) 的列表，未初始化、禁用或无 key 时为空。
+                decode 捕获尺寸 [1, 2, 4] 返回 FULL 下的 4、2、1 三个描述符。
 
         Side Effects:
             创建排序用列表，不修改 key 集合，也不创建或检查实际图对象。

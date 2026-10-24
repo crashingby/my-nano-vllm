@@ -69,7 +69,11 @@ def silu_and_mul_kernel(
 
 
 def _supports_silu_and_mul(x: torch.Tensor) -> bool:
-    """只接受连续 CUDA 浮点输入，最后一维必须包含两个非空、等长分片。"""
+    """只接受连续 CUDA 浮点输入，最后一维必须包含两个非空、等长分片。
+
+    Returns:
+        is_supported: 输入满足 CUDA、浮点精度、连续布局和最后一维非空等长分片约束时为 True。
+    """
     return (
         x.is_cuda
         and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
@@ -89,7 +93,7 @@ def silu_and_mul_triton(x: torch.Tensor) -> torch.Tensor:
             通过 IrOp 调用时先由 supports_args 检查输入，impl_fn 是已验证入口。
 
     Returns:
-        独立的 [..., H] 输出，device 和 dtype 与 x 相同，输入内容保持原值。
+        output: 独立的 [..., H] 输出，device 和 dtype 与 x 相同，输入内容保持原值。
 
     Side Effects:
         在当前 CUDA stream 启动 kernel，设备 SM 数由平台接口统一缓存。

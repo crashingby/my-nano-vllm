@@ -19,8 +19,8 @@ def get_kv_cache_spec(
         vllm_config: 当前 Worker 的总配置及其静态 forward context。
 
     Returns:
-        从 Attention 完整层名到该层 KVCacheSpec 的映射。对于 Qwen3，key 形如
-        ``"model.layers.0.self_attn.attn"``。
+        kv_cache_spec: 从 Attention 完整层名到该层 KVCacheSpec 的映射。对于 Qwen3，key 形如
+            ``"model.layers.0.self_attn.attn"``。
 
     Notes:
         当前 MVP 的所有 Qwen3 Attention 都是 full attention，因此每个注册层都会
@@ -29,9 +29,9 @@ def get_kv_cache_spec(
     """
     kv_cache_spec:dict[str,KVCacheSpec]={}
     attn_layers = get_layers_from_nanovllm_config(vllm_config, Attention)
-    # TODO:以后好像是通过config直接获得层的名字
+    # 静态注册表已经保留完整层名，规划与绑定必须沿用这些 key。
     for layer_name,module in attn_layers.items():
-        # 我们现在暂时只支持Attention里的KV Cache
+        # 当前只收集已注册的普通 Attention，其他类型不进入这张 KV 规划表。
         if not isinstance(module,Attention):
             continue
         kv_cache_spec[layer_name]=module.get_kv_cache_spec(vllm_config)

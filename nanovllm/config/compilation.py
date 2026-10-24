@@ -41,11 +41,18 @@ class CUDAGraphMode(enum.Enum):
         """返回 uniform decode batch 对应的具体模式，不修改配置。
 
         组合模式取 tuple 第一项；普通模式直接返回自身。
+
+        Returns:
+            decode_mode: uniform decode 路径的具体 CUDAGraphMode；组合策略取第一项。
         """
         return CUDAGraphMode(self.value[0]) if self.separate_routine() else self
 
     def mixed_mode(self) -> "CUDAGraphMode":
-        """返回 prefill/混合 batch 对应的具体模式，组合模式取 tuple 第二项。"""
+        """返回 prefill/混合 batch 对应的具体模式，组合模式取 tuple 第二项。
+
+        Returns:
+            mixed_mode: prefill 或混合 batch 路径的具体 CUDAGraphMode；组合策略取第二项。
+        """
         return CUDAGraphMode(self.value[1]) if self.separate_routine() else self
 
     def has_mode(self, mode: "CUDAGraphMode") -> bool:
@@ -53,6 +60,9 @@ class CUDAGraphMode(enum.Enum):
 
         Args:
             mode: NONE、PIECEWISE 或 FULL；组合模式不能作为查询条件。
+
+        Returns:
+            has_mode: 当前策略包含目标具体模式时为 True。
         """
         # 查询目标必须是单个模式，避免把两个执行策略当作具体运行方式比较。
         assert not mode.separate_routine()
@@ -62,26 +72,45 @@ class CUDAGraphMode(enum.Enum):
         return self == mode
 
     def requires_piecewise_compilation(self) -> bool:
-        """判断策略是否需要分段编译支持；完整 Graph 本身不要求分段编译。"""
+        """判断策略是否需要分段编译支持；完整 Graph 本身不要求分段编译。
+
+        Returns:
+            requires_piecewise: 当前策略包含 PIECEWISE、需要分段编译时为 True。
+        """
         return self.has_mode(CUDAGraphMode.PIECEWISE)
 
     def max_cudagraph_mode(self) -> "CUDAGraphMode":
         """按 NONE < PIECEWISE < FULL 返回策略包含的最高模式。
 
         用于判断是否需要完整模型 Wrapper；不表示实际 batch 必然使用该模式。
+
+        Returns:
+            max_mode: 按 NONE < PIECEWISE < FULL 取出的最高具体模式。
         """
         return CUDAGraphMode(max(self.value)) if self.separate_routine() else self
 
     def has_full_cudagraphs(self) -> bool:
-        """判断策略中是否有执行路径使用完整模型 Graph。"""
+        """判断策略中是否有执行路径使用完整模型 Graph。
+
+        Returns:
+            has_full_cudagraphs: 当前策略至少一条路径使用 FULL 模式时为 True。
+        """
         return self.max_cudagraph_mode() == CUDAGraphMode.FULL
 
     def has_piecewise_cudagraphs(self) -> bool:
-        """判断策略中是否有执行路径使用分段 Graph。"""
+        """判断策略中是否有执行路径使用分段 Graph。
+
+        Returns:
+            has_piecewise_cudagraphs: 当前策略至少一条路径使用 PIECEWISE 模式时为 True。
+        """
         return self.requires_piecewise_compilation()
 
     def separate_routine(self) -> bool:
-        """判断 decode 和混合 batch 是否分别配置了运行模式。"""
+        """判断 decode 和混合 batch 是否分别配置了运行模式。
+
+        Returns:
+            separate_routine: 策略分别配置 decode 与混合 batch 两种模式时为 True。
+        """
         return isinstance(self.value, tuple)
 
     @classmethod
@@ -89,19 +118,34 @@ class CUDAGraphMode(enum.Enum):
         """返回上游定义的三个具体运行模式，排除仅用于配置的组合模式。
 
         这不是当前项目的后端能力声明；PIECEWISE 在此保留其枚举语义。
+
+        Returns:
+            runtime_modes: 可作为具体运行模式的 NONE、PIECEWISE、FULL 冻结集合。
         """
         return frozenset({cls.NONE, cls.PIECEWISE, cls.FULL})
 
     def is_valid_runtime_mode(self) -> bool:
-        """判断自身能否作为具体运行模式，而非需要继续分派的组合策略。"""
+        """判断自身能否作为具体运行模式，而非需要继续分派的组合策略。
+
+        Returns:
+            is_valid: 自身属于具体运行模式集合时为 True；组合策略为 False。
+        """
         return self in CUDAGraphMode.valid_runtime_modes()
 
     def __str__(self) -> str:
-        """返回模式名称，供配置日志和运行模式统计使用。"""
+        """返回模式名称，供配置日志和运行模式统计使用。
+
+        Returns:
+            mode_name: 当前枚举名称字符串，供日志和运行统计使用。
+        """
         return self.name
 
     def __bool__(self) -> bool:
-        """仅 NONE 为 False；其他枚举表示策略包含某种 CUDA Graph 执行方式。"""
+        """仅 NONE 为 False；其他枚举表示策略包含某种 CUDA Graph 执行方式。
+
+        Returns:
+            enabled: 策略包含某种 CUDA Graph 执行方式时为 True；NONE 为 False。
+        """
         return self != CUDAGraphMode.NONE
 
 
@@ -219,10 +263,10 @@ class CompilationConfig:
             min_cg_attn_backend: 对应后端名称，用于定位能力不足的后端；可为 None。
 
         Returns:
-            最终配置策略，与回写的 cudagraph_mode 一致；组合策略仍需由
-            Dispatcher 根据每轮 batch 选择具体运行模式。
-            当前 FA2 声明 UNIFORM_BATCH，因此 FULL 会降级为 FULL_DECODE_ONLY，
-            已设置的 FULL_DECODE_ONLY 则保留。
+            cudagraph_mode: 最终配置策略，与回写的 cudagraph_mode 一致；组合策略仍需由
+                Dispatcher 根据每轮 batch 选择具体运行模式。
+                当前 FA2 声明 UNIFORM_BATCH，因此 FULL 会降级为 FULL_DECODE_ONLY，
+                已设置的 FULL_DECODE_ONLY 则保留。
 
         Side Effects:
             回写 cudagraph_mode，自动降级时记录 warning；捕获尺寸保持原值。

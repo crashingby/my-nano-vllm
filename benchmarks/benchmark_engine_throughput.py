@@ -1,4 +1,4 @@
-"""回放统一 SampleRequest，测量同步 Engine 的持续请求吞吐。
+"""回放统一 SampleRequest，测量同步或异步调度下的持续请求吞吐。
 
 数据集格式、chat template 和输入长度处理位于 benchmarks.datasets；
 配置与 CLI 位于 benchmarks.config，计数输出位于 benchmarks.metrics。
@@ -41,6 +41,11 @@ def _submit_requests(
 
     输入已在计时前编码，回放不再读取原始记录或调用 tokenizer。
     add_request() 成功后才更新计数，Engine 返回的完成结果负责减少活跃数量。
+
+    Returns:
+        (next_request_idx, num_active):
+            next_request_idx: 下一条尚未提交的输入下标。
+            num_active: 本次补充提交后的活跃请求数。
     """
     while next_request_idx < len(requests) and num_active < max_active:
         request = requests[next_request_idx]
@@ -70,6 +75,9 @@ def replay_requests(
         sampling_params: temperature、ignore_eos 等公共生成选项。
         max_active: 回放的最大活跃请求数，应与 Engine 的请求容量一致。
 
+    Returns:
+        stats: 实际回放计数、推理阶段耗时和吞吐；正常返回前已排空 Engine。
+
     Side Effects:
         向 Engine 提交并执行请求，消耗采样随机数，更新 KV 和 prefix cache。
         正常完成后排空在途结果和 Worker 清理通知，收尾调用不纳入吞吐计时。
@@ -94,7 +102,8 @@ def replay_requests(
         )
     with nvtx_range("benchmark_loop"):
         while next_request_idx < len(requests) or not llm.is_finished():
-            engine_core_outputs, num_tokens = llm.step()
+            # engine_core_outputs 可属于旧批次；num_tokens 仅统计本次新提交量。
+            engine_core_outputs, num_tokens = llm.step_fn()
             stats.num_engine_steps += 1
             stats.num_scheduled_tokens += num_tokens
             # 增量 token 每轮只累计一次，完成标记单独用于释放回放并发名额。
@@ -122,7 +131,7 @@ def replay_requests(
         raise RuntimeError("Engine finished without returning all replayed requests")
     # 异步模式可能仍有提前提交的结果和完成通知，必须排空后才能复用 Engine。
     while llm.has_requests():
-        llm.step()
+        llm.step_fn()
     return stats
 
 
@@ -131,6 +140,9 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkStats:
 
     创建的 Engine 在正常和异常路径都会关闭；返回统计可供其他脚本继续使用。
     原始文件读取、对话格式化和编码全部在模型创建与性能计时之前完成。
+
+    Returns:
+        stats: 本次吞吐回放的 BenchmarkStats，Engine 已按公共启动流程关闭。
     """
     return run_engine_benchmark(config, replay_requests)
 

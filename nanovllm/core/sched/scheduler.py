@@ -42,7 +42,7 @@ class Scheduler:
         kv_cache_manager: 物理 KV blocks、prefix cache 和 request block tables 的
             唯一所有者。
         requests: 从 request ID 到活跃 Request 的权威映射。
-        waiting: 尚未获得运行资源或被抢占的请求队列，当前保持 FCFS 顺序。
+        waiting: 尚未获得运行资源或被抢占的请求队列，按配置选择 FCFS 或优先级。
         running: 已拥有 block table、可在后续 schedule 中推进的请求列表。
         prev_step_scheduled_req_ids: 上一轮实际进入模型 batch 的请求 IDs，用于决定
             CachedRequestData 是否需要补发完整 token 序列。
@@ -98,7 +98,7 @@ class Scheduler:
 
         # requests 是活跃逻辑请求的权威表，调度输出更新进度时通过它回查 Request。
         self.requests: dict[str, Request] = {}
-        # 策略决定等待队列的排序，后续操作始终通过统一队列接口。
+        # 策略只决定等待队列排序；当前 running 的遍历和队尾抢占保持同一实现。
         try:
             self.policy = SchedulingPolicy(self.scheduler_config.policy)
         except ValueError as e:
@@ -160,11 +160,12 @@ class Scheduler:
             finished_status: 要设置的 FINISHED_* 状态。
 
         Returns:
-            本次实际结束的 (request_id, client_index)，忽略未知或已结束的请求。
+            finished_requests: 本次实际结束的 (request_id, client_index)，忽略未知或已结束的请求。
 
         Side Effects:
             先批量移除队列成员，再修改状态并统一释放资源，保留队列策略类型。
         """
+        # 外部结束入口只接受终止状态，避免把活跃请求从队列移走却仍标为 RUNNING。
         assert RequestStatus.is_finished(finished_status)
         if isinstance(request_ids, str):
             request_ids = (request_ids,)
@@ -173,9 +174,11 @@ class Scheduler:
         else:
             request_ids = self.requests.keys()
 
+        # 先收集对象，不能在迭代 request_ids 的映射视图时同步删除 requests。
         running_requests_to_remove: set[Request] = set()
         waiting_requests_to_remove: list[Request] = []
         valid_requests: list[Request] = []
+        # 未知 ID 和已结束请求视为幂等取消，不重复释放资源。
         for req_id in request_ids:
             request = self.requests.get(req_id)
             if request is None or request.is_finished():
@@ -192,6 +195,7 @@ class Scheduler:
         if waiting_requests_to_remove:
             self.waiting.remove_requests(waiting_requests_to_remove)
             self.skipped_waiting.remove_requests(waiting_requests_to_remove)
+        # 队列已统一清理，再标记终止并释放映射，避免残留可被再次调度的成员。
         for request in valid_requests:
             request.status = finished_status
             if finished_status == RequestStatus.FINISHED_ABORTED:
@@ -242,8 +246,8 @@ class Scheduler:
         """判断 Scheduler 是否已经没有任何待处理或运行中的请求。
 
         Returns:
-            当 ``waiting`` 和 ``running`` 均为空时返回 ``True``。完成请求在上层
-            清理后会从这两个容器移除，因此无需额外遍历 ``requests``。
+            is_finished: 当 ``waiting`` 和 ``running`` 均为空时返回 ``True``。完成请求在上层
+                清理后会从这两个容器移除，因此无需额外遍历 ``requests``。
         """
         return not self.waiting and not self.running
 
@@ -255,7 +259,7 @@ class Scheduler:
         所有用户请求已经完成时，仍可能有尚未送达 Worker 的清理通知。
 
         Returns:
-            有活跃请求，或有等待下发的结束/取消通知时返回 True。
+            has_requests: 有活跃请求，或有等待下发的结束/取消通知时返回 True。
         """
         return not self.is_finish() or bool(self.finished_req_ids)
 
@@ -292,15 +296,24 @@ class Scheduler:
         request.num_output_placeholders = 0
         # 抢占计数可用于后续可观测性和防止长期饥饿的策略。
         request.num_preemptions += 1
-        # appendleft 让刚被抢占的请求在当前 FCFS MVP 中优先等待恢复。
+        # FCFS 放到队首重试；priority 队列仍按请求原有排序键重新入堆。
         self.waiting.prepend_request(request)
 
     def schedule(self) -> SchedulerOutput:
         """构造混合批次快照，并在返回前提交一次调度进度。
 
-        先分配物理块并保存 forward 前的请求位置，再调用
-        _update_after_schedule() 推进已承诺执行的进度。本方法不执行模型。
-        空批次仍携带完成通知，并通过同一 hook 轮换通知集合。
+        先尝试推进 running，再在剩余 token budget 和 KV 容量内接纳 waiting。
+        快照保存 forward 前的请求位置，_update_after_schedule() 随后推进权威进度；
+        本方法只安排工作，不执行模型，也不读取 GPU token。
+
+        Returns:
+            scheduler_output: 新请求或已有请求的输入计划、每请求计算量、block 更新和清理通知。
+                即使没有可执行 token，空计划仍可能携带 finished_req_ids。
+
+        Side Effects:
+            分配或释放 KV block，修改 waiting/running 和请求状态，并推进
+            num_computed_tokens、num_in_flight_tokens；异步子类还增加输出占位。
+            更新上一轮调度集合并轮换完成通知，不把返回计划中的标量自动改为新值。
         """
         # 没有活跃请求也可能还有 Worker 清理工作；零 token 输出必须保留完成通知。
         if self.is_finish():
@@ -370,8 +383,7 @@ class Scheduler:
                 if new_blocks is not None:
                     break
 
-                # MVP 版本采用FCFS，从队尾抢占
-                # TODO: 后面可以加策略的选择
+                # 当前抢占统一选 running 队尾；waiting 的策略不改变受害者选择。
                 # preempted_req 是队尾的低服务优先级请求；在 FCFS 下不会是已调度前缀。
                 preempted_req = self.running.pop()
                 self._preempt_request(request=preempted_req)
@@ -545,7 +557,7 @@ class Scheduler:
                 request.num_computed_tokens
                 for request in cached_requests
             ],
-            # 输出长度让 Worker 知道 request.all_token_ids 中 prompt/output 的分界位置。
+            # 逻辑输出长度包含在途占位，供 Worker 对齐输出历史与输入位置。
             num_output_tokens=[
                 request.num_output_tokens + request.num_output_placeholders
                 for request in cached_requests
@@ -560,7 +572,7 @@ class Scheduler:
             total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
             # 传递当前 set 对象，随后必须替换而不是 clear，避免破坏本输出快照。
             finished_req_ids=self.finished_req_ids,
-            # 将本轮抢占对象投影为稳定 ID 集合，供 Worker 丢弃本地请求状态。
+            # 记录本轮抢占事件；Worker 从调度集合识别缺席请求，保留其请求镜像。
             preempted_req_ids={req.request_id for req in preempted_reqs},
         )
 
@@ -571,10 +583,15 @@ class Scheduler:
         return scheduler_output
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
-        """生成执行前快照之后推进已调度进度，并记录最后一次在途写入。
+        """保存计划后推进请求进度，并维护本轮与下一轮之间的通知边界。
 
-        当前进度表示已承诺执行的位置；GPU 完成由 update_from_output() 确认。
-        执行失败时向上传播，当前不支持原地重试或回滚。
+        Args:
+            scheduler_output: 已保存执行前标量和本轮输入数的计划。
+
+        Side Effects:
+            按本轮输入数增加 computed/in-flight 计数，判断是否仍有 prefill/recompute
+            历史待处理。替换完成通知集合和上一轮调度 ID 集合，不原地清空旧快照。
+            可选延迟释放策略开启时还记录最近一次 KV 写入编号。
         """
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
@@ -598,7 +615,11 @@ class Scheduler:
 
 
     def _handle_stopped_request(self, request: Request) -> bool:
-        """当前没有可恢复的流式输入，请求停止即结束生命周期。"""
+        """当前没有可恢复的流式输入，请求停止即结束生命周期。
+
+        Returns:
+            finished: 当前实现中停止请求直接结束生命周期，返回 True。
+        """
         return True
 
     def _update_request_with_output(
@@ -607,10 +628,21 @@ class Scheduler:
         new_token_ids: list[int],
         is_stale: bool = False,
     ) -> tuple[list[int], bool]:
-        """追加真实输出并检查停止条件。
+        """追加真实输出并检查停止条件，旧阶段结果不改写新阶段计算进度。
 
-        旧执行阶段的结果仍可进入 token 历史，但不能修改抢占后
-        已经重置的计算进度。
+        Args:
+            request: 收到输出时仍受 Scheduler 管理的请求。
+            new_token_ids: 本批新增真实 token，遇到停止条件可能原地截短。
+            is_stale: 是否属于抢占前的旧批次，旧结果仍可扩展真实历史。
+
+        Returns:
+            (new_token_ids, stopped):
+                new_token_ids: 本次实际接受的输出 token 列表。
+                stopped: 本次接受输出后触发停止条件时为 True。
+
+        Side Effects:
+            更新完整/输出 token 历史及 block hash，可能设置终止状态。非旧结果
+            若在列表中途停止，则回退未接受后缀对应的计算进度；单 token 路径回退为零。
         """
         stopped = False
         for num_new, output_token_id in enumerate(new_token_ids, 1):
@@ -633,10 +665,21 @@ class Scheduler:
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        """消费已完成的批次，更新请求并按 client 生成增量输出。
+        """按原始计划回收一批结果，更新请求并按客户端聚合真实增量。
 
-        缓存元数据由 allocate_slots() 按上游时机登记；本接口不重复发布。
-        结束请求先记录原因并释放资源，最后批量移除队列成员。
+        Args:
+            scheduler_output: 与本结果同批的原始执行计划，包含当时的输入数。
+            model_runner_output: 已完成 CPU 回传的结果及本批请求行映射。
+
+        Returns:
+            engine_core_outputs: client_index 到 EngineCoreOutputs 的映射；无有效增量时可以为空，
+                开启统计或完成通知时也可能只返回这些辅助字段。
+
+        Side Effects:
+            按输入量减少在途计数，区分抢占前旧结果，追加真实输出并判断停止。
+            完成请求释放资源、离开队列，清理通知留给下次 Worker 更新。
+            异步子类在输出 hook 中减少占位；此方法不会直接修补 Runner 的 CPU token 行。
+            开启统计时消费当前窗口的缓存统计，因此结果必须按 Engine 队列顺序回收。
         """
         sampled_token_ids = model_runner_output.sampled_token_ids
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
@@ -750,6 +793,19 @@ class Scheduler:
         cudagraph_stats: CUDAGraphStat | None = None,
         perf_stats: PerfStats | None = None,
     ) -> SchedulerStats | None:
+        """按当前队列与 KV 状态创建一次统计快照，关闭统计时返回 None。
+
+        Args:
+            cudagraph_stats: 可选的本批 Graph 容量观测结果。
+            perf_stats: 可选的本批计算/访存估算，不在此主动采集。
+
+        Returns:
+            stats: 当前请求数量、KV 使用比例与前缀命中统计组成的 SchedulerStats。
+
+        Side Effects:
+            make_prefix_cache_stats() 转交并替换缓存统计窗口；重复调用会消费新的窗口，
+            因此不能把该接口当作不改变状态的任意查询。
+        """
         if not self.log_stats:
             return None
         prefix_cache_stats = self.kv_cache_manager.make_prefix_cache_stats()

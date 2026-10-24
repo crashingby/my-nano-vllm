@@ -17,7 +17,11 @@ ConfigT = TypeVar("ConfigT")  # 保留装饰前后的配置类类型，供调用
 @overload
 @dataclass_transform(field_specifiers=(field, PydanticField))
 def config(cls: type[ConfigT]) -> type[ConfigT]:
-    """直接装饰配置类，采用默认校验策略。"""
+    """直接装饰配置类，采用默认校验策略。
+
+    Returns:
+        config_cls: 应用默认 Pydantic 策略后的配置 dataclass 类。
+    """
     ...
 
 
@@ -28,7 +32,11 @@ def config(
     config: ConfigDict | None = None,
     **kwargs: Any,
 ) -> Callable[[type[ConfigT]], type[ConfigT]]:
-    """携带 Pydantic 策略或 dataclass 参数创建配置装饰器。"""
+    """携带 Pydantic 策略或 dataclass 参数创建配置装饰器。
+
+    Returns:
+        decorator: 接收配置类并应用指定校验策略和 dataclass 参数的装饰器。
+    """
     ...
 
 
@@ -51,7 +59,9 @@ def config(
         **kwargs: 传给 Pydantic dataclass 的参数，例如 slots、kw_only 或 frozen。
 
     Returns:
-        装饰后的配置类，或等待接收配置类的装饰器。
+        根据调用方式返回以下分支之一：
+            config_cls: 直接传类时返回完成 dataclass 转换的配置类。
+            decorator: 未传类时返回等待接收配置类的装饰器。
 
     Side Effects:
         为配置类建立构造期校验逻辑；默认不启用赋值校验，初始化后仍可回写
@@ -63,7 +73,11 @@ def config(
         merged_config.update(config)
 
     def decorator(config_cls: type[ConfigT]) -> type[ConfigT]:
-        """应用当前配置类的校验策略，并透传 dataclass 的结构参数。"""
+        """应用当前配置类的校验策略，并透传 dataclass 的结构参数。
+
+        Returns:
+            config_cls: 应用当前校验策略并完成 dataclass 转换的配置类。
+        """
         return dataclass(config_cls, config=merged_config, **kwargs)
 
     # 带参数形式先保存策略，直接形式立即完成类的转换。

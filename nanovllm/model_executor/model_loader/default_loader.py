@@ -86,8 +86,10 @@ class DefaultModelLoader(BaseModelLoader):
             allow_patterns_overrides: 替代默认 *.safetensors 的匹配模式。
 
         Returns:
-            (权重目录, 权重文件列表, 是否 safetensors)。第三项沿用 vLLM 返回协议，
-            当前始终为 True；文件内容尚未读取为 tensor。
+            (hf_folder, hf_weights_files, use_safetensors):
+                hf_folder: 本地权重所在目录。
+                hf_weights_files: 已筛选并排序的权重文件路径列表，尚未加载 tensor。
+                use_safetensors: 文件采用 safetensors 时为 True，当前实现始终为 True。
 
         Raises:
             ValueError: 模型目录不存在，或传入远程模型 ID。
@@ -140,13 +142,14 @@ class DefaultModelLoader(BaseModelLoader):
             source: 本地文件位置与名称前缀。
 
         Returns:
-            依次产出 (checkpoint 权重名称, CPU tensor) 的生成器。
+            weights_iterator: 依次产出 (name, tensor) 的生成器；name 带 source.prefix，
+                tensor 是对应的 CPU 权重。
 
         Side Effects:
             扫描文件与索引，并在第一次调用时记录加载起点。真正读取 tensor
             发生在调用方消费生成器时，不一次性保留整个模型的权重字典。
         """
-        # 返回协议保留三个元素；当前只需把文件列表交给 safetensors 迭代器。
+        # _prepare_weights 返回 (hf_folder, hf_weights_files, use_safetensors)，这里仅使用文件列表。
         _, hf_weights_files, _ = self._prepare_weights(
             source.model_or_path,
             source.subfolder,
@@ -170,7 +173,9 @@ class DefaultModelLoader(BaseModelLoader):
             model: 可通过 allow_patterns_overrides 和 secondary_weights 定制来源。
 
         Yields:
-            权重名称与 CPU tensor；当前没有下载或 EP 筛选。
+            (name, tensor):
+                name: 带 Source.prefix 的 checkpoint 权重名称。
+                tensor: 对应的 CPU 权重 tensor，当前不涉及下载或 EP 筛选。
 
         Side Effects:
             消费生成器时打开本地权重文件。

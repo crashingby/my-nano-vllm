@@ -38,9 +38,10 @@ class CachedRequestState:
             不支持 prompt embeddings，因此始终是 list。
         sampling_params: 当前请求的采样参数。MVP 只会读取 ``temperature``。
         block_ids: 当前单 KV cache group 的完整逻辑 block table。
-        num_computed_tokens: 当前已经写入 KV cache 的 token 数。它是 Worker mirror
-            中的执行进度，不包含本轮尚未 forward 的 token。
-        output_token_ids: 已经采样确认的 completion token IDs，不包含 prompt。
+        num_computed_tokens: 最新收到的执行前逻辑进度，不包含当前批次输入。
+            异步时前批 KV 写入可能尚未完成，设备依赖由计算流顺序保证。
+        output_token_ids: 不含 prompt 的本地输出列表；同步时为真实 token，异步
+            连续执行时可以包含 -1 占位，长度仍用于准备后续输入位置。
         num_prompt_tokens: prompt token 数，由 ``prompt_token_ids`` 在构造时计算。
     """
     # Worker 与 Scheduler 使用同一个 request ID 建立跨进程对应关系。
@@ -51,7 +52,7 @@ class CachedRequestState:
     sampling_params: SamplingParams
     # 单 group MVP 中 block table 直接是 list[int]，不使用 vLLM 的 tuple[list[int], ...]。
     block_ids: list[int]
-    # 本轮 forward 前已经实际写入 KV cache 的逻辑 token 数。
+    # Scheduler 快照中的执行前进度，不在采样后自行推进，下轮下发时再更新。
     num_computed_tokens: int
     # Worker 在 sample_tokens() 后持续追加的生成 token 序列。
     output_token_ids: list[int]
@@ -62,7 +63,11 @@ class CachedRequestState:
 
     @property
     def num_tokens(self) -> int:
-        """返回当前 prompt 与已生成 token 拼接后的总长度。"""
+        """返回 prompt 与本地输出的逻辑总长度，包含异步输出列表中的占位。
+
+        Returns:
+            num_tokens: prompt 与本地输出的逻辑总长度，包含异步输出列表中的占位。
+        """
         return self.num_prompt_tokens + len(self.output_token_ids)
     def get_token_id(self, index: int) -> int:
         """按逻辑位置获取一个 token ID。
@@ -71,8 +76,9 @@ class CachedRequestState:
             index: 在 ``prompt + output`` 完整序列中的逻辑 token 下标。
 
         Returns:
-            对应位置的 token ID。若该位置尚未存在，返回 ``-1``；后者通常意味着
-            调度器要求 Worker 使用了尚未同步到本地的 token，属于内部协议错误。
+            token_id: 对应位置的 token ID。若该位置尚未存在，返回 ``-1``；后者通常意味着
+                本地尚无对应位置；异步列表中已有的占位也可能返回 -1，真实模型
+                输入随后由 Runner 使用上一轮 GPU 采样结果回填。
         """
         if index < self.num_prompt_tokens:
             return self.prompt_token_ids[index]
@@ -113,7 +119,7 @@ class InputBatch:
         req_id_to_index: request ID 到当前物理槽位的反向索引。
         token_ids_cpu_tensor: 固定容量的 CPU token matrix。
         num_prompt_tokens_cpu_tensor: 每个槽位的 prompt 长度。
-        num_computed_tokens_cpu_tensor: 每个槽位已经写入 KV cache 的 token 数。
+        num_computed_tokens_cpu_tensor: 每个槽位的执行前逻辑进度，按调度快照更新。
         block_table: 单 KV cache group 的 GPU/CPU block-table 工作区。
         temperature_cpu_tensor: request temperature 的 CPU staging buffer。
         temperature: 与 CPU staging buffer 对应的 GPU temperature tensor。
@@ -263,7 +269,7 @@ class InputBatch:
         """返回当前稳定 batch 中按物理槽位排序的 request IDs.
 
         Returns:
-            前 ``num_reqs`` 个连续槽位中的 request IDs。
+            req_ids: 前 ``num_reqs`` 个连续槽位中的 request IDs。
 
         Raises:
             AssertionError: 在 remove/add/condense 的中间状态访问时抛出。
@@ -280,6 +286,9 @@ class InputBatch:
         `_req_ids` 在 remove/add/condense 的中间阶段可以含有 ``None``，因此不能
         用它的列表长度表示活跃请求数。`req_id_to_index` 只包含仍在 batch 中的
         request，恰好是 vLLM 同名属性使用的权威计数来源。
+
+        Returns:
+            num_reqs: 持久 batch 中存活请求的数量，以 req_id_to_index 为准。
         """
 
         return len(self.req_id_to_index)
@@ -298,7 +307,7 @@ class InputBatch:
             request: 即将加入 InputBatch 的 Worker 侧请求镜像。
 
         Returns:
-            分配给该 request 的物理 ``req_index``。
+            new_req_index: 分配给该 request 的物理 ``req_index``。
         """
         # pop_removed() 会按需排序删除索引，并返回数值最小的空槽位。被取走的
         # 删除事件由下面的 added 事件覆盖，因此不应再出现在最终 BatchUpdate.removed。
@@ -339,7 +348,7 @@ class InputBatch:
             request: 要加入当前执行 batch 的 Worker 侧请求状态。
 
         Returns:
-            分配给该 request 的物理 ``req_index``.
+            req_index: 分配给该 request 的物理 ``req_index``.
 
         Raises:
             AssertionError: request 已存在、token 长度超过模型上限，或复用槽位不是
@@ -407,7 +416,7 @@ class InputBatch:
             req_id: 需要从当前 InputBatch 删除的 request ID。
 
         Returns:
-            被移除的物理槽位；若 request 当前不在 InputBatch 中则返回 ``None``。
+            req_index: 被移除的物理槽位；若 request 当前不在 InputBatch 中则返回 ``None``。
         """
         req_index = self.req_id_to_index.pop(req_id, None)
         if req_index is None:
@@ -512,7 +521,11 @@ class InputBatch:
         )
 
     def _get_active_token_count(self, req_index: int) -> int:
-        """返回一个活跃槽位当前真实需要保留的 token 前缀长度。"""
+        """返回一个活跃槽位当前真实需要保留的 token 前缀长度。
+
+        Returns:
+            num_tokens: 活跃槽位需保留的 prompt 与本地输出前缀总长度。
+        """
         output_token_ids = self.req_output_token_ids[req_index]
         assert output_token_ids is not None
         return int(self.num_prompt_tokens[req_index]) + len(output_token_ids)
@@ -655,6 +668,9 @@ class InputBatch:
 
         不复制 temperature 或 processor 容器；下一轮复用 buffer 前，本轮采样
         必须已经完成。零请求时返回合法的空 temperature view。
+
+        Returns:
+            sampling_metadata: 按当前紧凑请求行排列的 SamplingMetadata，引用原 temperature 与处理器容器。
         """
         return SamplingMetadata(
             temperature=self.temperature[:self.num_reqs],

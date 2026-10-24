@@ -51,12 +51,17 @@ class RequestStatus(IntEnum):
             status: 要判断的请求状态。
 
         Returns:
-            当 ``status`` 是任意 ``FINISHED_*`` 状态时返回 ``True``；等待、
-            运行和抢占状态均返回 ``False``。
+            is_finished: 当 ``status`` 是任意 ``FINISHED_*`` 状态时返回 ``True``；等待、
+                运行和抢占状态均返回 ``False``。
         """
         return status > RequestStatus.PREEMPTED
     @staticmethod
     def get_finished_reason(status: "RequestStatus") -> FinishReason | None:
+        """将终止状态映射为输出协议的完成原因，未结束状态返回 None。
+
+        Returns:
+            finish_reason: 终止状态对应的 FinishReason；状态尚未结束时为 None。
+        """
         return _FINISHED_REASON_MAP.get(status)
 
 
@@ -70,7 +75,7 @@ class Request:
     Attributes:
         request_id: 调用方提供的全局唯一请求标识，也是 Scheduler 和
             KVCacheManager 中各映射的 key。
-        priority: 未来优先级调度使用的排序键；当前 MVP 仍按 FCFS 入队。
+        priority: 优先级队列使用的排序键；默认 FCFS 策略按入队顺序处理。
         arrival_time: 请求进入系统的时间戳，用于同优先级请求的稳定排序。
         status: 当前请求生命周期状态。
         stop_reason: 请求完成或取消时由上层记录的停止原因；运行期间为 ``None``。
@@ -84,6 +89,11 @@ class Request:
         num_prompt_tokens: prompt 的 token 数，在请求创建后保持不变。
         num_computed_tokens: 已命中缓存或已承诺执行的逻辑进度。GPU 是否完成由
             执行结果确认，不能单独依据这个数字判断。
+        num_output_placeholders: 已安排但尚未回收的有效输出位置数，不含 token ID。
+        num_in_flight_tokens: 已安排但尚未回收的输入计算量，包含 prefill 和 decode。
+        num_stale_output_tokens: 抢占时仍在途的旧输入计算量，回收后只更新真实历史；
+            名称沿用输出协议，实际按各旧批次处理的输入 token 数扣减。
+        last_sched_seq: 可选延迟释放策略记录的最近写入批次编号；该策略默认关闭。
         is_prefill_chunk: 本轮调度后是否仍有 prompt 或重算 token 未完成；它只
             是执行提示，不是 P/D 逻辑状态机。
         num_preemptions: 请求被抢占的累计次数，可供后续统计或策略使用。
@@ -108,7 +118,8 @@ class Request:
             request_id: 非空且在同一 Scheduler 内唯一的请求标识。
             prompt_token_ids: 已经 tokenizer 编码后的非空 prompt token 序列。
             sampling_params: 本请求的采样配置，例如最大生成长度和 EOS 策略。
-            priority: 未来优先级调度的排序值；数值越小，排序越靠前。
+            priority: 优先级调度的排序值；数值越小，排序越靠前。
+            client_index: 结果按客户端分组时使用的路由编号，缺省为 0。
             arrival_time: 可选的入队时间戳。未提供时使用当前系统时间，测试中可
                 显式传入以获得可复现的排序结果。
             block_hasher: 由 Engine 创建并在所有 Request 间共享的增量 hash 函数。
@@ -128,8 +139,8 @@ class Request:
 
         # request_id 是逻辑请求跨 Scheduler、KVCacheManager 和 Worker 的共同身份。
         self.request_id: str = request_id
-        self.client_index: int = client_index
-        # 当前 MVP 仍使用 FCFS；该字段提前保留，使未来可替换为优先级队列。
+        self.client_index: int = client_index  # Scheduler 按此编号聚合同一客户端的输出。
+        # 默认 FCFS 不比较该字段，priority 策略通过 __lt__ 读取它。
         self.priority: int = priority
         # 未传入时间时在创建点采样，避免排序时多次读取系统时钟。
         self.arrival_time: float = (
@@ -153,13 +164,14 @@ class Request:
         # KV cache 的逻辑位置基于完整序列，因此单独维护 prompt + output 的拼接表。
         self._all_token_ids: list[int] = prompt_token_ids.copy()
 
-        # Used in async scheduling.
+        # 尚未回收的有效采样输出数量；它不扩展真实 token 列表。
         self.num_output_placeholders = 0
-        # Tokens of output in flight when the request was preempted: delivered
-        # on return, but must not mutate the reset counters.
+        # 抢占时复制在途输入量，旧批次按原始输入数回收，不能扣减新阶段的占位。
         self.num_stale_output_tokens = 0
+        # 已提交且尚未由 Scheduler 回收的输入数；GPU 完成不会自行减少该计数。
         self.num_in_flight_tokens = 0
         
+        # 仅在 Scheduler 启用延迟释放时用于标记最后一批 KV 写入。
         self.last_sched_seq = 0
         # prompt 长度在构造后不变，常用于判断 prefill 与生成长度上限。
         self.num_prompt_tokens: int = len(self.prompt_token_ids)
@@ -173,7 +185,7 @@ class Request:
         # 记录抢占次数，后续可用于统计和调度策略。
         self.num_preemptions: int = 0
 
-        self.prefill_stats: PrefillStats | None = PrefillStats()
+        self.prefill_stats: PrefillStats | None = PrefillStats()  # 首次输出时转交一次后清空。
         # 每项对应一个完整逻辑 token block 的 prefix hash。
         # 它与物理 block table 分离，抢占释放 KV 后仍可保留。
         self.block_hashes:list[BlockHash] =[]
@@ -187,8 +199,8 @@ class Request:
         """返回 prompt 与已生成输出拼接后的完整 token 序列。
 
         Returns:
-            Request 当前的完整逻辑 token 序列。该列表由 Request 内部维护；调用方
-            应将其视为只读，不能原地修改。
+            all_token_ids: Request 当前的完整逻辑 token 序列。该列表由 Request 内部维护；调用方
+                应将其视为只读，不能原地修改。
         """
         return self._all_token_ids
 
@@ -197,7 +209,7 @@ class Request:
         """返回已经确认生成的输出 token 序列。
 
         Returns:
-            不包含 prompt 的输出 token 列表。调用方应将返回列表视为只读。
+            output_token_ids: 不包含 prompt 的输出 token 列表。调用方应将返回列表视为只读。
         """
         return self._output_token_ids
 
@@ -206,8 +218,9 @@ class Request:
         """返回当前完整序列的逻辑 token 数。
 
         Returns:
-            ``len(prompt_token_ids) + len(output_token_ids)``。Scheduler 用这个
-            值与 ``num_computed_tokens`` 的差来计算本轮需要执行的 token 数。
+            num_tokens: ``len(prompt_token_ids) + len(output_token_ids)``。Scheduler 用这个
+                值加 ``num_output_placeholders`` 再减 ``num_computed_tokens``，
+                用于计算普通运行请求本轮需要推进的输入数。
         """
         return len(self._all_token_ids)
 
@@ -216,7 +229,7 @@ class Request:
         """返回已经生成的输出 token 数。
 
         Returns:
-            当前 completion 的长度，不包含 prompt token。
+            num_output_tokens: 当前 completion 的长度，不包含 prompt token。
         """
         return len(self._output_token_ids)
 
@@ -224,10 +237,15 @@ class Request:
         """判断当前请求是否已经结束。
 
         Returns:
-            当 ``self.status`` 为任意 ``FINISHED_*`` 状态时返回 ``True``。
+            is_finished: 当 ``self.status`` 为任意 ``FINISHED_*`` 状态时返回 ``True``。
         """
         return RequestStatus.is_finished(self.status)
     def get_finished_reason(self) -> FinishReason | None:
+        """返回当前状态对应的完成原因，请求尚未结束时返回 None。
+
+        Returns:
+            finish_reason: 当前请求的完成原因；请求尚未结束时为 None。
+        """
         return RequestStatus.get_finished_reason(self.status)
     def update_block_hashes(self)->None:
         """增量记录 Request 新出现的完整逻辑 token block hashes。
@@ -239,7 +257,7 @@ class Request:
             将此前未 hash 的完整 token blocks 追加到 ``self.block_hashes``。
         """
         if self._block_hasher is not None:
-            # 共享 hasher 只返回新增完整 blocks，因此不会重复 hash 已有 prompt。
+            # 共享 hasher 返回 new_block_hashes，只含新增完整 blocks，不重复 hash 已有 prompt。
             new_block_hashes = self._block_hasher(self)
             self.block_hashes.extend(new_block_hashes)
     def append_output_token_ids(
@@ -270,22 +288,30 @@ class Request:
             self._all_token_ids.extend(token_ids)
         self.update_block_hashes()
     def take_prefill_stats(self) -> PrefillStats | None:
+        """转交首轮 prefill 统计并清空引用，后续输出不再重复携带。
+
+        Returns:
+            prefill_stats: 首次调用时返回当前统计对象；已转交时返回 None。
+
+        Side Effects:
+            将 self.prefill_stats 设为 None，不复制统计对象。
+        """
         if self.prefill_stats is None:
             return None
         prefill_stats = self.prefill_stats
         self.prefill_stats = None
         return prefill_stats
     def __lt__(self, other: "Request") -> bool:
-        """为未来的优先级队列定义稳定的请求排序。
+        """为优先级队列定义请求排序。
 
         Args:
             other: 与当前请求比较的另一个 Request。
 
         Returns:
-            当前请求应排在 ``other`` 前面时返回 ``True``。排序优先级依次为
-            ``priority``、``arrival_time``、``request_id`` 和对象身份。
+            is_less: 当前请求应排在 ``other`` 前面时返回 ``True``。排序优先级依次为
+                ``priority``、``arrival_time``、``request_id`` 和对象身份。
         """
-        # priority 越小越靠前，便于未来直接将 Request 放入 heapq。
+        # priority 越小越靠前，PriorityRequestQueue 通过 heapq 使用该比较规则。
         if self.priority != other.priority:
             return self.priority < other.priority
         # 相同优先级下，先到达的请求先被服务，维持 FCFS 语义。

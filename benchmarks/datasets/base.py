@@ -30,7 +30,7 @@ class DatasetSample:
 
 @dataclass(frozen=True)
 class SampleRequest:
-    """已经完成预处理、可直接交给同步 Engine 的 benchmark 请求。
+    """已经完成预处理、可直接交给 Engine 的 benchmark 请求。
 
     命名参考 vLLM 的 SampleRequest；当前仅支持 token IDs 形式的单轮文本输入。
     prompt 列表提交后不得修改，prompt_len 始终从同一列表计算，避免统计量失配。
@@ -43,7 +43,11 @@ class SampleRequest:
 
     @property
     def prompt_len(self) -> int:
-        """返回真实提交的逻辑输入长度，不包含 Graph padding。"""
+        """返回真实提交的逻辑输入长度，不包含 Graph padding。
+
+        Returns:
+            prompt_len: 最终提交的 prompt token ID 数量，不含 Graph padding。
+        """
         return len(self.prompt)
 
 
@@ -69,7 +73,11 @@ class BenchmarkDataset(ABC):
 
     @abstractmethod
     def load_data(self) -> Iterator[DatasetSample]:
-        """读取本地记录并组织用户文本，不添加 chat template 或参考答案。"""
+        """读取本地记录并组织用户文本，不添加 chat template 或参考答案。
+
+        Returns:
+            samples: 逐条提供用户文本和 sample_id 的 DatasetSample 迭代器。
+        """
         raise NotImplementedError
 
     @staticmethod
@@ -78,6 +86,9 @@ class BenchmarkDataset(ABC):
 
         模板已经提供角色和特殊 token，因此 encode 不再重复添加特殊 token。
         该阶段在性能计时前执行，所有数据集使用相同的对话封装。
+
+        Returns:
+            prompt_ids: 应用统一聊天模板并编码后的 token ID 列表，包含模板特殊 token。
         """
         chat_prompt = tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
@@ -98,6 +109,9 @@ class BenchmarkDataset(ABC):
         这是吞吐负载的长度控制，会改变原始任务内容，不用于官方质量评分。
         先扣除空用户文本的模板开销，再从文本中部删减；重新编码后若边界分词
         增加 token，则继续缩减文本，直到满足包含模板在内的硬上限。
+
+        Returns:
+            prompt_ids: 保留用户文本首尾并重建模板后的 token ID 列表，最终长度不超过上限。
         """
         template_tokens = len(self._encode_prompt(tokenizer, ""))
         content_ids = tokenizer.encode(prompt, add_special_tokens=False)
@@ -128,6 +142,9 @@ class BenchmarkDataset(ABC):
         输入上限取 max_prompt_tokens 与 max_model_len - output_len 的较小值，
         为目标输出预留位置。error 策略遇到超限记录立即报错；skip 继续寻找后续
         样本；truncate 保留文本首尾。文件或字段错误始终报错，不按超长策略吞掉。
+
+        Returns:
+            requests: 按源顺序接受的合法 SampleRequest 列表，最多 num_requests 条，不重复补齐。
 
         Side Effects:
             读取本地数据、运行 tokenizer 并记录接受、跳过和截断数量；不启动 GPU。

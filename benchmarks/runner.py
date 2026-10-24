@@ -34,7 +34,7 @@ def run_benchmark(
         replay: 使用空闲 Engine 执行请求并返回统计的函数，负责自己的计时边界。
 
     Returns:
-        replay 返回的原始统计对象，保留具体子类类型。
+        stats: replay 返回的原始统计对象，保留具体子类类型。
 
     Side Effects:
         读取数据与 tokenizer、创建 Engine、重置 RNG 并执行请求。Engine 创建
@@ -56,8 +56,10 @@ def run_benchmark(
         )
     max_active = config.vllm_config.scheduler_config.max_num_seqs  # 闭环回放的并发上限。
     logger.info(
-        "Initializing LLM: model=%s num_prompts=%d max_active=%d max_tokens=%d",
+        "Initializing LLM: model=%s num_prompts=%d max_active=%d max_tokens=%d "
+        "async_scheduling=%s",
         model_config.model, len(requests), max_active, config.sampling_params.max_tokens,
+        config.vllm_config.scheduler_config.async_scheduling,
     )
     with nvtx_range("init_llm"):
         llm = LLM(vllm_config=config.vllm_config)
@@ -83,6 +85,7 @@ def _save_result(config: BenchmarkConfig, stats: BenchmarkStats) -> None:
             "model": model_config.model,
             "dtype": str(model_config.dtype),
             "enforce_eager": model_config.enforce_eager,
+            "async_scheduling": scheduler_config.async_scheduling,
             "max_model_len": model_config.max_model_len,
             "max_active": scheduler_config.max_num_seqs,
             "max_num_batched_tokens": scheduler_config.max_num_batched_tokens,

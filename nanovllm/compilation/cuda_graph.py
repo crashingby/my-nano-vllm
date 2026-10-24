@@ -97,6 +97,9 @@ class CUDAGraphLogging:
 
         四个字段都相同才合并为一行，按 Count 降序排列。比如 observe()
         两次提交 (3, 4, 1, "FULL")，表格该行的 Count 为 2。
+
+        Returns:
+            metric_table: 包含配置、批次记录与出现次数的 Markdown 表格字符串，不修改累计统计。
         """
         stats_counts = Counter(self.stats)  # 不可变记录作为 key，避免混合不同 padding 情况。
 
@@ -264,7 +267,11 @@ class CUDAGraphWrapper:
         CUDAGraphWrapper._all_instances.add(self)
 
     def __getattr__(self, key: str) -> Any:
-        """Wrapper 没有指定属性时，从原始 runnable 读取；不存在则抛异常。"""
+        """Wrapper 没有指定属性时，从原始 runnable 读取；不存在则抛异常。
+
+        Returns:
+            attr: 原始 runnable 上 key 对应的属性值或绑定方法；属性不存在时抛出 AttributeError。
+        """
         if hasattr(self.runnable, key):
             return getattr(self.runnable, key)
         if self.is_debugging_mode:
@@ -275,12 +282,20 @@ class CUDAGraphWrapper:
         raise AttributeError
 
     def unwrap(self) -> Callable[..., Any]:
-        """返回原始 callable，调用它会绕过本 Wrapper 的捕获与回放逻辑。"""
+        """返回原始 callable，调用它会绕过本 Wrapper 的捕获与回放逻辑。
+
+        Returns:
+            runnable: 原始可调用对象；直接调用它会绕过本 Wrapper 的捕获与回放。
+        """
         return self.runnable
 
     @property
     def cudagraph_wrapper(self) -> "CUDAGraphWrapper":
-        """返回自身，提供统一的 Wrapper 查找入口，不创建新的包装对象。"""
+        """返回自身，提供统一的 Wrapper 查找入口，不创建新的包装对象。
+
+        Returns:
+            cudagraph_wrapper: 当前 Wrapper 自身，不创建新的包装对象。
+        """
         return self
 
     def clear_graphs(self) -> None:
@@ -300,9 +315,9 @@ class CUDAGraphWrapper:
                 回放不会重新执行 runnable，动态值应通过固定地址 buffer 更新。
 
         Returns:
-            普通执行直接返回 runnable 的结果；捕获返回局部 output，是否 owning
-            由 weak_ref_output 决定；回放返回 entry.output 中的非 owning 别名。
-            返回结果不做 clone，不能作为跨回放长期保存的结果快照。
+            output: 普通执行直接返回 runnable 的结果；捕获返回局部 output，是否 owning
+                由 weak_ref_output 决定；回放返回 entry.output 中的非 owning 别名。
+                返回结果不做 clone，不能作为跨回放长期保存的结果快照。
 
         Side Effects:
             首次匹配 key 时加载原生扩展并捕获 GPU 工作，成功后缓存 Graph。
@@ -405,4 +420,4 @@ class CUDAGraphWrapper:
 
         # 回放不会重新调用 runnable，也不会读取新的 Python 参数来替换图内地址。
         entry.cudagraph.replay()
-        return entry.output  # 返回本次 GPU 写入的缓存别名，不创建输出快照。
+        return entry.output  # 返回 entry.output 中本次 GPU 写入的缓存别名，不创建输出快照。

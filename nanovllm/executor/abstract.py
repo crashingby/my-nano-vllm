@@ -68,7 +68,7 @@ class Executor(ABC):
                 但当前没有对应的多进程 Executor。
 
         Returns:
-            UniProcExecutor 类；Worker 创建与模型加载发生在随后构造实例时。
+            executor_class: UniProcExecutor 类；Worker 创建与模型加载发生在随后构造实例时。
 
         Raises:
             NotImplementedError: tensor_parallel_size 不为 1。
@@ -144,7 +144,7 @@ class Executor(ABC):
         # compilation_times 按 RPC rank 保存每个 Worker 的 CompilationTimes；
         # 先完成正式 KV 初始化，再执行内核、Graph 和 sampler 的启动准备。
         compilation_times: list[CompilationTimes]=self.collective_rpc("compile_or_warm_up_model")
-        # 有返回记录时才回填统计；当前单 Worker 返回一个元素，没有模型级编译时为零。
+        # compilation_times 非空时才回填统计；当前列表只有一个 Worker 的编译时间记录。
         if compilation_times:
             # t 是某个 Worker 的秒数统计；沿用 vLLM 取最大值，表达并行启动的编译耗时。
             self.vllm_config.compilation_config.compilation_time = max(
@@ -173,8 +173,8 @@ class Executor(ABC):
         KVCacheConfig，不在此接口内选择或分配物理 block。
 
         Returns:
-            list[int]，外层下标对应 Worker rank，元素单位为字节。当前单卡为
-            [rank0_budget]，与 get_kv_cache_specs() 返回列表的同一项配对。
+            available_memory: list[int]，外层下标对应 Worker rank，元素单位为字节。当前单卡为
+                [rank0_budget]，与 get_kv_cache_specs() 返回列表的同一项配对。
 
         Side Effects:
             Worker 执行模拟模型、采样和可能的 Graph profiling，更新显存统计。
@@ -192,9 +192,9 @@ class Executor(ABC):
         接口调用 Worker 的单数 get_kv_cache_spec()，并在外层保留 rank 维度。
 
         Returns:
-            每个元素都是 layer_name -> KVCacheSpec 字典，描述本地模型层的
-            block size、KV head 数、head dimension 与 dtype。单卡形如
-            [{"model.layers.0.self_attn.attn": spec, ...}]，与显存预算列表对齐。
+            kv_cache_specs: 每个元素都是 layer_name -> KVCacheSpec 字典，描述本地模型层的
+                block size、KV head 数、head dimension 与 dtype。单卡形如
+                [{"model.layers.0.self_attn.attn": spec, ...}]，与显存预算列表对齐。
         """
         # kv_cache_specs 的外层下标为 Worker rank，内部 key 为模型层稳定全名。
         kv_cache_specs: list[dict[str, KVCacheSpec]] = self.collective_rpc(
@@ -210,7 +210,11 @@ class Executor(ABC):
         kwargs: dict[str, Any] | None = None,
         non_block: Literal[False] = False,
     ) -> list[_R]:
-        """声明同步 RPC 的类型：按 Worker rank 返回 list[_R]。"""
+        """声明同步 RPC 的类型：按 Worker rank 返回 list[_R]。
+
+        Returns:
+            outputs: 按 Worker rank 排列的同步 RPC 返回值列表。
+        """
     @overload
     def collective_rpc(
         self,
@@ -220,7 +224,11 @@ class Executor(ABC):
         kwargs: dict[str, Any] | None = None,
         non_block: Literal[True] = True,
     ) -> Future[list[_R]]:
-        """声明 Future 形式的 RPC 类型：Future 的结果为整个 rank 有序列表。"""
+        """声明 Future 形式的 RPC 类型：Future 的结果为整个 rank 有序列表。
+
+        Returns:
+            future: 异步调用包装器，其 result() 为按 Worker rank 排列的完整结果列表。
+        """
     
     @abstractmethod
     def collective_rpc(
@@ -263,7 +271,11 @@ class Executor(ABC):
         scheduler_output: SchedulerOutput,
         non_block: Literal[False] = False,
     ) -> ModelRunnerOutput | None:
-        """声明同步执行结果：返回 ModelRunnerOutput 或表示待采样的 None。"""
+        """声明同步执行结果：返回 ModelRunnerOutput 或表示待采样的 None。
+
+        Returns:
+            model_output: 同步执行的单个 ModelRunnerOutput，或表示仍需调用 sample_tokens() 的 None。
+        """
 
     @overload
     def execute_model(
@@ -271,7 +283,11 @@ class Executor(ABC):
         scheduler_output: SchedulerOutput,
         non_block: Literal[True] = True,
     ) -> Future[ModelRunnerOutput | None]:
-        """声明子类可提供的单结果 Future；基类默认实现拒绝此调用方式。"""
+        """声明子类可提供的单结果 Future；基类默认实现拒绝此调用方式。
+
+        Returns:
+            future: 结果为单个 ModelRunnerOutput 或 None 的 Future；由具体执行器提供该能力。
+        """
 
     def execute_model(
         self,
@@ -289,8 +305,8 @@ class Executor(ABC):
                 子类需在覆盖方法中完成对应包装。
 
         Returns:
-            rank 0 的 ModelRunnerOutput 或 None。None 表示本轮 forward 已暂存
-            logits，调用方应先调用 sample_tokens()，再提交下一轮执行。
+            model_output: rank 0 的 ModelRunnerOutput 或 None。None 表示本轮 forward 已暂存
+                logits，调用方应先调用 sample_tokens()，再提交下一轮执行。
 
         Raises:
             NotImplementedError: 对基类默认实现传入 non_block=True。
@@ -306,7 +322,7 @@ class Executor(ABC):
                 "execute_model"
             )
 
-        # outputs 的外层下标是 Worker rank，此同步默认路径只返回第 0 项。
+        # outputs 按 Worker rank 排列；本同步路径返回 outputs[0]，调用方命名为 model_output。
         outputs: list[ModelRunnerOutput | None] = self.collective_rpc(
             "execute_model",
             args=(scheduler_output,),
@@ -317,7 +333,11 @@ class Executor(ABC):
         self,
         non_block: Literal[False] = False,
     ) -> ModelRunnerOutput:
-        """声明同步采样类型：返回单个 ModelRunnerOutput。"""
+        """声明同步采样类型：返回单个 ModelRunnerOutput。
+
+        Returns:
+            model_output: 当前批次采样得到的单个 ModelRunnerOutput。
+        """
         ...
 
     @overload
@@ -325,7 +345,11 @@ class Executor(ABC):
         self,
         non_block: Literal[True],
     ) -> Future[ModelRunnerOutput]:
-        """声明子类提供的 Future 采样类型：Future 的结果为单个输出对象。"""
+        """声明子类提供的 Future 采样类型：Future 的结果为单个输出对象。
+
+        Returns:
+            future: 结果为单个 ModelRunnerOutput 的 Future，由具体执行器提供。
+        """
         ...
 
     def sample_tokens(
@@ -343,8 +367,8 @@ class Executor(ABC):
                 于返回列表的同步路径，Future 返回需要具体子类覆盖适配。
 
         Returns:
-            同步列表中的 rank 0 ModelRunnerOutput。注解中的 Future 返回能力
-            由具体子类提供，本方法不会将 Future[list[...]] 转换为单结果 Future。
+            model_output: 同步列表中的 rank 0 ModelRunnerOutput。注解中的 Future 返回能力
+                由具体子类提供，本方法不会将 Future[list[...]] 转换为单结果 Future。
 
         Side Effects:
             Worker 消费待采样 logits、过滤候选并回写 token 镜像，结果交给调用方
@@ -511,5 +535,8 @@ class Executor(ABC):
 
         Future 是调用结果的包装形式；是否能安全重叠后续调度，需要具体执行器
         与 Worker 共同支持，不能仅根据某个接口返回 Future 推导。
+
+        Returns:
+            supports_async_scheduling: 执行器与 Worker 支持安全重叠后续调度时为 True；基类默认 False。
         """
         return False

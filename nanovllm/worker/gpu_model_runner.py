@@ -71,8 +71,13 @@ from nanovllm.compilation.monitor import (
 from nanovllm.distributed.parallel_state import graph_capture
 logger = init_logger(__name__)
 
-# Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
+    """提交采样结果的独立流回传，在回收时交付 CPU token 列表。
+
+    每个实例对应一个 batch，持有该批请求行快照、采样 tensor 和完成事件。
+    后续 batch 可以改变 InputBatch，但不能改变这里保存的输出归属。
+    """
+
     def __init__(
         self,
         model_runner_output: ModelRunnerOutput,
@@ -81,33 +86,57 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         async_output_copy_stream: torch.cuda.Stream,
         vocab_size: int,
     ):
+        """安排 D2H 和完成事件，保留回收前仍会被使用的设备存储。
+
+        Args:
+            model_runner_output: 本批请求 ID 和行号快照，token 列表尚未填入。
+            sampled_token_ids: GPU 上形状为 [num_reqs, 1] 的采样结果。
+            invalid_req_indices: 中间 prefill chunk 等应丢弃候选的输出行号。
+            async_output_copy_stream: Runner 复用的 GPU 到 CPU 拷贝流。
+            vocab_size: 词表容量；当前单 token 回收路径保留但不读取此参数。
+
+        Side Effects:
+            在拷贝流等待采样所在流，提交 CPU 拷贝并记录事件；不在这里
+            等待 GPU 完成。调用方必须通过 get_output() 等待后再读取结果。
+        """
+        # 输出归属与无效行均属于本批次，不能在回收时查询已经变化的 InputBatch。
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
 
+        # 每批独立事件只保护该批 D2H；设备 tensor 引用保证拷贝源保持存活。
         self.async_copy_ready_event = torch.Event()
         self._sampled_token_ids = sampled_token_ids
         self.vocab_size = vocab_size
         default_stream = torch.cuda.current_stream()
         with torch.cuda.stream(async_output_copy_stream):
+            # 这是设备侧依赖：采样完成后才能拷贝，不会让 CPU 等待采样结果。
             async_output_copy_stream.wait_stream(default_stream)
             self.sampled_token_ids_cpu = self._sampled_token_ids.to(
                 "cpu", non_blocking=True
             )
             self.async_copy_ready_event.record()
     def get_output(self) -> ModelRunnerOutput:
-        """Copy the device tensors to the host and return a ModelRunnerOutput.
+        """等待本批回传结束，过滤无效行，并填入可供 Scheduler 消费的结果。
 
-        This function blocks until the copy is finished.
+        Returns:
+            output: 保存本批请求映射和真实 CPU token 列表的 ModelRunnerOutput。
+
+        Side Effects:
+            阻塞 CPU 至本批完成事件，随后释放持有的 GPU tensor 引用。
+            当前只支持每行一个采样 token；该对象应只回收一次，重复读取由
+            外层 AsyncOutputFuture 的结果缓存处理。
         """
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
+        # CPU 从这里开始才可以安全读取 non_blocking D2H 的目标内存。
         self.async_copy_ready_event.synchronize()
 
         del self._sampled_token_ids
         if max_gen_len == 1:
             valid_sampled_token_ids = self.sampled_token_ids_cpu.tolist()
+            # 中间 prefill 也执行了采样，但不能把这些候选作为新增输出返回。
             for i in self._invalid_req_indices:
                 valid_sampled_token_ids[i].clear()
-        # 这里的else是干嘛的
+        # 上游采样断言限定单 token，尚未实现多候选/投机解码的回收分支。
         output = self._model_runner_output
         output.sampled_token_ids = valid_sampled_token_ids
         return output
@@ -125,11 +154,9 @@ class ExecuteModelState(NamedTuple):
         logits: 模型对需要采样位置计算出的 logits，形状通常为
             ``[num_sample_reqs, vocab_size]``。
     """
-    # TODO:其他成员什么时候加上去呢
+    # 原计划用于判断采样有效性；logits 必须在下一次 forward 前被消费。
     scheduler_output: SchedulerOutput
     logits: torch.Tensor
-    #cudagraph_stats 则是性能观测功能，不影响 CUDA Graph 本身是否工作。
-    #cudagraph_stats: CUDAGraphStat | None
 
 class GPUModelRunner:
     """执行单个 TP rank 的模型前向、KV cache 写入和 token 采样。
@@ -138,7 +165,7 @@ class GPUModelRunner:
 
     - Qwen3 decoder-only text generation；
     - 单 KV cache group 的 full attention；
-    - 同步连续批处理；
+    - 同步或异步调度的连续批处理；
     - 单 token 采样；
     - 单机或未来 TP 下的同构模型分片。
 
@@ -149,7 +176,7 @@ class GPUModelRunner:
     - LoRA、MoE routed experts；
     - 投机解码、结构化输出、logprobs；
     - Mamba、MLA、sliding-window attention；
-    - KV transfer connector、异步 scheduling。
+    - KV transfer connector。
 
     Attributes:
         vllm_config: 当前 Worker 使用的完整 nano-vLLM 配置。
@@ -172,6 +199,10 @@ class GPUModelRunner:
         cudagraph_dispatcher: 后端能力解析后保存合法 keys，选择运行模式和补齐容量。
         cudagraph_batch_sizes: 升序候选捕获尺寸；实际捕获计划以 Dispatcher 为准。
         execute_model_state: forward 完成后、采样完成前的短生命周期状态。
+        use_async_scheduling: 是否保留 GPU 采样结果并延后 CPU 输出回收。
+        async_output_copy_stream: 异步结果 D2H 使用的独立流。
+        prepare_inputs_event: 标记上一轮输入准备已消费 CPU staging buffer；
+            记录点位于模型 forward 之前，不代表整批计算或输出回传完成。
     """
     def __init__(
         self,
@@ -197,18 +228,18 @@ class GPUModelRunner:
         self.compilation_config = vllm_config.compilation_config
         self.load_config = vllm_config.load_config
         self.parallel_config = vllm_config.parallel_config
-        # TODO:observability_config
+        # 下方局部别名只缩短初始化时的配置访问，不创建新的配置副本。
         model_config = self.model_config
         cache_config = self.cache_config
         scheduler_config = self.scheduler_config
         parallel_config = self.parallel_config
         # device 是本 TP rank 实际执行所有 CUDA 运算的设备。
         self.device = device
-        # 平台统一检查锁页内存，避免 WSL 或无 CUDA 时强制启用 pinned host memory。
+        # 在分配 staging buffer 前读取平台策略，统一传给 InputBatch 和 CpuGpuBuffer。
         self.pin_memory = current_platform.is_pin_memory_available()
         # 配置已解析运行精度，不再从 HF 原始配置推断参数和激活精度。
         self.dtype = model_config.dtype
-        # kv_cache_dtype 暂且不写，现在等于self.dtype
+        # 当前 KV 与模型使用相同精度，长度上限还会在显存规划阶段更新。
         self.max_model_len = model_config.max_model_len
         # 单步调度总 token 预算，用于固定大小输入 buffer 的后续分配。
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
@@ -217,31 +248,29 @@ class GPUModelRunner:
         # 当前没有 spec decode，每个 uniform decode 请求只调度一个 query token。
         self.uniform_decode_query_len = 1
 
-        # TODO:本 TP rank 的 query head 数。 
+        # 保存本 rank 的 query head 数，Attention metadata 按本地分片解释。
         self.num_query_heads = model_config.get_num_attention_heads(parallel_config)
-        # TODO:Attention计算的选项，例如alibi等
 
         # 采样器本身不持有请求状态；temperature 等请求级数据属于 InputBatch。
 
+        # 控制 token 占位、GPU 结果复用、拷贝流和输入 buffer 保护的整条分支。
         self.use_async_scheduling = self.scheduler_config.async_scheduling
-        # TODO:Sampler以后还有参数
         self.sampler = Sampler()
 
         # KV cache 规划与真实 tensor 都必须在 profiling 后才能确定。
-        # TODO:self.kv_cache_config，这个vllm在initialize_kv_cache才初始化
+        # kv_cache_config 在 initialize_kv_cache() 时安装，此处尚无正式分配计划。
         self.kv_caches: list[torch.Tensor] = []
         # 外层按逻辑 KV group 编号索引，内层按后端和规格组织 AttentionGroup。
         self.attn_groups: list[list[AttentionGroup]] = []
         # Worker 侧持久请求镜像。其 key 与 Scheduler 的 request_id 完全一致。
         self.requests: dict[str, CachedRequestState] = {}
         placeholder_block_size = (
-            self.cache_config.block_size #or CacheConfig.DEFAULT_BLOCK_SIZE
+            self.cache_config.block_size
         )
-        # _init_block_sizes 系列是在KV Config未知时默认提供的
-        # 因为可能是多个group，所以要用list
+        # 正式 KV 计划未知时先按配置建立单 group 的尺寸约定，初始化后重新核对。
         self._init_block_sizes = [placeholder_block_size]
         self._init_kernel_block_sizes = [placeholder_block_size]
-        # TODO:之后初始化
+        # 先分配请求工作区；正式 KV 规格要求不同尺寸时会重建空 InputBatch。
         self.input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
@@ -253,11 +282,9 @@ class GPUModelRunner:
             kernel_block_size=placeholder_block_size,
             logitsprocs=LogitsProcessors()
         )
-        # Separate cuda stream for overlapping transfer of sampled token ids from
-        # GPU to CPU when async scheduling is enabled.
+        # 独立拷贝流允许结果回传与后续 batch 的计算重叠。
         self.async_output_copy_stream: torch.cuda.Stream | None = None
-        # cuda event to synchronize use of reused CPU tensors between steps
-        # when async scheduling is enabled.
+        # 输入事件保护跨批复用的 CPU staging，区别于每批输出的 D2H 完成事件。
         self.prepare_inputs_event: torch.Event | None = None
         if self.use_async_scheduling:
             self.async_output_copy_stream = torch.cuda.Stream()
@@ -269,9 +296,6 @@ class GPUModelRunner:
             and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
             else []
         )
-
-        # 获取SM的个数
-        # self._init_device_properties()
 
         # 本轮 packed token IDs 的 CPU/GPU 固定 buffer。
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
@@ -292,7 +316,7 @@ class GPUModelRunner:
             self.max_num_reqs, dtype=torch.int32, device="cpu",
             pin_memory=self.pin_memory,
         )
-        # forward 前每个 request 已写入 KV 的长度。
+        # 执行前计划中的逻辑进度；异步时其依赖由同一计算流保证，CPU 不等完成。
         self.num_computed_tokens = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
@@ -317,13 +341,21 @@ class GPUModelRunner:
         self.execute_model_state: ExecuteModelState | None = None
 
     def update_max_model_len(self, max_model_len: int) -> None:
+        """更新显存规划后允许使用的逻辑上下文长度。
+
+        Args:
+            max_model_len: Worker 规划后确定的 token 长度上限。
+
+        Side Effects:
+            只更新 Runner 的长度标量，不重新分配已有输入工作区。
+        """
         self.max_model_len = max_model_len
 
     def get_model(self) -> nn.Module:
         """返回当前已加载的原始语言模型，绕过 CUDA Graph 包装。
 
         Returns:
-            已构造且权重已加载到当前 CUDA device 的模型。
+            model: 已构造且权重已加载到当前 CUDA device 的模型。
 
         Raises:
             ValueError: 在 ``load_model()`` 前调用时抛出。
@@ -351,9 +383,10 @@ class GPUModelRunner:
             self.model_config.model,
         )
         try:
+            # profiler 只度量模型加载的显存净增量，KV 分配仍在后续规划阶段。
             with DeviceMemoryProfiler() as m:
                 time_before_load = time.perf_counter()
-                model_loader = get_model_loader(self.load_config)
+                model_loader = get_model_loader(self.load_config)  # 根据加载策略选择权重入口。
                 self.model = model_loader.load_model(
                     vllm_config=self.vllm_config,model_config=self.model_config
                 )
@@ -385,16 +418,18 @@ class GPUModelRunner:
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """返回当前模型所有 Attention layer 的 KV cache 存储规格。
 
-        该方法应调用 ``nanovllm.worker.gpu.attn_utils.get_kv_cache_spec()``。
-        它读取模型构造期间注册的 Attention，不直接依赖 Qwen3 的 module 遍历顺序。
+        直接读取模型构造期注册的 AttentionLayerBase 对象，并调用各层的
+        get_kv_cache_spec()；不依赖 Qwen3 的 module 遍历顺序或旧缓存辅助入口。
 
         Returns:
-            从完整 Attention 层名到 ``KVCacheSpec`` 的映射。
+            kv_cache_spec: 从完整 Attention 层名到 ``KVCacheSpec`` 的映射。
         """
         kv_cache_spec: dict[str, KVCacheSpec] = {}
+        # 注册表保留稳定完整层名，后续规划、分配和 forward 都通过同一 key 连接。
         layer_type = cast(type[Any], AttentionLayerBase)
         attn_layers = get_layers_from_nanovllm_config(self.vllm_config,layer_type)
         for layer_name,attn_module in attn_layers.items():
+            # 不需要独立 KV cache 的层可以返回 None，不为它创建空分配描述。
             if spec := attn_module.get_kv_cache_spec(self.vllm_config):
                 kv_cache_spec[layer_name] = spec
         return kv_cache_spec
@@ -485,11 +520,12 @@ class GPUModelRunner:
             Dispatcher 的合法 key 集合；不预热、不捕获、不修改请求数据。
         """
         assert len(attention_backends) == len(kv_cache_groups)
+        # 多种后端共用捕获入口，整体能力由最弱的一种限制，不能取最大支持级别。
         min_cg_support = AttentionCGSupport.ALWAYS
         min_cg_attn_backend = None
         for attn_backend_set, kv_cache_group in zip(attention_backends, kv_cache_groups):
             for attn_backend in attn_backend_set:
-                builder_cls = attn_backend.get_builder_cls()
+                builder_cls = attn_backend.get_builder_cls()  # 能力由 metadata Builder 声明。
                 cg_support = builder_cls.get_cudagraph_support(
                     self.vllm_config, kv_cache_group.kv_cache_spec,
                 )
@@ -522,6 +558,9 @@ class GPUModelRunner:
         当前 query 长度固定为 1：最大调度量为 1 且总 token 数等于请求数时
         返回 True。不比较历史上下文长度，也不读取请求的 prefill/decode 标签。
         force_uniform_decode 供后续 dummy/capture 路径显式指定 batch 类型。
+
+        Returns:
+            uniform_decode: 输入满足 uniform decode 条件时为 True；显式覆盖参数优先。
         """
         return (
             (max_num_scheduled_tokens == uniform_decode_query_len)
@@ -553,14 +592,19 @@ class GPUModelRunner:
             force_uniform_decode: dummy/capture 可覆盖自动判断，普通执行传 None。
 
         Returns:
-            (模式, 描述符, should_ubatch, num_tokens_across_dp, cudagraph_stats)。
-            当前无 DBO、DP 和 Graph 指标配置，后三项固定为 False、None、None。
-            描述符含执行容量；本方法不修改输入 buffer、不补齐 metadata。
+            按返回顺序包含以下各项：
+                cudagraph_mode: 当前批次实际使用的具体 CUDA Graph 模式。
+                batch_descriptor: 执行容量与布局的描述符，本方法不修改输入 buffer 或补齐 metadata。
+                should_ubatch: 是否拆分 microbatch；当前没有 DBO，固定为 False。
+                num_tokens_across_dp: 跨 DP token 数；当前没有 DP，固定为 None。
+                cudagraph_stats: 可选 Graph 指标；当前未启用，固定为 None。
         """
+        # uniform 指每请求本轮 query 数相同，不要求历史 KV 长度相同。
         uniform_decode = self._is_uniform_decode(
             max_num_scheduled_tokens, self.uniform_decode_query_len,
             num_tokens, num_reqs, force_uniform_decode,
         )
+        # Dispatcher 返回 (cudagraph_mode, batch_descriptor)，后者描述运行容量；实际 padding 在执行入口完成。
         cudagraph_mode, batch_descriptor = self.cudagraph_dispatcher.dispatch(
             num_tokens=num_tokens,
             uniform_decode=uniform_decode,
@@ -610,7 +654,7 @@ class GPUModelRunner:
             kernel_block_sizes: 与 ``kv_cache_groups`` 顺序一致的 kernel page 大小。
 
         Returns:
-            从完整 Attention layer 名称到 combined KV cache tensor 的映射。
+            kv_caches: 从完整 Attention layer 名称到 combined KV cache tensor 的映射。
         """
         # 首先按 KVCacheTensor.size 分配原始字节存储。
         kv_cache_raw_tensors = self._allocate_kv_cache_tensors(
@@ -695,9 +739,9 @@ class GPUModelRunner:
         decode，没有 PIECEWISE、encoder Graph 或编译捕获计数器。
 
         Returns:
-            Graph 计划的估算显存字节数；计划为空时返回 0。
-            第二档增量至少按每图 1 MiB 计算，以覆盖 driver 开销。这是估算，
-            不是对所有形状逐一捕获后的精确值。
+            total_estimate: Graph 计划的估算显存字节数；计划为空时返回 0。
+                第二档增量至少按每图 1 MiB 计算，以覆盖 driver 开销。这是估算，
+                不是对所有形状逐一捕获后的精确值。
 
         Side Effects:
             临时绑定 Attention 的 KV cache，修改 dummy 输入与 metadata。
@@ -914,8 +958,8 @@ class GPUModelRunner:
         内部执行。图覆盖模型 forward，不包含词表投影与 sampler。
 
         Returns:
-            捕获前后 GPU 空闲显存的差值，单位为字节；禁用 Graph 时返回 0。
-            此值包含 Graph pool 与相关 CUDA 开销，不能视为图对象的精确大小。
+            cuda_graph_size: 捕获前后 GPU 空闲显存的差值，单位为字节；禁用 Graph 时返回 0。
+                此值包含 Graph pool 与相关 CUDA 开销，不能视为图对象的精确大小。
 
         Side Effects:
             更新持久 dummy 输入与 metadata，向模型 Wrapper 缓存捕获条目，
@@ -1113,13 +1157,23 @@ class GPUModelRunner:
                 gc.unfreeze()
                 gc.collect()
     def shutdown(self) -> None:
+        """释放模型与 KV 引用，并清理注册层和共享 RoPE 缓存。
+
+        Engine 应先回收在途 Future 再关闭 Worker。本方法解除 Python 引用，
+        不负责继续生成、向用户交付结果或等待各批输出事件。
+        """
+        # 清理 KV 绑定和临时 profiling 存储，避免模型层继续持有设备 tensor。
         self._cleanup_profiling_kv_cache()
         self.compilation_config.static_forward_context.clear()
         self.model = None  # type: ignore[assignment]
         get_rope.cache_clear()
 
     def _get_or_create_async_output_copy_stream(self) -> torch.cuda.Stream:
-        """获取异步输出拷贝流，首次使用时创建并保存。"""
+        """获取异步输出拷贝流，首次使用时创建并保存。
+
+        Returns:
+            stream: 本 Runner 复用的异步输出拷贝 stream，首次使用时创建。
+        """
         stream = self.async_output_copy_stream
         if stream is None:
             # 同一个 Runner 复用该流，避免每轮采样重复创建。
@@ -1143,7 +1197,7 @@ class GPUModelRunner:
                 新请求、恢复请求和完成通知。
 
         Returns:
-            当前不支持投机解码，不需要 forward 后的延迟修正回调，返回 None。
+            post_forward_callback: 当前不支持投机解码，不需要 forward 后的延迟修正回调，返回 None。
 
         Side Effects:
             修改 requests、InputBatch 请求槽位、CPU token 行、block table
@@ -1228,7 +1282,7 @@ class GPUModelRunner:
             new_block_ids = req_data.new_block_ids[req_idx]
             # 该 request 是否要从 PREEMPTED 状态恢复。
             resumed_from_preemption = req_id in req_data.resumed_req_ids
-            # 本轮 forward 前已经确认生成的 output token 数。
+            # 本轮执行前的逻辑输出长度；异步时包含尚未回收的输出占位。
             num_output_tokens = req_data.num_output_tokens[req_idx]
             # 若请求尚在持久 batch 中，取得其当前物理槽位；被抢占或上轮未调度的
             # 请求此前已经从 InputBatch 移除，因此这里会得到 None。
@@ -1321,10 +1375,10 @@ class GPUModelRunner:
                 每项表示对应 request 本轮执行的 token 数。
 
         Returns:
-            每条 request 最后一个 query token 在 packed hidden-state tensor 中的索引。
-            ``execute_model()`` 应使用它执行：
+            logits_indices: 每条 request 最后一个 query token 在 packed hidden-state tensor 中的索引。
+                ``execute_model()`` 应使用它执行：
 
-            ``sample_hidden_states = hidden_states[logits_indices]``。
+                ``sample_hidden_states = hidden_states[logits_indices]``。
 
         Raises:
             ValueError: SchedulerOutput、InputBatch 与传入 token 数数组不一致时抛出。
@@ -1374,11 +1428,10 @@ class GPUModelRunner:
             token_indices_tensor,
             out=self.input_ids.cpu[:total_num_scheduled_tokens],
         )
-        # Prepare the attention metadata.
+        # Query 的起始边界带一个起始零，末项等于本批真实 packed token 数。
         self.query_start_loc.np[0] = 0
         self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
-        # Note: pad query_start_loc to be non-decreasing, as kernels
-        # like FlashAttention requires that
+        # 空请求后缀重复最后一个终点，保证 FlashAttention 读取的前缀和单调不减。
         self.query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
         self.query_start_loc.copy_to_gpu()
 
@@ -1467,8 +1520,9 @@ class GPUModelRunner:
                 None 时从持久 BlockTable 构造；映射必须覆盖补齐后的 token 容量。
 
         Returns:
-            二元组：第一项按完整层名提供后端元数据；第二项为投机解码
-            使用的公共元数据，当前不支持该功能，故返回 None。
+            (attn_metadata, common_attn_metadata):
+                attn_metadata: 按完整 Attention 层名索引的后端元数据，零 token 时为空字典。
+                common_attn_metadata: 供投机解码使用的公共元数据；当前不支持该功能，固定为 None。
 
         Side Effects:
             原地清理固定输入及 metadata 的 padding 后缀，不替换 GPU storage。
@@ -1580,8 +1634,8 @@ class GPUModelRunner:
                 以及每个请求本轮需要执行的 token 数。
 
         Returns:
-            没有调度 token 时，返回空 ModelRunnerOutput。
-            成功执行 forward 时，返回 None，调用方随后必须调用 sample_tokens()。
+            model_output: 没有调度 token 时，返回空 ModelRunnerOutput。
+                成功执行 forward 时，返回 None，调用方随后必须调用 sample_tokens()。
 
         Raises:
             RuntimeError: 上一轮 logits 尚未消费，或执行时尚未初始化 KV cache。
@@ -1618,7 +1672,7 @@ class GPUModelRunner:
             
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
             # 整理 packed token IDs、positions、长度和 block-table slot mapping。
-            # 返回每条请求最后一个 query token 在 packed hidden states 中的位置。
+            # logits_indices 是每条请求最后一个 query token 在 packed hidden states 中的位置。
             logits_indices = self._prepare_inputs(
                 scheduler_output,
                 num_scheduled_tokens_np,
@@ -1662,7 +1716,6 @@ class GPUModelRunner:
                 max_query_len=max_num_scheduled_tokens,
                 slot_mappings=slot_mappings_by_group,
             )
-            # TODO:_preprocess是干啥的
             # 固定缓冲区只取本轮有效前缀，避免把上轮残留 token 送入模型。
             input_ids = self.input_ids.gpu[:num_tokens_padded]
             positions = self.positions[:num_tokens_padded]
@@ -1699,9 +1752,9 @@ class GPUModelRunner:
         清除上一轮 GPU token 引用，完成 bookkeeping，最后构造输出。
 
         Returns:
-            同步模式返回已经包含 CPU token 列表的 ModelRunnerOutput。
-            异步模式返回 AsyncGPUModelRunnerOutput，由 get_output()
-            等待设备到主机的拷贝完成后取得实际结果。
+            根据调用方式返回以下分支之一：
+                output: 同步模式下已填入 CPU token 列表的 ModelRunnerOutput。
+                async_output: 异步模式下的 AsyncGPUModelRunnerOutput，调用 get_output() 后取得实际结果。
 
         Raises:
             RuntimeError: 没有待消费的 forward 结果时抛出。
@@ -1739,7 +1792,7 @@ class GPUModelRunner:
             req_id_to_index=req_id_to_index_output_copy,
             sampled_token_ids=valid_sampled_token_ids,
         )
-        # 同步模式在 bookkeeping 中已经取得 CPU 结果，直接返回即可。
+        # 同步模式的 output 已包含 bookkeeping 取得的 CPU 结果，直接返回即可。
         if not self.use_async_scheduling:
             return output
         # 异步包装器在独立拷贝流上提交 D2H，保存完成事件和设备 tensor 引用。
@@ -1753,7 +1806,11 @@ class GPUModelRunner:
         return async_output
 
     def _sample(self, logits: torch.Tensor) -> SamplerOutput:
-        """使用与 logits 行顺序一致的 InputBatch metadata 调用 Sampler。"""
+        """使用与 logits 行顺序一致的 InputBatch metadata 调用 Sampler。
+
+        Returns:
+            sampler_output: 采样得到的 SamplerOutput，使用与 logits 行顺序一致的 metadata。
+        """
         return self.sampler(logits, self.input_batch.sampling_metadata)
 
     def _bookkeeping_sync(
@@ -1776,8 +1833,11 @@ class GPUModelRunner:
             sampler_output: 按当前请求槽位排列的设备端采样结果。
 
         Returns:
-            依次返回 CPU token 列表、请求 ID 快照、请求到输出行的映射快照，
-            以及异步输出需要过滤的无效行下标。异步模式的 CPU token 列表为空。
+            按返回顺序包含以下各项：
+                valid_sampled_token_ids: 有效 CPU token 行列表；异步模式尚未回收，整体为空列表。
+                req_ids_output_copy: 本批请求 ID 顺序的快照。
+                req_id_to_index_output_copy: 请求 ID 到本批输出行的映射快照。
+                invalid_req_indices: 异步输出回收时需要过滤的无效行下标列表。
 
         Side Effects:
             更新 CPU token 行和 CachedRequestState.output_token_ids。
@@ -1905,9 +1965,10 @@ class GPUModelRunner:
                 测量长上下文 workspace；只有构造 attention metadata 时生效。
 
         Returns:
-            (hidden_states, last_hidden_states)：前者包含补齐后的全部 token 行；
-            后者只包含每个有效 dummy 请求最后一行，形状为 [num_reqs, hidden_size]。
-            本方法不计算 logits、不采样、不推进真实请求状态。
+            (hidden_states, last_hidden_states):
+                hidden_states: dummy 批次包含 padding 在内的全部 hidden-state 行。
+                last_hidden_states: 每个有效 dummy 请求最后一个 token 的 hidden states，
+                    形状为 [num_reqs, hidden_size]；本方法不计算 logits 或采样。
 
         Side Effects:
             原地更新 Runner 的输入和 metadata 工作区，保持 GPU storage 地址；
@@ -1982,7 +2043,7 @@ class GPUModelRunner:
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
 
         # _cudagraph_mode 是实际可用模式，batch_desc 则是对应的固定形状 key。
-        # 当前不支持 microbatch、DP 或 Graph 指标，丢弃其余三项返回值。
+        # 当前丢弃 should_ubatch、num_tokens_across_dp 和 cudagraph_stats 三项返回值。
         _cudagraph_mode, batch_desc, _, _, _ = (
             self._determine_batch_execution_and_padding(
                 num_tokens=num_tokens_unpadded,
@@ -2017,7 +2078,7 @@ class GPUModelRunner:
         # attn_metadata 缺省为空，允许模型 profiling 在正式 KV cache 分配前执行。
         attn_metadata: dict[str, AttentionMetadata] | None = None
         # slot_mappings_by_group 供 Builder 使用，slot_mappings 则供 Attention 层查找。
-        # 无正式 KV 配置时返回 (None, None)，上下文自动使用空写入映射。
+        # 无正式 KV 时 slot_mappings_by_gid、slot_mappings_by_layer 均为 None，使用空写入映射。
         slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
             num_tokens_padded=num_tokens_padded,
             num_reqs_padded=num_reqs_padded,
@@ -2155,9 +2216,9 @@ class GPUModelRunner:
                 dummy forward 中可能出现的 NaN/Inf 影响采样。
 
         Returns:
-            SamplerOutput，其中 sampled_token_ids 为 [num_reqs, 1] 的设备端
-            int32 tensor。profile_run 持有该结果直到 GPU 同步完成，不将候选
-            token 写入请求，也不转换成 CPU 列表。
+            sampler_output: SamplerOutput，其中 sampled_token_ids 为 [num_reqs, 1] 的设备端
+                int32 tensor。profile_run 持有该结果直到 GPU 同步完成，不将候选
+                token 写入请求，也不转换成 CPU 列表。
 
         Side Effects:
             分配随机 hidden states、词表 logits、模拟 temperature 和采样输出，
@@ -2206,7 +2267,7 @@ class GPUModelRunner:
             # 非 OOM 错误沿用原异常，避免把算子或参数问题误报成显存不足。
             else:
                 raise e
-        # 返回采样容器，候选仅用于模拟负载；真实 token 回写不属于本方法。
+        # 返回 sampler_output，候选仅用于模拟负载；本方法不回写真实 token。
         return sampler_output
 
         
@@ -2221,6 +2282,16 @@ class GPUModelRunner:
     def _make_buffer(
         self, *size: int | torch.SymInt, dtype: torch.dtype, numpy: bool = True
     ) -> CpuGpuBuffer:
+        """按当前设备和锁页策略创建一对固定容量 CPU/GPU 工作区。
+
+        Args:
+            *size: 两侧 tensor 的形状，调用方自行维护有效前缀。
+            dtype: 两侧一致的元素类型。
+            numpy: 是否建立与 CPU tensor 共享存储的 NumPy view。
+
+        Returns:
+            buffer: 初始清零的 CpuGpuBuffer；两侧内容只在显式拷贝后保持一致。
+        """
         return CpuGpuBuffer(
             *size,
             dtype=dtype,
@@ -2246,17 +2317,18 @@ class GPUModelRunner:
             num_tokens: 形状为 ``[num_reqs]`` 的 int32 数组。第 i 项是第 i 条
                 活跃 request 本轮执行的 token 数。
             arange_out: 可复用的 NumPy 输出 buffer，容量至少为所有 token 数之和。
+            cumsum_dtype: 累计长度数组的 dtype，默认 int32，与 attention 边界一致。
 
         Returns:
-            形状为 ``[num_reqs]`` 的 int32 累计 token 数组。第 i 项表示前
-            ``i + 1`` 条 request 本轮 query token 的总数。
+            cu_num_tokens: 形状为 ``[num_reqs]``、类型为 cumsum_dtype 的累计数组。第 i 项表示前
+                ``i + 1`` 条 request 本轮 query token 的总数。
         """
-        # Step 1. [2, 5, 3] -> [2, 7, 10]
+        # 先求累计终点：[2, 5, 3] -> [2, 7, 10]。
         cu_num_tokens = np.cumsum(num_tokens, dtype=cumsum_dtype)
         total_num_tokens = int(cu_num_tokens[-1])
-        # Step 2. [2, 7, 10] -> [0, 0, 2, 2, 2, 2, 2, 7, 7, 7]
+        # 将各 query 的起点按长度展开：[0, 0, 2, 2, 2, 2, 2, 7, 7, 7]。
         cumsums_offsets = np.repeat(cu_num_tokens - num_tokens, num_tokens)
-        # Step 3. [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+        # 从全局 arange 减去各 query 起点，得到请求内位置并写入复用 buffer。
         np.subtract(
             self.arange_np[:total_num_tokens],
             cumsums_offsets,
@@ -2415,13 +2487,9 @@ class GPUModelRunner:
                 当前 nano-vLLM 尚未支持 DBO，因此只能为 ``None``。
 
         Returns:
-            一个二元组 ``(slot_mappings_by_gid, slot_mappings_by_layer)``：
-
-            - ``slot_mappings_by_gid``：从 KV cache group 编号到 slot mapping 的
-              映射，供后续 ``_build_attention_metadata()`` 使用。
-            - ``slot_mappings_by_layer``：从稳定 Attention layer 名称到 slot
-              mapping 的映射，供后续 ``set_forward_context()`` 使用。
-            - 若 KV cache 尚未初始化或模型没有 KV cache group，两者均为 ``None``。
+            (slot_mappings_by_gid, slot_mappings_by_layer):
+                slot_mappings_by_gid: KV group ID 到 slot mapping 的映射，供 metadata 构建使用。
+                slot_mappings_by_layer: Attention 层全名到 slot mapping 的映射，供 ForwardContext 使用；KV 未初始化或无 group 时两项均为 None。
 
         Raises:
             AssertionError: 当前尚未支持 DBO micro-batch 切分，或当前运行时出现了
@@ -2563,10 +2631,11 @@ class GPUModelRunner:
             kv_cache_config: Engine 下发的最终 KV cache 分配计划。
 
         Returns:
-            从 Attention layer 名称到一维 int8 raw storage 的映射。同一个
-            ``KVCacheTensor.shared_by`` 中的层会引用同一个 raw tensor。
+            kv_cache_raw_tensors: 从 Attention layer 名称到一维 int8 raw storage 的映射。同一个
+                ``KVCacheTensor.shared_by`` 中的层会引用同一个 raw tensor。
         """
-        kv_cache_raw_tensors:dict[str,torch.Tensor]={}
+        kv_cache_raw_tensors:dict[str,torch.Tensor]={}  # 完整层名到 raw storage 的绑定表。
+        # 分配计划按物理 tensor 组织，不一定与 layer 数量一一对应。
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             # int8 仅作为逐字节存储载体；后续会按 KVCacheSpec.dtype 重新 view。
             tensor = torch.zeros(
@@ -2574,13 +2643,16 @@ class GPUModelRunner:
                 dtype=torch.int8,
                 device=self.device,
             )
+            # shared_by 中的层共享这次分配，不能为每个层名再次分配一份。
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name]=tensor
+        # 用逻辑 group 的所有层反查分配结果，缺失或额外层都说明计划不一致。
         layer_names=set()
         for group in kv_cache_config.kv_cache_groups:
             for layer_name in group.layer_names:
                 layer_names.add(layer_name)
 
+        # 这里只验证绑定名称，具体 dtype/shape/stride 在 reshape 阶段解释。
         assert layer_names == set(kv_cache_raw_tensors.keys()),(
             "Some layers are not correctly initialized"
         )
@@ -2597,9 +2669,9 @@ class GPUModelRunner:
             kernel_block_sizes: 按逻辑 KV group 编号排列的 kernel page 大小。
 
         Returns:
-            层名到 combined KV cache view 的映射。view 与原始存储共享内存；
-            当前 FlashAttention 的逻辑布局是
-            [num_kernel_blocks, K/V, kernel_block_size, kv_heads, head_size]。
+            kv_caches: 层名到 combined KV cache view 的映射。view 与原始存储共享内存；
+                当前 FlashAttention 的逻辑布局是
+                [num_kernel_blocks, K/V, kernel_block_size, kv_heads, head_size]。
         """
         kv_caches: dict[str, torch.Tensor] = {}
         # 一个逻辑 KV group 可以有多个 AttentionGroup；后者决定各层的布局。
@@ -2654,17 +2726,29 @@ class GPUModelRunner:
     
     @contextmanager
     def synchronize_input_prep(self):
+        """在改写 CPU staging 前等待上一轮输入准备完成，并记录本轮边界。
+
+        execute_model() 用它包住请求槽位更新、H2D 和输入 metadata 构建。
+        退出作用域时的事件记录在当前计算流上、模型 forward 之前；下一轮
+        只需等此前已提交的输入准备工作，而不在这里等待上一轮完整 forward。
+
+        Yields:
+            无值；作用域内可以复用上一轮已消费的 CPU staging tensor。
+
+        Side Effects:
+            异步模式进入时可能阻塞 CPU，并在正常或异常退出时记录新事件。
+            同步模式未创建事件，直接执行作用域，不增加额外等待。
+        """
         if self.prepare_inputs_event is None:
             yield
             return
 
-        # Ensure prior step has finished with reused CPU tensors.
-        # This is required in the async scheduling case because
-        # the CPU->GPU transfer happens async.
+        # non_blocking H2D 返回后设备可能仍在读取 CPU 源内存，改写前必须等待。
         self.prepare_inputs_event.synchronize()
         try:
             yield
         finally:
+            # 即使准备失败也维持下一次进入时可等待的边界；不在这里捕获异常。
             self.prepare_inputs_event.record()
 
     def _model_forward(
@@ -2673,6 +2757,16 @@ class GPUModelRunner:
         positions:torch.Tensor|None=None,
         **model_kwargs:dict[str,Any],
     )->Any:
+        """调用已安装的模型入口，沿用外层设置的 ForwardContext。
+
+        Args:
+            input_ids: 当前 packed token 输入，Graph 路径可包含容量补齐。
+            positions: 与输入一一对应的完整序列位置。
+            **model_kwargs: 保留扩展参数入口，当前文本模型路径不向模型转发。
+
+        Returns:
+            hidden_states: 模型产生的 hidden states；词表投影和采样由外层另行执行。
+        """
         return self.model(
             input_ids = input_ids,
             positions=positions

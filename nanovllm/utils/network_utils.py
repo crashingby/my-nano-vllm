@@ -23,9 +23,9 @@ def get_ip() -> str:
     """优先返回显式主机地址，否则依次通过 IPv4、IPv6 路由探测本机地址。
 
     Returns:
-        VLLM_HOST_IP 的非空值，或系统为探测目标选择的本机源地址。两种探测
-        均失败时沿用上游返回 0.0.0.0，并发出警告；单机可设置环境变量为
-        127.0.0.1，使初始化明确使用回环地址。
+        host_ip: VLLM_HOST_IP 的非空值，或系统为探测目标选择的本机源地址。两种探测
+            均失败时沿用上游返回 0.0.0.0，并发出警告；单机可设置环境变量为
+            127.0.0.1，使初始化明确使用回环地址。
 
     Side Effects:
         自动探测时短暂创建 UDP socket，通过 connect() 选择路由，不发送应用
@@ -63,7 +63,11 @@ def get_ip() -> str:
 
 
 def is_valid_ipv6_address(address: str) -> bool:
-    """判断 address 是否为合法 IPv6 字面量，供 TCP URI 选择方括号格式。"""
+    """判断 address 是否为合法 IPv6 字面量，供 TCP URI 选择方括号格式。
+
+    Returns:
+        is_ipv6: address 是合法 IPv6 字面量时为 True，否则为 False。
+    """
     try:
         ipaddress.IPv6Address(address)
         return True
@@ -72,7 +76,11 @@ def is_valid_ipv6_address(address: str) -> bool:
 
 
 def get_distributed_init_method(ip: str, port: int) -> str:
-    """将主机地址和端口组成供 PyTorch process group 使用的 TCP 会合 URI。"""
+    """将主机地址和端口组成供 PyTorch process group 使用的 TCP 会合 URI。
+
+    Returns:
+        distributed_init_method: 可供 PyTorch 进程组初始化使用的 TCP 会合 URI。
+    """
     return get_tcp_uri(ip, port)
 
 
@@ -80,6 +88,9 @@ def get_tcp_uri(ip: str, port: int) -> str:
     """格式化 TCP URI；IPv6 地址用方括号与端口分隔，不绑定或保留该端口。
 
     例如 IPv4 返回 tcp://127.0.0.1:12345，IPv6 返回 tcp://[::1]:12345。
+
+    Returns:
+        tcp_uri: 含主机地址与端口的 TCP URI；IPv6 地址使用方括号。
     """
     # IPv6 地址自身包含冒号，需要方括号明确主机部分的边界。
     if is_valid_ipv6_address(ip):
@@ -94,6 +105,9 @@ def get_open_port() -> int:
     当前没有 DP master，因此直接委托 _get_open_port()，省略上游 DP 预留
     端口范围的过滤。调用结束即关闭探测 socket，不持有端口租约；实际创建
     PyTorch store 前，该端口仍可能被其他进程占用。
+
+    Returns:
+        port: 探测时可以绑定的整数端口；返回前探测 socket 已关闭，不保留端口租约。
     """
     return _get_open_port()
 
@@ -110,8 +124,8 @@ def _get_open_port(
         max_attempts: 指定起点时的最大尝试次数；None 沿用上游的不限制策略。
 
     Returns:
-        探测成功的整数端口。指定起点使用 IPv4；系统分配路径先尝试 IPv4，
-        再尝试 IPv6，不要求调用方提供有效的外网地址。
+        port: 探测成功的整数端口。指定起点使用 IPv4；系统分配路径先尝试 IPv4，
+            再尝试 IPv6，不要求调用方提供有效的外网地址。
 
     Raises:
         RuntimeError: 指定起点的尝试次数达到 max_attempts，仍未找到端口。

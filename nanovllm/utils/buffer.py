@@ -34,6 +34,19 @@ class CpuGpuBuffer:
         with_numpy: bool = True,
     ) -> None:
         # 这些 buffer 属于运行时状态；在关闭 inference mode 时创建，以允许后续原地写入。
+        """分配同形 CPU staging 与设备镜像，可选暴露共享存储的 NumPy view。
+
+        Args:
+            *size: 两侧 tensor 的维度。
+            dtype: 元素类型，with_numpy=True 时不能是 bfloat16。
+            device: 镜像设备。
+            pin_memory: 是否使用锁页 CPU 内存。
+            with_numpy: 是否创建 cpu 的 NumPy view，而不是另复制一份数组。
+
+        Side Effects:
+            分配并清零两侧存储，主动关闭 inference mode 以允许后续原地改写。
+            创建 NumPy view 失败时抛出异常，调用方负责保证 dtype 约束。
+        """
         with torch.inference_mode(False):
             self.cpu = torch.zeros(
                 *size,
@@ -41,15 +54,16 @@ class CpuGpuBuffer:
                 device="cpu",
                 pin_memory=pin_memory,
             )
-            self.gpu = torch.zeros_like(self.cpu, device=device)
+            self.gpu = torch.zeros_like(self.cpu, device=device)  # 独立存储，不与 CPU 自动同步。
 
         if with_numpy:
+            # NumPy 无法直接表达 PyTorch bfloat16，不能静默改变精度后再暴露 view。
             if dtype == torch.bfloat16:
                 raise ValueError(
                     "Bfloat16 torch tensor 无法直接转换为 NumPy array；请设置 "
                     "with_numpy=False"
                 )
-            self.np: np.ndarray = self.cpu.numpy()
+            self.np: np.ndarray = self.cpu.numpy()  # 原地写 np 会直接修改 CPU staging。
 
     def copy_to_gpu(self, n: int | None = None) -> torch.Tensor:
         """将全部或前缀 CPU tensor 拷贝到 device。
@@ -58,7 +72,11 @@ class CpuGpuBuffer:
             n: 第一维需要拷贝的前缀长度。``None`` 表示拷贝完整 tensor。
 
         Returns:
-            更新后的 device tensor，或被拷贝的前缀 view。
+            gpu_tensor: 更新后的 device tensor，或被拷贝的前缀 view。
+
+        Side Effects:
+            在当前流提交 non_blocking 拷贝。返回不代表设备已经读完 CPU 源；
+            调用方复用 staging 前需通过流顺序或事件确保上一份数据已被消费。
         """
         if n is None:
             return self.gpu.copy_(self.cpu, non_blocking=True)
@@ -74,7 +92,7 @@ class CpuGpuBuffer:
             n: 第一维需要拷贝的前缀长度。``None`` 表示拷贝完整 tensor。
 
         Returns:
-            更新后的 CPU tensor，或被拷贝的前缀 view。
+            cpu_tensor: 更新后的 CPU tensor，或被拷贝的前缀 view。
         """
         if n is None:
             return self.cpu.copy_(self.gpu, non_blocking=True)

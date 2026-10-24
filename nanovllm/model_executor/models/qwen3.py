@@ -119,6 +119,9 @@ class Qwen3Attention(nn.Module):
 
         Q/K Norm 在 RoPE 前作用于每个 head 的最后一维；分页缓存写入和
         Attention 计算委托给 self.attn，模型不维护另一套缓存或批次 Context。
+
+        Returns:
+            output: Attention 投影后的 tensor，形状为 [num_tokens, hidden_size]。
         """
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -129,8 +132,8 @@ class Qwen3Attention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)  # 包装层已返回 [num_tokens, q_size]。
-        output = self.o_proj(attn_output)  # 当前 Linear 直接返回 tensor，无独立 bias 返回值。
+        attn_output = self.attn(q, k, v)  # attn_output 为包装层返回的 [num_tokens, q_size]。
+        output = self.o_proj(attn_output)  # output 为线性投影结果，无独立 bias 返回值。
         return output
 
 
@@ -159,7 +162,11 @@ class Qwen3MLP(nn.Module):
         self.silu_and_mul = SiluAndMul()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """将 [num_tokens, hidden_size] 经 SwiGLU 映射回相同形状。"""
+        """将 [num_tokens, hidden_size] 经 SwiGLU 映射回相同形状。
+
+        Returns:
+            x: 经过 gate/up 投影、SiLU 乘法及 down 投影的 MLP 输出，与输入形状相同。
+        """
         gate_up = self.gate_up_proj(x)  # gate/up 合并为一次本地投影。
         x = self.silu_and_mul(gate_up)  # SiLU(gate) * up，使用构造时按 kernel_config 绑定的实现。
         x = self.down_proj(x)  # 恢复 hidden_size，TP 时归约各 rank 的贡献。
@@ -198,11 +205,13 @@ class Qwen3DecoderLayer(nn.Module):
             rope_scaling=getattr(config, "rope_scaling", None),
             prefix=self_attention_prefix,
         )
+        # Attention 与 MLP 都输出本层 hidden_size，残差相加延后合入下一次 RMSNorm。
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
         )
+        # 前归一化供 Attention 使用，后归一化先合并 Attention 输出与残差再供 MLP 使用。
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -218,6 +227,11 @@ class Qwen3DecoderLayer(nn.Module):
 
         首层没有 residual 时先保存原始输入；后续层在 input_layernorm 中
         合并上一层 MLP 输出和 residual，避免在模型中另行执行残差相加。
+
+        Returns:
+            (hidden_states, residual):
+                hidden_states: 本层 MLP 输出，尚未与返回的 residual 相加。
+                residual: 留给下一次 fused add + RMSNorm 合并的残差 tensor。
         """
         if residual is None:
             residual = hidden_states  # 保存 Attention 子层的残差输入。
@@ -270,7 +284,11 @@ class Qwen3Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        """执行查表和全部 decoder 层，保留输入 token 的 packed 行顺序。"""
+        """执行查表和全部 decoder 层，保留输入 token 的 packed 行顺序。
+
+        Returns:
+            hidden_states: 全部 decoder 层及最终 RMSNorm 的输出，保留 packed token 的行顺序。
+        """
         hidden_states = self.embed_tokens(input_ids)
         residual = None  # 首层创建 residual，之后每层更新并向下传递。
         for layer in self.layers:
@@ -323,7 +341,11 @@ class Qwen3ForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        """返回 decoder hidden states，词表投影由 compute_logits 单独执行。"""
+        """返回 decoder hidden states，词表投影由 compute_logits 单独执行。
+
+        Returns:
+            hidden_states: decoder 输出的 hidden states；词表投影由 compute_logits() 另行完成。
+        """
         return self.model(input_ids, positions)
 
     def compute_logits(
@@ -333,6 +355,9 @@ class Qwen3ForCausalLM(nn.Module):
         """计算已选定 hidden states 的词表分数，TP 时仅 rank 0 返回结果。
 
         token 行选择由 Runner 完成；此处不读取 prefill/decode Context。
+
+        Returns:
+            logits: 选定 token 行的完整词表分数；TP 时非输出 rank 为 None。
         """
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
@@ -349,7 +374,7 @@ class Qwen3ForCausalLM(nn.Module):
             weights: DefaultModelLoader 提供的原始 checkpoint 名称与 CPU tensor。
 
         Returns:
-            实际装填的模型参数名集合，供 Loader 检查参数级覆盖。
+            loaded_params: 实际装填的模型参数名集合，供 Loader 检查参数级覆盖。
 
         Side Effects:
             原地修改参数。共享 embedding 时跳过 lm_head 的重复条目；

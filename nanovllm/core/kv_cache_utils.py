@@ -70,8 +70,8 @@ def hash_block_tokens(
             prompt embedding hash 或 cache salt。纯文本请求传入 ``None``。
 
     Returns:
-        当前完整逻辑 block 的 ``BlockHash``。该值既是下一个 block 的父 hash，
-        也是 KVCacheManager 查询 prefix cache 时使用的逻辑 key。
+        block_hash: 当前完整逻辑 block 的 ``BlockHash``。该值既是下一个 block 的父 hash，
+            也是 KVCacheManager 查询 prefix cache 时使用的逻辑 key。
     """
     # 首 block 没有真实父 block；所有 Request 共享同一个根 hash 作为链的起点。
     if parent_block_hash is None:
@@ -104,9 +104,11 @@ def get_request_block_hasher(
     Args:
         block_size: 一个逻辑 hash block 覆盖的 token 数。当前 MVP 中它与 KV cache
             的物理 block size 保持一致。
+        caching_hash_fn: 把父 hash 与当前 block token 内容编码为 bytes 的共享函数，
+            同一 Engine 内所有请求必须使用同一种算法才能命中同一前缀。
 
     Returns:
-        一个接收 Request、返回新增完整 block hash 列表的函数。
+        request_block_hasher: 一个接收 Request、返回新增完整 block hash 列表的函数。
 
     Raises:
         ValueError: block_size 不为正数时抛出。
@@ -122,7 +124,7 @@ def get_request_block_hasher(
             request: token 序列已经更新的逻辑请求。
 
         Returns:
-            新出现的完整逻辑 blocks 的 hash 列表。末尾不完整 block 不会被 hash。
+            new_block_hashes: 新出现的完整逻辑 blocks 的 hash 列表。末尾不完整 block 不会被 hash。
         """
         # 已有 hash 数乘 block_size，即第一个尚未 hash 的 token 位置。
         start_token_idx = len(request.block_hashes) *block_size
@@ -186,7 +188,7 @@ class KVCacheBlock:
         """返回 block 当前的 prefix cache hash。
 
         Returns:
-            已缓存时返回 hash；尚未缓存或重用后已失效时返回 ``None``。
+            block_hash: 已缓存时返回 hash；尚未缓存或重用后已失效时返回 ``None``。
         """
         return self._block_hash
 
@@ -223,7 +225,11 @@ class KVCacheBlock:
         self._block_hash = None
 
     def __repr__(self) -> str:
-        """只显示相邻块编号，避免双向链表递归打印整个空闲队列。"""
+        """只显示相邻块编号，避免双向链表递归打印整个空闲队列。
+
+        Returns:
+            representation: 包含当前块和相邻块编号的调试字符串，不递归展开链表。
+        """
         prev_block_id = (
             self.prev_free_block.block_id if self.prev_free_block else None
         )
@@ -264,7 +270,11 @@ class FreeKVCacheBlockQueue:
             self.fake_free_list_tail.prev_free_block = self.fake_free_list_head
 
     def popleft(self) -> KVCacheBlock:
-        """移除并返回队首真实块，同时减少空闲块数量。"""
+        """移除并返回队首真实块，同时减少空闲块数量。
+
+        Returns:
+            first_block: 从队首移除的真实物理 KVCacheBlock。
+        """
         first_block = self.fake_free_list_head.next_free_block
         if first_block is self.fake_free_list_tail or first_block is None:
             assert self.num_free_blocks == 0, "Free block count is out of sync"
@@ -278,7 +288,11 @@ class FreeKVCacheBlockQueue:
         return first_block
 
     def popleft_n(self, n: int) -> list[KVCacheBlock]:
-        """批量取出队首 n 个块，返回值保持原有驱逐顺序。"""
+        """批量取出队首 n 个块，返回值保持原有驱逐顺序。
+
+        Returns:
+            ret: 按原驱逐顺序从队首取出的 n 个物理块；n=0 时为空列表。
+        """
         if n == 0:
             return []
         assert self.num_free_blocks >= n  # 分配前由 Manager 检查整体容量。
@@ -346,7 +360,11 @@ class FreeKVCacheBlockQueue:
         self.num_free_blocks += len(blocks)
 
     def get_all_free_blocks(self) -> list[KVCacheBlock]:
-        """返回按驱逐顺序排列的空闲块快照，供状态检查使用。"""
+        """返回按驱逐顺序排列的空闲块快照，供状态检查使用。
+
+        Returns:
+            ret: 按当前驱逐顺序排列的全部空闲块快照。
+        """
         ret: list[KVCacheBlock] = []
         curr_block = self.fake_free_list_head.next_free_block
         if curr_block is None:
@@ -378,7 +396,7 @@ def create_kv_cache_group_specs(
             cache groups，内层 list 表示共享一个 block table 的 layers。
 
     Returns:
-        与 ``grouped_layer_names`` 顺序一致的 ``KVCacheGroupSpec`` 列表。
+        kv_cache_groups: 与 ``grouped_layer_names`` 顺序一致的 ``KVCacheGroupSpec`` 列表。
 
     Raises:
         KeyError: 分组中出现了 ``kv_cache_spec`` 未包含的 layer name 时抛出。
@@ -429,8 +447,8 @@ def get_kv_cache_groups(
         kv_cache_spec: 当前模型从 layer name 到独立 ``KVCacheSpec`` 的映射。
 
     Returns:
-        当前模型的 KV cache groups。无 Attention layer 时返回空列表；Qwen3
-        正常返回只包含一个 group 的列表。
+        kv_cache_groups: 当前模型的 KV cache groups。无 Attention layer 时返回空列表；Qwen3
+            正常返回只包含一个 group 的列表。
 
     Raises:
         NotImplementedError: layers 无法合并为统一 ``FullAttentionSpec``，或模型
@@ -466,7 +484,7 @@ def get_uniform_page_size(
             ``kv_cache_spec``。
 
     Returns:
-        所有 specs 共有的 ``page_size_bytes``。
+        page_size_bytes: 所有 specs 共有的 ``page_size_bytes``。
 
     Raises:
         AssertionError: 输入为空，或不同 specs 的 page 字节数不一致时抛出。
@@ -494,7 +512,7 @@ def may_override_num_blocks(
         num_blocks: 根据显存 profiling 自动计算出的物理 block 数。
 
     Returns:
-        存在 override 时返回用户值，否则返回自动计算出的 ``num_blocks``。
+        num_blocks: 存在 override 时返回用户值，否则返回自动计算出的 ``num_blocks``。
     """
     # override 主要用于测试和复现实验；正常推理应使用 profiling 的计算结果。
     if vllm_config.cache_config.num_gpu_blocks_override is not None:
@@ -523,7 +541,7 @@ def get_num_blocks(
         page_size: 单个 Attention layer 的一个 K/V page 占用的字节数。
 
     Returns:
-        当前 Worker 可分配的物理 KV block 数，结果不会小于零。
+        num_blocks: 当前 Worker 可分配的物理 KV block 数，结果不会小于零。
 
     Raises:
         ZeroDivisionError: ``num_layers`` 或 ``page_size`` 为零时抛出，表示上游
@@ -587,8 +605,8 @@ def get_kv_cache_config_from_groups(
         available_memory: 当前 Worker 可用于 KV cache 的显存字节数。
 
     Returns:
-        当前 Worker 的 ``KVCacheConfig``，其中包含物理 block 数、每段 tensor 的
-        字节大小和 layer 绑定关系。
+        kv_cache_config: 当前 Worker 的 ``KVCacheConfig``，其中包含物理 block 数、每段 tensor 的
+            字节大小和 layer 绑定关系。
 
     Raises:
         AssertionError: 不同 groups 的物理 page 大小不一致时抛出。
@@ -677,8 +695,8 @@ def get_kv_cache_configs(
         available_memory: 按 Worker rank 排列的 KV cache 可用显存字节数。
 
     Returns:
-        按 Worker rank 排列的 ``KVCacheConfig``。所有配置的 ``num_blocks`` 最终
-        相同，但 tensor 和 layer 绑定信息分别属于对应 Worker。
+        kv_cache_configs: 按 Worker rank 排列的 ``KVCacheConfig``。所有配置的 ``num_blocks`` 最终
+            相同，但 tensor 和 layer 绑定信息分别属于对应 Worker。
 
     Raises:
         ValueError: Worker 数量不一致、没有 Worker、同名 layer 在不同 TP ranks

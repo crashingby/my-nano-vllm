@@ -35,4 +35,9 @@ class SamplingParams:
 
     @property
     def eos_token_id(self) -> int | None:
+        """返回 Engine 注入的停止用 EOS；ignore_eos 请求通常由 Engine 设为 None。
+
+        Returns:
+            eos_token_id: Engine 注入的停止用 EOS ID；ignore_eos 请求通常为 None。
+        """
         return self._eos_token_id

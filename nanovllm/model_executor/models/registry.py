@@ -30,7 +30,7 @@ class _LazyRegisteredModel:
         """导入模块并返回模型类，不构造实例。
 
         Returns:
-            对应的 nn.Module 子类。
+            model_cls: 对应的 nn.Module 子类。
 
         Side Effects:
             首次调用会执行模型模块的导入代码；导入错误直接向上传播。
@@ -57,7 +57,7 @@ class _ModelRegistry:
             model_arch: HF config.json 中的架构名称。
 
         Returns:
-            注册的模型类；没有注册该名称时为 None。
+            model_cls: 注册的模型类；没有注册该名称时为 None。
         """
         if model_arch not in self.models:
             return None
@@ -75,7 +75,9 @@ class _ModelRegistry:
             model_config: 保留 vLLM 调用协议；当前没有依赖配置的后端回退分支。
 
         Returns:
-            模型类及命中的候选架构名称。
+            (model_cls, arch):
+                model_cls: 注册并成功加载的 nn.Module 子类。
+                arch: 命中的候选 HF 架构名称。
 
         Raises:
             ValueError: 没有候选架构，或所有候选都没有本地实现。

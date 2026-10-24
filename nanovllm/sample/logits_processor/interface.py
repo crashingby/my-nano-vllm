@@ -123,7 +123,7 @@ class LogitsProcessor(ABC):
             logits: 形状通常为 ``[num_reqs, vocab_size]`` 的模型输出 logits。
 
         Returns:
-            处理后的 logits 张量。
+            logits: 处理后的 logits 张量。
         """
         raise NotImplementedError
 
@@ -133,6 +133,9 @@ class LogitsProcessor(ABC):
 
         若返回 `True`，将来 sampler 可以在处理前完成贪心 token 选择，避免
         为纯贪心请求执行不影响结果的 logits 处理。
+
+        Returns:
+            is_argmax_invariant: 处理器不会改变贪心 argmax token 时为 True。
         """
         raise NotImplementedError
 

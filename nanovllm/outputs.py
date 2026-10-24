@@ -29,26 +29,32 @@ class ModelRunnerOutput:
     Attributes:
         req_ids: 当前 batch 的请求 ID 快照。
         req_id_to_index: 请求 ID 到输出行下标的快照。
-        sampled_token_ids: 每行是 ``[token_id]`` 或 ``[]``，不包含 prompt。
+        sampled_token_ids: 回收后每行是 ``[token_id]`` 或 ``[]``，不包含 prompt。
+            异步包装器回收前整个列表可以为空，不能提前当作已完成结果读取。
+        cudagraph_stats: 可选 Graph 容量统计，缺省不采集。
     """
-    # [num_reqs]
+    # 按本批输出行排列的请求 ID，不随 InputBatch 后续重排而改变。
     req_ids: list[str]
-    # req_id -> index
+    # Scheduler 通过请求 ID 找到本批输出行，不能使用当前 Runner 的槽位。
     req_id_to_index: dict[str, int]
-    # 这里不考虑投机解码，但是元素还是list[int]
+    # 行列表保留无效 prefill 的空输出；异步回收前允许整个列表尚未填入。
     sampled_token_ids: list[list[int]] = field(default_factory=list)
 
     cudagraph_stats: CUDAGraphStat | None = None
 
-# ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):
+    """持有尚未回收的执行结果，向 Executor 提供一次性阻塞回收接口。"""
+
     @abstractmethod
     def get_output(self) -> ModelRunnerOutput:
-        """Get the ModelRunnerOutput for this async output.
+        """等待结果就绪，并返回可在 CPU 上消费的 ModelRunnerOutput。
 
-        This is a blocking call that waits until the results are ready, which
-        might involve copying device tensors to the host.
-        This method should only be called once per AsyncModelRunnerOutput.
+        Returns:
+            model_runner_output: 可在 CPU 消费的 ModelRunnerOutput；调用前可能需要等待设备到主机的拷贝。
+
+        Side Effects:
+            可能等待设备到 CPU 的拷贝并释放临时设备引用。每个包装器只应调用
+            一次；需要重复 result() 时由 Executor 的 Future 缓存回收结果。
         """
         pass
 

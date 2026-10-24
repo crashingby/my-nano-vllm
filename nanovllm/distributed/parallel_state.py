@@ -159,8 +159,8 @@ class GroupCoordinator:
                 由它为指定 device 创建上下文，再传给本接口。
 
         Yields:
-            本作用域实际使用的 GraphCaptureContext，保留传入对象身份。
-            调用方可将其 stream 传给 torch.cuda.graph，发起真正的捕获。
+            graph_capture_context: 本作用域实际使用的 GraphCaptureContext，保留传入对象身份。
+                调用方可将其 stream 传给 torch.cuda.graph，发起真正的捕获。
 
         Side Effects:
             捕获 stream 等待进入前的当前 stream，保证其已有初始化工作先完成。
@@ -195,7 +195,7 @@ def get_world_group() -> GroupCoordinator:
     """返回已初始化的全局 world group 描述。
 
     Returns:
-        封装当前默认 PyTorch process group 的 ``GroupCoordinator``。
+        world_group: 封装当前默认 PyTorch process group 的 ``GroupCoordinator``。
 
     Raises:
         AssertionError: ``init_distributed_environment`` 尚未成功执行时抛出。
@@ -208,7 +208,7 @@ def get_tp_group() -> GroupCoordinator:
     """返回已初始化的 Tensor Parallel group 描述。
 
     Returns:
-        当前 rank 所属的 TP ``GroupCoordinator``。
+        tp_group: 当前 rank 所属的 TP ``GroupCoordinator``。
 
     Raises:
         AssertionError: ``ensure_model_parallel_initialized`` 尚未成功执行时抛出。
@@ -229,7 +229,7 @@ def graph_capture(device: torch.device):
             应已完成设备绑定和 TP group 初始化。
 
     Yields:
-        含指定 device 上新建 stream 的上下文；模型调用可使用其 stream 捕获图。
+        context: 含指定 device 上新建 stream 的上下文；模型调用可使用其 stream 捕获图。
 
     Side Effects:
         创建 CUDA stream，通过组接口建立进入前的 stream 依赖并临时切换 stream。
@@ -256,7 +256,7 @@ def init_world_group(
         backend: world 对应的通信 backend。
 
     Returns:
-        当前 rank 视角下的全局 group 描述对象。
+        world_group: 当前 rank 视角下的全局 group 描述对象。
     """
     return GroupCoordinator(
         group_ranks=[ranks],
@@ -281,7 +281,7 @@ def init_model_parallel_group(
         group_name: 逻辑组名称，例如 ``"tp"``。
 
     Returns:
-        当前 rank 所属的逻辑并行组描述。
+        group: 当前 rank 所属的逻辑并行组描述。
     """
     return GroupCoordinator(
         group_ranks=group_ranks,
@@ -419,12 +419,14 @@ def initialize_model_parallel(
 
     world_group = get_world_group()
     world_size = world_group.world_size
+    # 每个 TP 组必须包含相同数量的 rank，不能留下无法成组的尾部进程。
     if world_size % tensor_model_parallel_size != 0:
         raise ValueError(
             "tensor_model_parallel_size must divide world size, got "
             f"tensor_model_parallel_size={tensor_model_parallel_size}, "
             f"world_size={world_size}."
         )
+    # 未指定通信后端时沿用已初始化的默认进程组，保持所有 rank 的选择一致。
     if backend is None:
         backend = dist.get_backend()
 
@@ -437,7 +439,9 @@ def initialize_model_parallel(
     ]
 
     global _TP
+    # 组对象只有一个所有者，重复初始化会丢失旧通信资源，必须先显式销毁。
     assert _TP is None, "tensor model parallel group is already initialized"
+    # 每个进程按相同 group_ranks 顺序建组，再由组协调器选出当前 rank 所属组。
     _TP = init_model_parallel_group(
         group_ranks=group_ranks,
         local_rank=world_group.local_rank,
@@ -451,12 +455,19 @@ def model_parallel_is_initialized() -> bool:
 
     vLLM 还要求 PP group 同时存在；nano-vLLM 当前尚未实现 PP，因此 TP group 存在
     即表示当前支持范围内的模型并行状态已就绪。
+
+    Returns:
+        is_initialized: 当前 TP group 已初始化时为 True；当前项目未实现 PP。
     """
     return _TP is not None
 
 
 def get_tensor_model_parallel_world_size() -> int:
-    """返回当前 rank 所属 Tensor Parallel group 的大小。"""
+    """返回当前 rank 所属 Tensor Parallel group 的大小。
+
+    Returns:
+        tp_size: 当前 rank 所属 TP group 的 world_size。
+    """
     return get_tp_group().world_size
 
 

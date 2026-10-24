@@ -22,7 +22,7 @@ class AttentionLayerBase(ABC):
         """返回本层使用的 Attention 后端类。
 
         Returns:
-            用于构建 Attention metadata 和执行后端的类。
+            attn_backend: 用于构建 Attention metadata 和执行后端的类。
         """
         pass
 
@@ -34,6 +34,6 @@ class AttentionLayerBase(ABC):
             vllm_config: 提供 block size、模型精度等规划参数的总配置。
 
         Returns:
-            本层的 KVCacheSpec；不需要 KV cache 的层返回 None。
+            kv_cache_spec: 本层的 KVCacheSpec；不需要 KV cache 的层返回 None。
         """
         pass

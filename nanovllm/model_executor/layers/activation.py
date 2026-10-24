@@ -17,6 +17,9 @@ def _get_compiled_native() -> Callable[[torch.Tensor], torch.Tensor]:
 
     各层共享同一个无状态 callable，保留原先 @torch.compile 的执行方式；
     包装只针对 native 计算函数，provider 选择在模型构造阶段完成。
+
+    Returns:
+        compiled_native: 各层共享的 native torch.compile 包装器，实际编译在首次执行时发生。
     """
     native_impl = silu_and_mul.get_impl("native")  # torch 配置名映射到 IR 的 native。
     return torch.compile(native_impl.impl_fn)
@@ -66,9 +69,16 @@ class SiluAndMul(nn.Module):
 
         torch 路径由编译器管理计算；triton/cutedsl 路径检查 CUDA、精度和连续
         布局后启动 kernel。指定实现不支持输入时抛错，便于确认实验采用的后端。
+
+        Returns:
+            output: 独立的 [..., H] 激活结果，与输入同设备、同精度，输入保持原值。
         """
         return self._forward_method(x)
 
     def extra_repr(self) -> str:
-        """在模型结构输出中展示本层固定使用的后端。"""
+        """在模型结构输出中展示本层固定使用的后端。
+
+        Returns:
+            representation: 展示本层固定后端名称的模块说明字符串。
+        """
         return f"backend={self.backend!r}"

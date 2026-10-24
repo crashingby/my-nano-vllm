@@ -23,7 +23,7 @@ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
         load_config: 描述加载格式、进度条与设备覆盖选项的配置。
 
     Returns:
-        持有该配置引用的 Loader 实例。
+        model_loader: 持有该配置引用的 Loader 实例。
 
     Raises:
         ValueError: 格式不在当前支持列表中。

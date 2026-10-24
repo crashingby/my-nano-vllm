@@ -30,17 +30,33 @@ class KVCacheBlocks:
     @overload
     def get_block_ids(
         self, allow_none: Literal[False] = False,
-    ) -> tuple[list[int], ...]: ...
+    ) -> tuple[list[int], ...]:
+        """默认返回各 KV group 的编号列表，空组保留为空列表。
+
+        Returns:
+            block_ids: 按 KV group 排列的物理 block ID 列表元组，空 group 保留为空列表。
+        """
+        ...
 
     @overload
     def get_block_ids(
         self, allow_none: Literal[True],
-    ) -> tuple[list[int], ...] | None: ...
+    ) -> tuple[list[int], ...] | None:
+        """允许全空增量以 None 表示，使 Worker 跳过 block table 追加。
+
+        Returns:
+            block_ids: 按 KV group 排列的编号快照；全部为空且允许省略时为 None。
+        """
+        ...
 
     def get_block_ids(
         self, allow_none: bool = False,
     ) -> tuple[list[int], ...] | None:
-        """创建编号快照，允许增量协议用 None 表示没有新增块。"""
+        """创建编号快照，允许增量协议用 None 表示没有新增块。
+
+        Returns:
+            block_ids: 按 KV group 排列的编号快照；allow_none 且全部为空时为 None。
+        """
         if allow_none and all(len(group) == 0 for group in self.blocks):
             return None
         return tuple([block.block_id for block in group] for group in self.blocks)
@@ -54,7 +70,11 @@ class BlockHashToBlockMap:
         self._cache: dict[BlockHash, KVCacheBlock | dict[int, KVCacheBlock]] = {}
 
     def get_one_block(self, key: BlockHash) -> KVCacheBlock | None:
-        """查询任意一个匹配副本，不改变空闲队列或引用计数。"""
+        """查询任意一个匹配副本，不改变空闲队列或引用计数。
+
+        Returns:
+            block: 任意一个匹配 block_hash 的物理副本；未命中时为 None。
+        """
         blocks = self._cache.get(key)
         if blocks is not None:
             if isinstance(blocks, KVCacheBlock):
@@ -73,7 +93,11 @@ class BlockHashToBlockMap:
             blocks[block.block_id] = block
 
     def pop(self, key: BlockHash, block_id: int) -> KVCacheBlock | None:
-        """只驱逐指定物理副本，其余同 hash 块仍可命中。"""
+        """只驱逐指定物理副本，其余同 hash 块仍可命中。
+
+        Returns:
+            block: 移除的指定物理副本；不存在该 hash 或 block ID 时为 None。
+        """
         blocks = self._cache.pop(key, None)
         if blocks is None:
             return None
@@ -88,7 +112,11 @@ class BlockHashToBlockMap:
         return block
 
     def __len__(self) -> int:
-        """返回前缀 hash 数量，同 hash 的物理副本不重复计数。"""
+        """返回前缀 hash 数量，同 hash 的物理副本不重复计数。
+
+        Returns:
+            num_hashes: 缓存的不同前缀 hash 数量，同 hash 的物理副本只计一次。
+        """
         return len(self._cache)
 
 
@@ -113,7 +141,12 @@ class KVCacheManager:
             max_model_len: token slots 可达到的最大序列长度。
             enable_caching: 是否登记和查询完整块的本地前缀缓存。
             log_stats: 是否记录前缀查询和命中 token 数。
+
+        Side Effects:
+            创建 CPU 侧块对象、空闲队列和索引，并永久取走 block 0 作为空块。
+            不分配或清零真实 GPU KV tensor，那部分由 Worker 按同一配置完成。
         """
+        # 单 group 让每个物理编号在所有 Attention 层表示同一段逻辑 token。
         assert len(kv_cache_config.kv_cache_groups) == 1
         assert kv_cache_config.num_blocks > 0  # 永久保留的 block 0 必须存在。
         self.max_model_len: int = max_model_len
@@ -123,10 +156,11 @@ class KVCacheManager:
             PrefixCacheStats() if log_stats else None
         )
         self.kv_cache_config: KVCacheConfig = kv_cache_config
-        self.block_size: int = (
+        self.block_size: int = (  # token/block，调度器和 Worker 必须使用一致的单位。
             kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
         )
-        self.num_gpu_blocks: int = kv_cache_config.num_blocks
+        self.num_gpu_blocks: int = kv_cache_config.num_blocks  # 包含不可分配的 block 0。
+        # 一次建立固定身份的块对象；引用计数、hash 与空闲链表都操作这些对象。
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(self.num_gpu_blocks)
         ]
@@ -134,19 +168,29 @@ class KVCacheManager:
             self.blocks
         )
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
+        # null block 永久离开空闲队列，只用于 padding，不参与正常缓存驱逐。
         self.null_block: KVCacheBlock = self.free_block_queue.popleft()
         self.null_block.is_null = True
+        # 每个请求按逻辑 token 位置保存块引用，同一物理块可以由多个请求共享。
         self.req_to_blocks: defaultdict[str, list[KVCacheBlock]] = defaultdict(list)
         self.num_cached_block: dict[str, int] = {}  # 活跃请求已登记的完整块数。
         self.empty_kv_cache_blocks: KVCacheBlocks = KVCacheBlocks(((),))
 
     @property
     def usage(self) -> float:
-        """返回去除永久 null block 后的物理块使用率。"""
+        """返回去除永久 null block 后的物理块使用率。
+
+        Returns:
+            usage: 去除永久 null block 后的真实物理块使用率，范围为 [0, 1]。
+        """
         return self.get_usage()
 
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
-        """取出并轮换前缀统计，关闭统计时不创建计数对象。"""
+        """取出并轮换前缀统计，关闭统计时不创建计数对象。
+
+        Returns:
+            stats: 本轮前缀缓存统计；关闭统计时为 None，取出后内部切换到新统计对象。
+        """
         if not self.log_stats:
             return None
         stats = self.prefix_cache_stats
@@ -157,12 +201,24 @@ class KVCacheManager:
         """查询最长完整前缀，最后一个 token 留给模型重新计算 logits。
 
         查询不取得物理引用；allocate_slots() 容量检查成功后才 touch 命中块。
+
+        Args:
+            request: 保存真实 token 历史和完整块 hash 的待接纳/恢复请求。
+
+        Returns:
+            (computed_blocks, num_new_computed_tokens):
+                computed_blocks: 连续命中的前缀 KVCacheBlocks 包装，未命中或关闭缓存时为空包装。
+                num_new_computed_tokens: 命中块覆盖的 token 数；至少保留最后一个 token 重算 logits，未命中时为 0。
+
+        Side Effects:
+            开启统计时累加查询/命中数，不增加块引用计数或占用新物理块。
         """
         if not self.enable_caching:
             return self.empty_kv_cache_blocks, 0
-        max_cache_hit_length = request.num_tokens - 1
+        max_cache_hit_length = request.num_tokens - 1  # 即使全部历史命中也要产生最新 logits。
         computed_blocks: list[KVCacheBlock] = []
         max_num_blocks = max_cache_hit_length // self.block_size
+        # Full attention 只能跳过从位置 0 开始的连续前缀，中间缺块后不再继续查找。
         for block_hash in request.block_hashes[:max_num_blocks]:
             block = self.get_cached_block(block_hash)
             if block is None:
@@ -194,7 +250,7 @@ class KVCacheManager:
             new_computed_blocks: 与新命中 token 对应的物理块包装。
 
         Returns:
-            本次新增块的包装；容量不足返回 None，且不改变映射和引用。
+            new_blocks: 本次新增块的包装；容量不足返回 None，且不改变映射和引用。
 
         Side Effects:
             成功后更新请求块序列、引用计数和缓存 hash。与 vLLM 相同，完整
@@ -207,10 +263,12 @@ class KVCacheManager:
             if new_computed_blocks is not None
             else self.empty_kv_cache_blocks.blocks[0]
         )
+        # running 已有进度与本次新查出的命中前缀均不属于本轮新增计算量。
         num_local_computed_tokens = (
             request.num_computed_tokens + num_new_computed_tokens
         )
         total_computed_tokens = min(num_local_computed_tokens, self.max_model_len)
+        # 本轮结束后的逻辑长度决定需要多少物理块，不按新增 token 数单独取整。
         num_tokens_need_slot = min(
             total_computed_tokens + num_new_tokens, self.max_model_len
         )
@@ -221,6 +279,7 @@ class KVCacheManager:
         num_new_blocks = max(
             num_required_blocks - len(req_blocks) - len(new_computed_block_list), 0
         )
+        # 命中但 ref_cnt 为 0 的块还在空闲队列，touch 后也会消耗可用容量。
         num_evictable_blocks = sum(
             block.ref_cnt == 0 and not block.is_null
             for block in new_computed_block_list
@@ -252,25 +311,45 @@ class KVCacheManager:
 
         延迟回收调用方接管这些引用，写入完成后调用 free_blocks()。
         尚未分配就取消的请求返回空列表。
+
+        Returns:
+            req_blocks: 从请求映射移交的物理块列表，尚未分配时为空；引用计数暂不减少。
         """
         req_blocks = self.req_to_blocks.pop(request.request_id, [])
         self.num_cached_block.pop(request.request_id, None)
         return req_blocks
 
     def get_blocks(self, request_id: str) -> KVCacheBlocks:
-        """返回请求的物理块包装，不改变引用计数。"""
+        """返回请求的物理块包装，不改变引用计数。
+
+        Returns:
+            blocks: 当前请求的 KVCacheBlocks 包装，不改变物理引用计数。
+        """
         return self.create_kv_cache_blocks((self.req_to_blocks[request_id],))
 
     def get_block_ids(self, request_id: str) -> tuple[list[int], ...]:
-        """创建 Worker 使用的物理编号快照。"""
+        """创建 Worker 使用的物理编号快照。
+
+        Returns:
+            block_ids: 请求各 KV group 的物理 block ID 列表元组。
+        """
         return self.get_blocks(request_id).get_block_ids()
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
-        """增量登记完整块，num_cached_block 避免重复设置块 hash。"""
+        """按调用方给定的逻辑进度增量登记完整块，避免重复写入 hash。
+
+        Args:
+            request: 已拥有当前物理 block table 和真实历史 hash 的请求。
+            num_computed_tokens: 允许发布的前缀 token 数，向下取整到完整 block。
+
+        Side Effects:
+            为新增完整块写入 hash 索引并推进 num_cached_block；不执行设备同步。
+            调用方负责提交、回收和块复用时的设备先后关系。
+        """
         if not self.enable_caching:
             return
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
-        num_full_blocks = num_computed_tokens // self.block_size
+        num_full_blocks = num_computed_tokens // self.block_size  # 不发布尚未填满的尾块。
         if num_cached_blocks >= num_full_blocks:
             return
         self.cache_full_blocks(
@@ -284,11 +363,19 @@ class KVCacheManager:
     def create_kv_cache_blocks(
         self, blocks: tuple[Sequence[KVCacheBlock], ...],
     ) -> KVCacheBlocks:
-        """包装非空块序列，空结果复用唯一空包装。"""
+        """包装块序列，空结果复用空包装；非空时保留原序列引用，不复制块。
+
+        Returns:
+            kv_cache_blocks: 保留原块序列引用的 KVCacheBlocks；没有块时复用空包装。
+        """
         return KVCacheBlocks(blocks) if any(blocks) else self.empty_kv_cache_blocks
 
     def get_cached_block(self, block_hash: BlockHash) -> KVCacheBlock | None:
-        """查询唯一 group 中任意一个匹配的物理副本。"""
+        """查询唯一 group 中任意一个匹配的物理副本。
+
+        Returns:
+            block: 唯一 KV group 内任意一个匹配的物理副本，未命中时为 None。
+        """
         return self.cached_block_hash_to_block.get_one_block(block_hash)
 
     def cache_full_blocks(
@@ -301,6 +388,7 @@ class KVCacheManager:
         """写入新增完整块的 hash，保留同 hash 的其他物理副本。"""
         if num_cached_blocks >= num_full_blocks:
             return
+        # 请求前部已登记，只有当前新增的完整后缀可以首次设置 block_hash。
         new_full_blocks = blocks[num_cached_blocks:num_full_blocks]
         assert len(request.block_hashes) >= num_full_blocks
         new_block_hashes = request.block_hashes[num_cached_blocks:]
@@ -313,7 +401,11 @@ class KVCacheManager:
             self.cached_block_hash_to_block.insert(block_hash, block)
 
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
-        """取出空闲块，先驱逐旧 hash，再取得物理块引用。"""
+        """取出空闲块，先驱逐旧 hash，再取得物理块引用。
+
+        Returns:
+            ret: 按空闲队列顺序取出的物理块列表，已驱逐旧 hash 并取得新的引用。
+        """
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
         ret = self.free_block_queue.popleft_n(num_blocks)
@@ -325,7 +417,11 @@ class KVCacheManager:
         return ret
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
-        """只驱逐当前物理副本的 hash，不影响其他同 hash 块。"""
+        """只驱逐当前物理副本的 hash，不影响其他同 hash 块。
+
+        Returns:
+            evicted: 当前物理副本的旧 hash 被实际驱逐时为 True，否则为 False。
+        """
         block_hash = block.block_hash
         if block_hash is None:
             return False
@@ -360,11 +456,19 @@ class KVCacheManager:
         self.free_block_queue.append_n(blocks_with_hash)
 
     def get_num_free_blocks(self) -> int:
-        """返回空闲真实物理块数量，不包含永久 null block。"""
+        """返回空闲真实物理块数量，不包含永久 null block。
+
+        Returns:
+            num_free_blocks: 空闲真实物理块数，不包含永久保留的 null block。
+        """
         return self.free_block_queue.num_free_blocks
 
     def get_usage(self) -> float:
-        """返回去除 null block 后的物理块使用率。"""
+        """返回去除 null block 后的物理块使用率。
+
+        Returns:
+            usage: 去除 null block 后的物理块使用率；没有可分配真实块时为 0.0。
+        """
         total_gpu_blocks = self.num_gpu_blocks - 1
         if not total_gpu_blocks:
             return 0.0

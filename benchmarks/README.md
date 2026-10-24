@@ -1,7 +1,7 @@
 # 本地推理 Benchmarks
 
 这个目录将数据集读取、配置、指标和回放分开。当前支持单进程 Engine 的吞吐与
-逐 token 延迟测试，复用相同的配置、数据集和启动流程。数据集包含
+逐 token 延迟测试，可选择同步或异步调度，复用相同的配置、数据集和启动流程。数据集包含
 Alpaca 与 LongBench 文本负载；后续新增数据集，只需实现适配器并登记名称。
 
 ## 模块职责
@@ -18,11 +18,17 @@ Alpaca 与 LongBench 文本负载；后续新增数据集，只需实现适配�
 | [metrics.py](metrics.py) | 实际请求/token 计数与吞吐输出。 |
 | [latency_metrics.py](latency_metrics.py) | 逐请求时间轴、TTFT/TPOT/ITL 分布及 JSON 统计。 |
 | [runner.py](runner.py) | 公共数据准备、Engine 启停、随机数重置与报告保存。 |
-| [benchmark_engine_throughput.py](benchmark_engine_throughput.py) | 创建 Engine，持续补充请求，调用 step() 并消费完成结果。 |
-| [benchmark_engine_latency.py](benchmark_engine_latency.py) | 持续补充请求，在每轮 step() 返回后观察生成 token，统计本地延迟。 |
+| [benchmark_engine_throughput.py](benchmark_engine_throughput.py) | 创建 Engine，持续补充请求，调用 step_fn() 并消费完成结果。 |
+| [benchmark_engine_latency.py](benchmark_engine_latency.py) | 持续补充请求，在每轮 step_fn() 返回后观察生成 token，统计本地延迟。 |
+| [profile_engine_overlap.py](profile_engine_overlap.py) | 真实请求预热后，临时标记各批次 CPU 阶段，供 Nsight 诊断跨批次重叠。 |
+| [analyze_engine_overlap.py](analyze_engine_overlap.py) | 读取四组 Nsight SQLite 与批次布局，计算 16 并发稳态 decode 的重叠及等待。 |
 
 这里使用 Python ABC 基类与显式注册表。格式差异放在各数据集类中，共同的编码和
 长度策略留在基类；不需要为当前单轮文本任务引入 Traits 或多重继承。
+
+同步与异步在 eager、CUDA Graph 下的实测对比，以及 Nsight 采集命令见
+[异步调度性能记录](../docs/performance/async_schedule.md)。诊断入口增加观测开销，
+其 TPS 不用于替代两个正式 benchmark 的结果。
 
 ## 配置与数据怎样流动
 
@@ -176,6 +182,7 @@ truncate 会改变原始任务内容，适用于性能负载控制。它保留�
 | --seed | 0 | Engine 启动后重置生成随机数状态。 |
 | --result-path | 不指定 | 可选 JSON 报告路径；计时结束后保存配置摘要和统计，可覆盖已有文件。 |
 | --enforce-eager | 关闭 | 禁用 CUDA Graph，局部层编译和内核预热仍存在。 |
+| --async-scheduling / --no-async-scheduling | 关闭 | 启用或显式关闭异步调度，两个入口均支持。 |
 | --max-model-len | 4096 | prompt 与 output 的总上下文容量。 |
 | --max-num-batched-tokens | 1024 | 单轮真实 token 预算，必须不小于 max-active。 |
 | --gpu-memory-utilization | 0.9 | 当前实例占设备总显存的预算，示例使用 0.5。 |
@@ -185,12 +192,91 @@ truncate 会改变原始任务内容，适用于性能负载控制。它保留�
 seed 固定的是生成前随机数初态，不保证不同 batch 调度或 Graph 模式生成逐字相同
 的文本。需要固定工作量时，同时使用 --ignore-eos 和相同的输入/输出长度策略。
 
+## 同步与异步调度对比
+
+默认使用同步调度。添加 `--async-scheduling` 后，Engine 使用 AsyncScheduler 和
+最多两个在途批次，让 CPU 准备后续批次时，GPU 可以继续处理已经提交的工作。
+启动日志和 JSON 的 `config.async_scheduling` 都会记录实际选项。
+
+Engine 在初始化时将 `step_fn` 绑定到同步 `step()` 或 `step_with_batch_queue()`。
+回放与手动驱动统一调用 `llm.step_fn()`，`generate()` 的调用方式保持不变。
+
+下面在相同负载上分别运行两种模式，默认启用 decode CUDA Graph：
+
+```shell
+for mode in no-async-scheduling async-scheduling; do
+  VLLM_HOST_IP=127.0.0.1 python -m benchmarks.benchmark_engine_throughput \
+    --num-prompts 128 \
+    --max-active 16 \
+    --max-prompt-tokens 256 \
+    --long-prompt-policy truncate \
+    --max-model-len 1024 \
+    --max-num-batched-tokens 1024 \
+    --max-tokens 128 \
+    --gpu-memory-utilization 0.5 \
+    --ignore-eos \
+    --seed 0 \
+    --"$mode" \
+    --result-path "benchmark_results/throughput_${mode}.json"
+done
+```
+
+比较报告中的 `metrics.output_tps`，并确认完成请求数、输入与输出 token 总数一致。
+两种模式应分别在没有其他 GPU 任务时运行，重复测试并交替先后顺序。添加
+`--enforce-eager` 可比较 eager 模式；将入口替换为
+`benchmarks.benchmark_engine_latency` 可同时观察 TTFT 和 ITL 的变化。
+
+异步模式可能在收到请求完成结果前，已经提交了该请求的下一步，因此
+`scheduled_tokens` 和 `num_engine_steps` 可能与同步模式不同。回放会消费增量输出，
+不会只按调度提交数量提前结束计时。吞吐入口等待请求和在途队列都结束；延迟入口
+在全部请求完成时结束计时，然后排空剩余在途结果。两个入口都在返回前清理 Worker。
+
+### 本机实测
+
+2026-10-22，在 WSL 的 RTX 4060 Laptop 8 GB 上，使用 Qwen3-0.6B BF16、
+PyTorch 2.5.1+cu121、FlashAttention 2.8.3.post1，按上面的参数运行。
+首次测试沿用 WSL 下关闭锁页内存的策略，Graph 同步为 1587.6 token/s、异步为
+1674.0 token/s，提升 5.44%。检查发现 temperature 每轮上传时会触发阻塞同步。
+
+允许本机 CUDA 平台分配锁页内存后，重新加入未锁页对照，测得：
+
+| 执行方式 | pin_memory | 同步输出 token/s | 异步输出 token/s | 异步相对提升 |
+| --- | --- | --- | --- | --- |
+| decode CUDA Graph | False，对照 | 1750.1 | 1839.9 | +5.13% |
+| decode CUDA Graph | True | 1742.6 | 2016.2 | +15.70% |
+| eager | True | 581.2 | 594.3 | +2.25% |
+
+每种组合测两次，表中为输出吞吐的算术平均值。Graph 先依次运行未锁页同步、
+锁页同步、锁页异步、未锁页异步，再逆序运行；eager 按同步、异步、异步、同步运行。
+未锁页对照仅在独立测试进程中覆盖平台检测结果，不修改项目的运行策略。
+本轮与初测的机器状态存在差异，应使用同轮对照判断收益。
+
+所有测试均完成 128 条请求，逻辑输入共 3737 token，输出共 16384 token。
+锁页 Graph 同步两次为 1779.4、1705.7 token/s，异步为 2036.4、1996.0 token/s；
+同轮锁页异步相对未锁页异步提升 9.58%。锁页 eager 同步为 603.5、558.9 token/s，
+异步为 605.0、583.6 token/s，波动大于平均提升，当前结果不足以说明它有稳定收益。
+这些数字只代表本机这组负载，不能推广为所有并发和输入长度下的提升幅度。
+
+运行时核对了 temperature、输入 token、长度、block table、slot mapping 等
+12 类 staging tensor 的 `is_pinned()`，确认它们接收了平台策略；异步输出的
+CPU tensor 也已锁页。完整 token 历史矩阵只在 CPU 上用于 gather，继续保持未锁页。
+额外用确定性 argmax 验证了变长输出、分块 prefill、槽位复用和重复前缀下的同步/
+异步 token 序列一致，延迟入口的时间戳数量与实际输出长度一致；吞吐测试仍使用
+原有随机采样器。
+
+另用 32 条请求、每条输出 64 token 的异步 Graph trace 核对同步点，temperature
+上传里的 `cudaStreamSynchronize` 从初测的 128 次变为 0 次。本次 trace 中，
+`refresh_metadata()` 共耗时 16.2 ms，输入 buffer 复用保护的事件等待为 1.4 ms，
+结果回收的事件等待为 590.2 ms。后两处事件分别保护 CPU staging buffer 复用和
+采样结果读取，应保留；不能把它们当作无效同步直接删除。trace 用于定位调用，
+吞吐表采用未启用 profiler 的独立测试。
+
 ## 指标与计时边界
 
 | 指标 | 含义 |
 | --- | --- |
 | num_prompts / num_submitted / num_finished | 接受、提交和完成的实际请求数。 |
-| num_engine_steps | 计时循环内的 step() 次数，不含最后的 Worker 清理调用。 |
+| num_engine_steps | 计时循环内的 step_fn() 次数，不含最后的 Worker 清理调用。 |
 | input_tokens | 实际提交的逻辑 prompt 长度之和，包含 chat template。 |
 | output_tokens | 完成请求实际返回的生成 token 数。 |
 | scheduled_tokens | 各轮真实调度 token 总量，包含混合 batch 和可能的重算，不含 Graph padding。 |
@@ -272,11 +358,12 @@ TPOT 的均值对请求等权，ITL 的均值对 token 间隔等权。不同请�
 
 ### 时间戳怎样采集
 
-当前 `LLMEngine.step()` 返回 `(dict[int, EngineCoreOutputs], 本轮调度 token 数)`。
+当前统一入口 `LLMEngine.step_fn()` 返回
+`(dict[int, EngineCoreOutputs], 本次新提交的 token 数)`。
 字典按 client 分组，每条输出的 `new_token_ids` 仅包含本轮增量，`finished`
 表示请求已经结束。吞吐脚本逐轮累计增量 token；`generate()` 自行累计完整结果。
 延迟脚本在提交时取得
-Scheduler 中的 Request 引用，每轮 `step()` 返回后立即采集一次时间，并检查各个
+Scheduler 中的 Request 引用，每轮 `step_fn()` 返回后立即采集一次时间，并检查各个
 活跃 Request 的 `num_output_tokens`。长度增加 1 时，追加一个 token 时间戳；
 中间 prefill chunk 长度保持不变，等待时间自然进入 TTFT 或下一次 ITL。
 
@@ -285,10 +372,11 @@ Scheduler 中的 Request 引用，每轮 `step()` 返回后立即采集一次时
 数量，移除活跃引用并补充下一条请求。当前每请求每步最多产生一个 token，遇到
 多个新增 token 会直接报错，保留逐 token 间隔的明确含义。
 
-这些时间表示 **本地同步 Engine 在 step 返回时的 token 可见时间**。同轮请求共用
-一个观察时刻，范围包含调度、执行、采样同步及 Engine 状态提交；文本解码、HTTP
-传输和客户端接收由服务层另行计时。脚本沿用 Engine 已有同步行为，观察过程只读取
-CPU Request 状态。逐 token 记录和循环管理会增加少量开销，TPS 包含这些测量开销。
+这些时间表示 **本地 Engine 在 step 返回时的 token 可见时间**。同轮请求共用
+一个观察时刻，范围包含调度、执行、采样结果回收及 Engine 状态提交；文本解码、HTTP
+传输和客户端接收由服务层另行计时。异步模式下，提交批次但尚未回收结果的 step
+不会增加时间戳；占位 token 也不计为真实输出。观察过程只读取 CPU Request 状态，
+逐 token 记录和循环管理会增加少量开销，TPS 包含这些测量开销。
 
 回放采用固定最大并发的闭环方式：完成一条后补充一条。请求在 benchmark 中尚未
 提交的等待不计入 TTFT；成功提交后在 Engine 内的等待计入 TTFT。数据读取、编码、
@@ -299,7 +387,7 @@ Engine 初始化、启动预热、报告汇总和最终清理均在回放计时�
 
 指定 `--result-path` 后，脚本在计时结束后创建父目录并写入：
 
-- `config`：模型、精度、eager 选项、数据集、并发、token 预算与采样参数摘要。
+- `config`：模型、精度、eager 与异步调度选项、数据集、并发、token 预算与采样参数摘要。
 - `metrics`：公共工作量计数、`output_tps` 和毫秒延迟分布。
 - `metrics.request_latencies`：按提交顺序保存请求 ID、输入长度、到达时间、逐 token
   时间戳、完成时间及派生指标。原始时间戳单位为秒，原点统一为回放开始时刻。

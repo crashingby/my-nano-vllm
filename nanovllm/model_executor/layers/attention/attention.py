@@ -135,8 +135,8 @@ class Attention(nn.Module, AttentionLayerBase):
             output_shape: 预分配输出的形状，缺省为 [T, H * D]。
 
         Returns:
-            后端写入的输出，形状为 [-1, output_shape[-1]]；默认是 [T, H * D]。
-            例如 Query [6, 4, 8] 对应输出 [6, 32]。
+            output: 后端写入的输出，形状为 [-1, output_shape[-1]]；默认是 [T, H * D]。
+                例如 Query [6, 4, 8] 对应输出 [6, 32]。
 
         Side Effects:
             若后端要求独立缓存更新且本层存在 slot mapping，先调用后端
@@ -176,7 +176,11 @@ class Attention(nn.Module, AttentionLayerBase):
         return output.view(-1, hidden_size)
 
     def extra_repr(self) -> str:
-        """在 module 展示中给出本层 head 参数和实际后端实现名称。"""
+        """在 module 展示中给出本层 head 参数和实际后端实现名称。
+
+        Returns:
+            representation: 包含 head 参数、缩放系数和实际后端名称的模块展示字符串。
+        """
         return (
             f"head_size={self.impl.head_size}, num_heads={self.impl.num_heads}, "
             f"num_kv_heads={self.impl.num_kv_heads}, scale={self.impl.scale}, "
@@ -195,7 +199,11 @@ class Attention(nn.Module, AttentionLayerBase):
         self.impl.process_weights_after_loading(act_dtype)
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        """返回后端类型，供 Runner 创建 AttentionGroup 和 metadata builder。"""
+        """返回后端类型，供 Runner 创建 AttentionGroup 和 metadata builder。
+
+        Returns:
+            attn_backend: 本层绑定的 AttentionBackend 子类，供 Runner 创建 metadata builder。
+        """
         return self.attn_backend
 
     def get_kv_cache_spec(self, vllm_config: NanovllmConfig) -> KVCacheSpec:
@@ -206,7 +214,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 模型加载后、缓存规划前调整。
 
         Returns:
-            使用本 rank KV head 数、head_size 和模型缓存精度的 FullAttentionSpec。
+            kv_cache_spec: 使用本 rank KV head 数、head_size 和模型缓存精度的 FullAttentionSpec。
         """
         block_size = vllm_config.cache_config.block_size
         return FullAttentionSpec(
@@ -226,9 +234,11 @@ def get_attention_context(
         layer_name: 构造 Attention 时注册的完整层名。
 
     Returns:
-        (本层 metadata, 本层实例, 本层 combined KV cache, 本层 slot mapping)。
-        profiling 时 metadata 可以为 None；未安排缓存写入时 slot mapping 为 None。
-        返回原始对象引用，不复制 tensor。
+        按返回顺序包含以下各项：
+            attn_metadata: 本层 Attention metadata，profiling 时可为 None。
+            attn_layer: 当前层的 Attention 实例引用。
+            kv_cache: 本层已绑定的 combined KV cache tensor。
+            layer_slot_mapping: 本层 slot mapping，未安排缓存写入时可为 None；所有对象均按引用返回。
 
     Raises:
         AssertionError: 未安装上下文，或 slot_mapping 不是按层组织的字典。
@@ -264,8 +274,8 @@ def unified_kv_cache_update(
         layer_name: 需要更新缓存的完整 Attention 层名。
 
     Returns:
-        与缓存同设备、同精度的空 tensor，沿用 vLLM 的依赖参数接口。
-        当前未注册 custom op，它本身不提供 torch.compile 的顺序保证。
+        kv_cache_dummy_dep: 与缓存同设备、同精度的空 tensor，沿用 vLLM 的依赖参数接口。
+            当前未注册 custom op，它本身不提供 torch.compile 的顺序保证。
 
     Side Effects:
         存在本层 slot mapping 时，由 impl.do_kv_cache_update 修改缓存。

@@ -35,8 +35,8 @@ def get_flash_attn_version(
         has_sinks: 是否要求 attention sinks；当前未支持。
 
     Returns:
-        当前扩展和 GPU 支持时返回 2；无可用 GPU、缺少扩展或要求不支持的
-        功能时返回 None。安装了扩展不代表当前机器具备可运行的 CUDA GPU。
+        fa_version: 当前扩展和 GPU 支持时返回 2；无可用 GPU、缺少扩展或要求不支持的
+            功能时返回 None。安装了扩展不代表当前机器具备可运行的 CUDA GPU。
     """
     if not current_platform.is_cuda():
         return None
@@ -60,23 +60,38 @@ def is_flash_attn_varlen_func_available() -> bool:
 
     此接口只描述函数是否可导入。是否能在当前设备执行，应另外通过
     get_flash_attn_version 或 is_fa_version_supported 查询。
+
+    Returns:
+        is_available: CUDA 平台的 FA2 varlen 函数已成功导入时为 True，不探测 GPU 能力。
     """
     # 与 vLLM CUDA 分支一致：模块已经成功导入，说明包入口的扩展检查已通过。
     return current_platform.is_cuda()
 
 
 def flash_attn_supports_quant_query_input() -> bool:
-    """报告当前移植接口不支持量化 Query，只接受 FP16/BF16。"""
+    """报告当前移植接口不支持量化 Query，只接受 FP16/BF16。
+
+    Returns:
+        supports_quant_query_input: 是否支持量化 Query；当前移植接口始终返回 False。
+    """
     return False
 
 
 def flash_attn_supports_sinks() -> bool:
-    """报告当前 FA2 接口不支持 attention sinks。"""
+    """报告当前 FA2 接口不支持 attention sinks。
+
+    Returns:
+        supports_sinks: 是否支持 attention sinks；当前接口始终返回 False。
+    """
     return False
 
 
 def flash_attn_supports_mla() -> bool:
-    """报告当前普通 decoder Attention 路径不支持 MLA。"""
+    """报告当前普通 decoder Attention 路径不支持 MLA。
+
+    Returns:
+        supports_mla: 是否支持 MLA；当前普通 decoder Attention 路径返回 False。
+    """
     return False
 
 

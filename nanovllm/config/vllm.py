@@ -281,7 +281,7 @@ def get_current_config() -> NanovllmConfig:
     """取得最近一层 set_current_config() 安装的完整配置引用。
 
     Returns:
-        当前由 :func:`set_current_config` 安装的 ``NanovllmConfig``。
+        vllm_config: 当前由 :func:`set_current_config` 安装的 ``NanovllmConfig``。
 
     Raises:
         AssertionError: 当前没有活动配置作用域时抛出。普通 forward 的运行时
@@ -297,7 +297,11 @@ def get_current_config() -> NanovllmConfig:
 
 
 def get_current_config_or_none() -> NanovllmConfig | None:
-    """查询当前初始化作用域的配置；没有活动作用域时返回 None，不触发断言。"""
+    """查询当前初始化作用域的配置；没有活动作用域时返回 None，不触发断言。
+
+    Returns:
+        vllm_config: 当前初始化作用域的完整配置引用；没有活动作用域时为 None。
+    """
     return _current_vllm_config
 
 
@@ -320,8 +324,8 @@ def get_layers_from_nanovllm_config(
         layer_names: 可选的层名子集。为 ``None`` 时遍历注册表中的所有层。
 
     Returns:
-        新建的层名到 layer_type 实例映射，value 仍引用原始 module。名称不存在或
-        类型不匹配的条目被跳过；不修改 static_forward_context，也不复制模型层。
+        layers: 新建的层名到 layer_type 实例映射，value 仍引用原始 module。名称不存在或
+            类型不匹配的条目被跳过；不修改 static_forward_context，也不复制模型层。
     """
     # 该字典由 Attention 等 module 在模型构建期注册，Worker 只读地查询它。
     forward_context = vllm_config.compilation_config.static_forward_context

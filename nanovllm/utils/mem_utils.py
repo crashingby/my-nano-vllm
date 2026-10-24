@@ -18,21 +18,31 @@ from .mem_constants import GiB_bytes, KiB_bytes, MiB_bytes
 
 
 def format_kib(b: int) -> str:
+    """将字节数 b 换算为 KiB 数值字符串，round 到两位小数但不固定补零。
+
+    Returns:
+        kib_str: 字节数换算为 KiB 后的数值字符串，最多保留两位小数，不固定补零。
+    """
     return f"{round(b / KiB_bytes, 2)}"
 
 
 def format_mib(b: int) -> str:
+    """将字节数 b 换算为 MiB 数值字符串，round 到两位小数但不固定补零。
+
+    Returns:
+        mib_str: 字节数换算为 MiB 后的数值字符串，最多保留两位小数，不固定补零。
+    """
     return f"{round(b / MiB_bytes, 2)}"
 
 
 def format_gib(b: int) -> str:
-    """将字节数转换为便于日志展示的 GiB 字符串。
+    """将字节数转换为日志中的 GiB 数值字符串，不附加单位。
 
     Args:
-        num_bytes: 待转换的字节数。
+        b: 待转换的字节数。
 
     Returns:
-        保留两位小数的 GiB 数值字符串，不额外附加单位。例如 ``"12.34"``。
+        gib_str: round 到两位小数的数值字符串，不固定补零，例如 1 GiB 返回 "1.0"。
     """
     return f"{round(b / GiB_bytes, 2)}"
 
@@ -69,8 +79,8 @@ class DeviceMemoryProfiler:
         """按 vLLM 的 CUDA 采样流程读取当前 tensor 显存占用。
 
         Returns:
-            PyTorch allocator 中仍被 tensor 占用的显存字节数。
-            保留 vLLM 的 float 返回类型注解，CUDA API 实际返回整数。
+            memory_usage: PyTorch allocator 中仍被 tensor 占用的显存字节数。
+                保留 vLLM 的 float 返回类型注解，CUDA API 实际返回整数。
 
         Side Effects:
             执行 Python 垃圾回收、释放 allocator 的空闲缓存，并重置目标设备的
@@ -89,7 +99,7 @@ class DeviceMemoryProfiler:
         """记录执行前的显存基线，供退出时计算差值。
 
         Returns:
-            当前 profiler 对象，可通过 with ... as profiler 读取统计结果。
+            profiler: 当前 profiler 对象，可通过 with ... as profiler 读取统计结果。
 
         Side Effects:
             创建 initial_memory 字段，并执行一次带清理操作的显存采样。
@@ -217,8 +227,8 @@ class MemorySnapshot:
             other: 更早采集的同设备显存快照。
 
         Returns:
-            一个 ``auto_measure=False`` 的新快照。每个数值字段均为
-            ``self - other`` 的字节数或秒数差值。
+            difference: 一个 ``auto_measure=False`` 的新快照。每个数值字段均为
+                ``self - other`` 的字节数或秒数差值。
 
         Raises:
             ValueError: 两份快照来自不同 CUDA device 时抛出。
@@ -241,7 +251,11 @@ class MemorySnapshot:
             auto_measure=False,
         )
     def __repr__(self) -> str:
-        """返回便于日志阅读的 GiB 格式显存摘要。"""
+        """返回便于日志阅读的 GiB 格式显存摘要。
+
+        Returns:
+            representation: 以 GiB 和秒表示当前显存快照的调试字符串。
+        """
         return (
             f"torch_peak={format_gib(self.torch_peak)}GiB, "
             f"free_memory={format_gib(self.free_memory)}GiB, "
@@ -285,7 +299,11 @@ class MemoryProfilingResult:
         self.before_profile = MemorySnapshot(device=device, auto_measure=False)
         self.after_profile = MemorySnapshot(device=device, auto_measure=False)
     def __repr__(self) -> str:
-        """返回便于日志输出的显存 profile 摘要。"""
+        """返回便于日志输出的显存 profile 摘要。
+
+        Returns:
+            representation: 包含权重、峰值增长、非 PyTorch 增长及耗时的 profiling 摘要字符串。
+        """
         return (
             "MemoryProfilingResult("
             f"weights_memory={format_gib(self.weights_memory)}, "
@@ -312,8 +330,9 @@ def memory_profiling(
         weights_memory: 已加载模型权重占用的 PyTorch 显存，单位为字节。
 
     Yields:
-        用于承载本次 profile 结果的 ``MemoryProfilingResult``。进入 ``with``
-        块前已记录 ``before_profile``；退出后会填充完整统计数据。
+        result: 用于承载本次 profile 结果的 ``MemoryProfilingResult``。进入 ``with``
+            块前已记录 ``before_profile``；退出后会填充完整统计数据。
+
     单张 GPU 上的显存可以分成三类：
 
     1. 当前 nano-vLLM 实例以外的对象占用的显存。

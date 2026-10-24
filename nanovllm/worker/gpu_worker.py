@@ -208,7 +208,7 @@ class Worker(WorkerBase):
         Wrapper 的识别与 unwrap() 由 Runner 完成，Worker 只转发查询。
 
         Returns:
-            当前 GPUModelRunner 持有的已加载语言模型。
+            model: 当前 GPUModelRunner 持有的已加载语言模型。
 
         Raises:
             ValueError: 模型尚未加载时，由 ``GPUModelRunner.get_model()`` 抛出。
@@ -223,9 +223,9 @@ class Worker(WorkerBase):
         交给 Engine，生成后续 initialize_from_config() 接收的 KVCacheConfig。
 
         Returns:
-            从稳定 Attention layer 全名到 ``KVCacheSpec`` 的映射。例如 Qwen3 的
-            key 形如 ``"model.layers.0.self_attn.attn"``。不需要独立 KV cache 的
-            layer 不出现在映射中；规格本身不持有已分配的 GPU KV tensor。
+            kv_cache_spec: 从稳定 Attention layer 全名到 ``KVCacheSpec`` 的映射。例如 Qwen3 的
+                key 形如 ``"model.layers.0.self_attn.attn"``。不需要独立 KV cache 的
+                layer 不出现在映射中；规格本身不持有已分配的 GPU KV tensor。
         """
         # 只查询规格，不改变 block 数、KV 层绑定或 Scheduler 的请求状态。
         return self.model_runner.get_kv_cache_spec()
@@ -247,8 +247,8 @@ class Worker(WorkerBase):
         CacheConfig.kv_cache_memory_bytes 预算分支尚未接入。
 
         Returns:
-            交给 Engine KV cache planner 的候选显存字节数，不是物理 block 数。
-            不将不足的预算截断为零；是否足以容纳请求由 planner 校验。
+            available_memory: 交给 Engine KV cache planner 的候选显存字节数，不是物理 block 数。
+                不将不足的预算截断为零；是否足以容纳请求由 planner 校验。
 
         Raises:
             AssertionError: profiling 后的空闲显存大于初始化基线，可能发生
@@ -317,7 +317,7 @@ class Worker(WorkerBase):
             f"current_free={format_gib(free_gpu_memory)} GiB."
         )
         # available_kv_cache_memory_bytes 是候选 KV 字节预算，尚未换算或分配物理 blocks。
-        # 例如总预算 10 GiB，权重 2、激活 1、非 PyTorch 0.5、Graph 0.5，返回 6 GiB。
+        # 总预算 10 GiB 减权重 2、激活 1、非 PyTorch 0.5、Graph 0.5，available_memory 为 6 GiB。
         self.available_kv_cache_memory_bytes = (
             self.requested_memory
             - profile_result.non_kv_cache_memory
@@ -391,9 +391,9 @@ class Worker(WorkerBase):
                 增量及每请求执行 token 数。Worker 原样交给 Runner。
 
         Returns:
-            有调度 token 时，Runner 执行 forward、暂存 logits 并返回 None；
-            下一轮 execute_model() 前必须先消费这轮采样状态。
-            空调度返回空 ModelRunnerOutput，调用方可直接处理该结果。
+            model_output: 有调度 token 时，Runner 执行 forward、暂存 logits 并返回 None；
+                下一轮 execute_model() 前必须先消费这轮采样状态。
+                空调度返回空 ModelRunnerOutput，调用方可直接处理该结果。
 
         Raises:
             RuntimeError: 上一轮 logits 尚未消费，或底层模型执行失败。
@@ -413,7 +413,8 @@ class Worker(WorkerBase):
         采样、过滤尚未完成 prefill 的请求，并回写有效生成 token。
 
         Returns:
-            ModelRunnerOutput，包含请求行映射和各请求的有效 sampled token IDs。
+            output: 同步时为包含请求行映射及有效 token IDs 的 ModelRunnerOutput；
+                异步时为 AsyncModelRunnerOutput，调用 get_output() 后得到可读的 CPU 结果。
 
         Raises:
             RuntimeError: 没有待采样状态，例如尚未 forward 或重复消费同一轮结果。
@@ -442,9 +443,9 @@ class Worker(WorkerBase):
         预热归 capture_model()，最后的普通 dummy 则为 sampler 准备输入。
 
         Returns:
-            CompilationTimes，language_model 为模型级编译统计秒数。
-            当前该统计默认 0.0，不包含本方法的总耗时、Graph 捕获时间，
-            也不自动累计局部 @torch.compile 函数的首次 JIT 时间。
+            compilation_times: CompilationTimes，language_model 为模型级编译统计秒数。
+                当前该统计默认 0.0，不包含本方法的总耗时、Graph 捕获时间，
+                也不自动累计局部 @torch.compile 函数的首次 JIT 时间。
 
         Side Effects:
             更新 Runner 的 dummy 输入和 metadata，触发内核首次初始化；启用
@@ -569,7 +570,7 @@ class Worker(WorkerBase):
         # 预热结束后冻结当前 Python GC 跟踪对象，减少常驻对象的后续循环 GC 扫描。
         # 这是进程级 GC 策略，不是冻结 CUDA Graph pool，也不是禁用未来对象的 GC。
         freeze_gc_heap()
-        # 返回配置累计的模型级编译时间；当前没有该编译链，所以默认仍为 0.0。
+        # 返回 compilation_times，language_model 取配置累计秒数；当前没有该编译链，默认 0.0。
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
         )

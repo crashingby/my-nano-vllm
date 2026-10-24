@@ -84,8 +84,8 @@ def parse_args(
         description: 当前吞吐或延迟入口在 --help 中显示的测试说明。
 
     Returns:
-        已完成配置校验的 BenchmarkConfig；不读取数据集或创建 GPU 资源。
-        ModelConfig 构造会读取本地 HF 结构配置。
+        config: 已完成配置校验的 BenchmarkConfig；不读取数据集或创建 GPU 资源。
+            ModelConfig 构造会读取本地 HF 结构配置。
     """
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--model-path", default=str(Path.home() / "models/Qwen3-0.6B"))
@@ -100,6 +100,10 @@ def parse_args(
     parser.add_argument("--seed", type=int, default=0, help="生成随机种子，不保证跨模式逐字一致。")
     parser.add_argument("--result-path", help="可选 JSON 报告路径，包含配置摘要与实际指标。")
     parser.add_argument("--enforce-eager", action="store_true", help="禁用 CUDA Graph。")
+    parser.add_argument(
+        "--async-scheduling", action=argparse.BooleanOptionalAction, default=False,
+        help="启用异步调度与在途批次队列；默认关闭，可用 --no-async-scheduling 显式关闭。",
+    )
     parser.add_argument("--max-model-len", type=int, default=4096)
     # 提高单轮预算，让 512-token 输入减少分块和首批排队，仍允许 CLI 显式覆盖。
     parser.add_argument(
@@ -125,6 +129,7 @@ def parse_args(
                 scheduler_config=SchedulerConfig(
                     max_num_seqs=args.max_active,
                     max_num_batched_tokens=args.max_num_batched_tokens,
+                    async_scheduling=args.async_scheduling,
                 ),
                 cache_config=CacheConfig(gpu_memory_utilization=args.gpu_memory_utilization),
             ),

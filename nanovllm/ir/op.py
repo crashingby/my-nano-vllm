@@ -41,7 +41,11 @@ def _validate_name(name: str, entity_type: str) -> None:
 
 
 def _get_signature(fn: Callable[..., Any], description: str) -> inspect.Signature:
-    """取得显式参数签名，拒绝当前算子协议尚未支持的可变或仅关键字参数。"""
+    """取得显式参数签名，拒绝当前算子协议尚未支持的可变或仅关键字参数。
+
+    Returns:
+        signature: 受当前 IR 协议支持的显式函数签名，不含可变或仅关键字参数。
+    """
     signature = inspect.signature(fn)  # 仅在注册时反射，在线调用不进行参数绑定。
     for parameter in signature.parameters.values():
         if parameter.kind in (
@@ -83,14 +87,26 @@ def _check_signature(
 
 
 @overload
-def register_op(f: Callable[..., Any]) -> IrOp: ...
+def register_op(f: Callable[..., Any]) -> IrOp:
+    """直接装饰 native 函数，并返回已注册的逻辑算子。
+
+    Returns:
+        op: 已注册的可调用 IrOp，保留 native 函数作为默认实现。
+    """
+    ...
 
 
 @overload
 def register_op(
     *,
     name: str | None = None,
-) -> Callable[[Callable[..., Any]], IrOp]: ...
+) -> Callable[[Callable[..., Any]], IrOp]:
+    """先配置算子名，再返回接收 native 函数的注册装饰器。
+
+    Returns:
+        decorator: 接收 native 函数并注册为 IrOp 的装饰器。
+    """
+    ...
 
 
 def register_op(
@@ -105,14 +121,20 @@ def register_op(
         name: 全局唯一算子名，省略时使用函数名。
 
     Returns:
-        可调用的 IrOp，或等待 native 函数的装饰器。
+        根据调用方式返回以下分支之一：
+            op: 直接传入 native 函数时返回注册后的 IrOp。
+            decorator: 未传 native 函数时返回等待接收函数的装饰器。
 
     Side Effects:
         成功创建后写入 IrOp.registry，并登记 native 实现。重复名称或无效签名
         在提交注册之前报错；导入与注册本身不编译 kernel 或初始化 CUDA。
     """
     def decorator(native_impl: Callable[..., Any]) -> IrOp:
-        """创建完整算子后再写入注册表，失败时保持全局表原值。"""
+        """创建完整算子后再写入注册表，失败时保持全局表原值。
+
+        Returns:
+            op: 完成校验并写入注册表的逻辑算子对象。
+        """
         op_name = native_impl.__name__ if name is None else name
         _validate_name(op_name, "op")
         if op_name in IrOp.registry:
@@ -172,7 +194,7 @@ class IrOp:
                 只检查 shape、dtype、stride 等元数据，避免在线读取设备数值。
 
         Returns:
-            将函数替换为 IrOpImpl 的装饰器；该对象可直接调用并持有原始 impl_fn。
+            decorator: 将函数替换为 IrOpImpl 的装饰器；该对象可直接调用并持有原始 impl_fn。
 
         Side Effects:
             成功后更新 impls。已设置的优先级保持原值，新 provider 需要显式选择。
@@ -182,7 +204,11 @@ class IrOp:
             raise ValueError(f"Provider {provider!r} is reserved for op {self.name!r}")
 
         def decorator(impl_fn: Callable[..., Any]) -> IrOpImpl:
-            """检查实现契约并登记，已经选定的默认策略保持原值。"""
+            """检查实现契约并登记，已经选定的默认策略保持原值。
+
+            Returns:
+                impl: 完成校验并注册的 provider 实现对象，可直接调用。
+            """
             impl = IrOpImpl(self, provider, impl_fn, supported, supports_args)
             self.impls[provider] = impl  # 构造期间完成重复、schema 与输入条件校验。
             if self._priority_impls:
@@ -199,13 +225,16 @@ class IrOp:
 
         模型构造或单算子 benchmark 可保存返回对象并直接调用。输入支持条件
         在该对象每次调用时检查，因为 packed token 数和布局可以逐轮变化。
+
+        Returns:
+            impl: 指定 provider 的实现对象，不存在或静态不可用时抛出异常。
         """
         if provider not in self.impls:
             raise ValueError(
                 f"Unknown provider {provider!r} for op {self.name!r}; "
                 f"registered providers: {list(self.impls)}"
             )
-        impl = self.impls[provider]  # 返回已有对象，不复制函数或建立另一份注册状态。
+        impl = self.impls[provider]  # 返回已注册的 impl，不复制函数或建立另一份注册状态。
         if not impl.supported:
             raise ValueError(f"Provider {provider!r} is unavailable for op {self.name!r}")
         return impl
@@ -215,6 +244,9 @@ class IrOp:
 
         优先级在启动时过滤静态不可用项；每轮只检查动态输入条件。实现执行时
         的异常交给调用方处理，输入不支持的回退发生在启动任何 kernel 之前。
+
+        Returns:
+            impl: 按当前优先级找到的首个支持本次输入的实现，必要时回退 native。
         """
         if not self._priority_impls:
             return self.impls["native"]  # 未配置优先级时提供确定的参考实现。
@@ -225,24 +257,44 @@ class IrOp:
         raise RuntimeError(f"No implementation supports the arguments for op {self.name!r}")
 
     def _inner_call(self, *args: Any, **kwargs: Any) -> Any:
-        """选择实现后调用原始函数，动态支持条件只在 dispatch 中计算一次。"""
+        """选择实现后调用原始函数，动态支持条件只在 dispatch 中计算一次。
+
+        Returns:
+            output: 选中实现的原始执行结果，不再添加包装。
+        """
         impl = self.dispatch(*args, **kwargs)
         return impl.impl_fn(*args, **kwargs)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        """通过 Python 分派执行算子，返回选定 provider 的原始结果。"""
+        """通过 Python 分派执行算子，返回选定 provider 的原始结果。
+
+        Returns:
+            output: 按当前 provider 策略执行算子得到的原始结果。
+        """
         return self._inner_call(*args, **kwargs)
 
     def __repr__(self) -> str:
-        """返回包含逻辑算子名称的简短调试表示。"""
+        """返回包含逻辑算子名称的简短调试表示。
+
+        Returns:
+            representation: 包含逻辑算子名称的简短调试字符串。
+        """
         return f"IrOp({self.name!r})"
 
     def get_priority(self) -> list[str]:
-        """返回解析后的默认 provider 顺序快照；尚未配置时返回空列表。"""
+        """返回解析后的默认 provider 顺序快照；尚未配置时返回空列表。
+
+        Returns:
+            providers: 当前默认 provider 优先级的字符串列表快照。
+        """
         return [impl.provider for impl in self._priority_impls]
 
     def _filter_priority_impls(self, priority: list[str]) -> list[IrOpImpl]:
-        """校验优先级并过滤不可用项，沿用 vLLM 自动追加 native 的回退规则。"""
+        """校验优先级并过滤不可用项，沿用 vLLM 自动追加 native 的回退规则。
+
+        Returns:
+            filtered_impls: 过滤静态不可用项并补齐 native 回退后的实现列表。
+        """
         if isinstance(priority, str):
             raise ValueError(f"Priority for op {self.name!r} must be a list of provider names")
         # 先检查所有名称，保证前面的无条件实现不会掩盖后面的配置拼写错误。
@@ -289,7 +341,11 @@ class IrOp:
             self._priority_impls = previous_impls
 
     def supported_providers(self) -> list[str]:
-        """按注册顺序列出静态可用 provider；具体输入支持范围由实现条件决定。"""
+        """按注册顺序列出静态可用 provider；具体输入支持范围由实现条件决定。
+
+        Returns:
+            providers: 按注册顺序排列的静态可用 provider 名称列表。
+        """
         return [provider for provider, impl in self.impls.items() if impl.supported]
 
 
@@ -338,17 +394,29 @@ class IrOpImpl:
 
     @property
     def supports_all_args(self) -> bool:
-        """返回实现是否无需额外输入筛选，供启动时截断无效的优先级后缀。"""
+        """返回实现是否无需额外输入筛选，供启动时截断无效的优先级后缀。
+
+        Returns:
+            supports_all_args: 实现没有额外输入筛选条件时为 True。
+        """
         return self._supports_args is None
 
     def supports_args(self, *args: Any, **kwargs: Any) -> bool:
-        """查询输入支持条件；条件函数的异常直接传播，不转化为静默回退。"""
+        """查询输入支持条件；条件函数的异常直接传播，不转化为静默回退。
+
+        Returns:
+            supports_args: 当前调用参数满足实现约束时为 True；筛选函数异常直接传播。
+        """
         if self._supports_args is None:
             return True
         return self._supports_args(*args, **kwargs)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        """强制执行当前 provider，静态不可用或输入不支持时在启动 kernel 前报错。"""
+        """强制执行当前 provider，静态不可用或输入不支持时在启动 kernel 前报错。
+
+        Returns:
+            output: 当前 provider 的原始执行结果；不支持的输入在 kernel 启动前报错。
+        """
         if not self.supported:
             raise ValueError(f"Provider {self.provider!r} is unavailable for op {self.op.name!r}")
         if not self.supports_args(*args, **kwargs):

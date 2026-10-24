@@ -125,6 +125,7 @@ class BlockTable:
             return
 
         if self.use_hybrid_blocks:
+            # 一个 manager block 展开为多个连续 kernel page，之后的行长度按 page 计。
             assert self._kernel_block_arange is not None
             block_ids = self.map_to_kernel_blocks(
                 np.asarray(block_ids),
@@ -133,7 +134,7 @@ class BlockTable:
             ).tolist()
 
         num_blocks = len(block_ids)
-        start = int(self.num_blocks_per_row[row_idx])
+        start = int(self.num_blocks_per_row[row_idx])  # 从旧有效前缀末尾追加，不覆盖已有页。
         end = start + num_blocks
         if end > self.max_num_blocks_per_req:
             raise ValueError(
@@ -141,6 +142,7 @@ class BlockTable:
                 f"{self.max_num_blocks_per_req}"
             )
 
+        # 同时更新编号和长度，后续 move/commit 才能正确解释这一行。
         self.block_table.np[row_idx, start:end] = block_ids
         self.num_blocks_per_row[row_idx] = end
 
@@ -233,12 +235,13 @@ class BlockTable:
             无返回值。有效 slot 写入 ``slot_mapping.gpu`` 前缀，固定容量后缀填为
             ``PAD_SLOT_ID``。
         """
-        num_tokens = positions.numel()
+        num_tokens = positions.numel()  # 真实 packed query 数，不包含固定缓冲区尾部。
         if num_tokens > self.max_num_batched_tokens:
             raise ValueError(
                 f"本轮有 {num_tokens} 个 token，超过 slot_mapping 容量 "
                 f"{self.max_num_batched_tokens}"
             )
+        # 每个请求需要起点，最后还需一个终点，才能在 kernel 中切出各自区间。
         if query_start_loc.numel() != num_reqs + 1:
             raise ValueError(
                 "query_start_loc 必须包含每个 request 的起点和最后一个结束位置"
@@ -248,6 +251,7 @@ class BlockTable:
                 "positions 和 query_start_loc 必须位于 BlockTable.device"
             )
 
+        # 多出的一个 program 负责把无效后缀写为 -1，避免上轮 slot 被 padding 误用。
         _compute_slot_mapping_kernel[(num_reqs + 1,)](
             num_tokens,
             self.max_num_batched_tokens,
@@ -298,8 +302,8 @@ class BlockTable:
                 ``[[0, ..., k - 1]]``，由 BlockTable 缓存。
 
         Returns:
-            展平后的 kernel page ID 数组。若输入 ``[10, 3]`` 且每个 manager block
-            包含两个 kernel page，返回 ``[20, 21, 6, 7]``。
+            kernel_block_ids: 展平后的 kernel page ID 数组。若输入 ``[10, 3]`` 且每个 manager block
+                包含两个 kernel page，返回 ``[20, 21, 6, 7]``。
         """
         if blocks_per_kv_block == 1:
             return kv_manager_block_ids
@@ -317,16 +321,24 @@ class BlockTable:
             num_reqs: 要暴露的活跃行数。
 
         Returns:
-            形状为 ``[num_reqs, max_num_blocks_per_req]`` 的 view，不复制数据。
+            block_table_tensor: 形状为 ``[num_reqs, max_num_blocks_per_req]`` 的 view，不复制数据。
         """
         return self.block_table.gpu[:num_reqs]
 
     def get_cpu_tensor(self) -> torch.Tensor:
-        """返回完整的 CPU kernel-page staging tensor。"""
+        """返回完整的 CPU kernel-page staging tensor。
+
+        Returns:
+            cpu_tensor: 完整 CPU kernel-page staging tensor，与内部 buffer 共享存储。
+        """
         return self.block_table.cpu
 
     def get_numpy_array(self) -> np.ndarray:
-        """返回用于低开销 host 行更新的 NumPy view。"""
+        """返回用于低开销 host 行更新的 NumPy view。
+
+        Returns:
+            numpy_array: CPU 页表对应的 NumPy view，可用于低开销 host 行更新。
+        """
         return self.block_table.np
 
     def _make_buffer(
@@ -341,7 +353,7 @@ class BlockTable:
             dtype: CPU 与 GPU tensor 共用的元素类型。
 
         Returns:
-            带 CPU、GPU 与 NumPy view 的可变 runtime buffer。
+            buffer: 带 CPU、GPU 与 NumPy view 的可变 runtime buffer。
         """
         return CpuGpuBuffer(
             *size,

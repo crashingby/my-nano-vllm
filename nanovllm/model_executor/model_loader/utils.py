@@ -41,7 +41,7 @@ def initialize_model(
             新式构造函数仍从 vllm_config 读取配置，调用方应保持两者一致。
 
     Returns:
-        已构造但尚未加载权重的 nn.Module；此处不调用 eval()。
+        model: 已构造但尚未加载权重的 nn.Module；此处不调用 eval()。
 
     Side Effects:
         分配模型参数，模型中的 Attention 可向当前配置注册层名。正常或异常
@@ -135,7 +135,7 @@ def device_loading_context(
         target_device: 后处理目标设备；为 CPU 时直接交付原模块。
 
     Yields:
-        同一个 module，而非深拷贝。
+        module: 同一个 module，而非深拷贝。
 
     Side Effects:
         修改参数的 data 引用。上下文主体正常结束或抛异常后，按原参数名称
@@ -177,7 +177,9 @@ def _get_model_architecture(
         model_config: 提供 hf_config.architectures 和 registry 的模型配置。
 
     Returns:
-        模型类与命中的 HF 架构名称；当前没有 Transformers 后端回退或任务转换。
+        (model_cls, arch):
+            model_cls: 具体 nn.Module 子类。
+            arch: 命中的 HF 架构名称，当前不执行后端回退或任务转换。
 
     Raises:
         ValueError: 候选架构为空或没有受支持的模型实现。
@@ -200,7 +202,9 @@ def get_model_architecture(
         model_config: 模型目录及 HF 架构配置。
 
     Returns:
-        已解析的模型类与架构名。
+        (model_cls, arch):
+            model_cls: 具体 nn.Module 子类。
+            arch: 命中的 HF 架构名称，当前不执行后端回退或任务转换。
 
     Side Effects:
         首次解析时可能导入模型模块，并写入进程内缓存；不会构造模型。
@@ -228,7 +232,7 @@ def get_model_cls(model_config: ModelConfig) -> type[nn.Module]:
         model_config: 用于架构解析的模型配置。
 
     Returns:
-        具体的 nn.Module 子类。
+        model_cls: 具体的 nn.Module 子类。
     """
     return get_model_architecture(model_config)[0]
 
@@ -240,7 +244,7 @@ def get_architecture_class_name(model_config: ModelConfig) -> str:
         model_config: 用于架构解析的模型配置。
 
     Returns:
-        例如 Qwen3ForCausalLM，而非模型目录或模块导入路径。
+        arch: 例如 Qwen3ForCausalLM，而非模型目录或模块导入路径。
     """
     return get_model_architecture(model_config)[1]
 
@@ -284,7 +288,11 @@ class ParamMapping:
             module_name: 完整模块路径，例如 model.layers.0.self_attn.qkv_proj。
 
         Returns:
-            命中时返回融合短名称和子模块名列表引用；未命中返回 None。
+            (key, value):
+                key: 命中的融合模块短名称。
+                value: 该融合模块的子模块名称列表，保留原列表引用；整体未命中时返回 None。
+
+            未命中任何融合名称时，整体返回 None。
         """
         # key/value 是融合短名称和组成列表，匹配方式沿用 vLLM 的 endswith。
         for key, value in self.packed_mapping.items():

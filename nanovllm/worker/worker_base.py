@@ -164,8 +164,8 @@ class WorkerBase:
         Wrapper，使调用方可访问原模型的 module 和参数。
 
         Returns:
-            原始 nn.Module 引用，不复制权重。跨 Worker 的模型操作可通过
-            apply_model() 在模型所在 Worker 内执行。
+            model: 原始 nn.Module 引用，不复制权重。跨 Worker 的模型操作可通过
+                apply_model() 在模型所在 Worker 内执行。
         """
         raise NotImplementedError
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
@@ -175,9 +175,9 @@ class WorkerBase:
         结合这些规格与可用显存字节数规划 KVCacheConfig，再下发给 Worker。
 
         Returns:
-            Attention layer 稳定全名到 KVCacheSpec 的映射，例如 Qwen3 的
-            "model.layers.0.self_attn.attn"。规格描述单层存储布局和页大小，
-            查询本身不分配 KV tensor，也不决定最终物理 block 数。
+            kv_cache_spec: Attention layer 稳定全名到 KVCacheSpec 的映射，例如 Qwen3 的
+                "model.layers.0.self_attn.attn"。规格描述单层存储布局和页大小，
+                查询本身不分配 KV tensor，也不决定最终物理 block 数。
         """
         raise NotImplementedError
     def apply_model(
@@ -193,7 +193,7 @@ class WorkerBase:
             fn: 接收原始 nn.Module 引用的回调，返回类型由调用方决定。
 
         Returns:
-            fn 的返回值，保留其类型与对象语义。
+            result: fn 的返回值，保留其类型与对象语义。
 
         Side Effects:
             由回调决定；fn 可以检查或修改原模型，修改直接作用于 Worker 持有
@@ -209,8 +209,8 @@ class WorkerBase:
         捕获与 sampler 预热；enforce_eager=True 时仍执行普通预热。
 
         Returns:
-            CompilationTimes，单位为秒。当前 language_model 为模型级编译统计，
-            无对应编译流程时返回 0.0，不代表本次预热或 Graph 捕获的总耗时。
+            compilation_times: CompilationTimes，单位为秒。当前 language_model 为模型级编译统计，
+                无对应编译流程时返回 0.0，不代表本次预热或 Graph 捕获的总耗时。
 
         Side Effects:
             具体实现可触发 JIT、更新固定输入缓冲区、捕获 Graph，并调整进程级
@@ -222,8 +222,8 @@ class WorkerBase:
         """从模型配置查询全局词表大小，无需先加载模型权重。
 
         Returns:
-            Hugging Face 配置中声明的正整数 vocab_size，不包含模型层为计算
-            布局额外添加的 padding，也不表示某个 TP rank 的本地词表行数。
+            vocab_size: Hugging Face 配置中声明的正整数 vocab_size，不包含模型层为计算
+                布局额外添加的 padding，也不表示某个 TP rank 的本地词表行数。
 
         Raises:
             ValueError: ModelConfig 未找到有效的正整数 vocab_size。
@@ -243,9 +243,9 @@ class WorkerBase:
                 及每请求执行 token 数。输入准备和模式分派由具体 Worker 完成。
 
         Returns:
-            ModelRunnerOutput 表示该轮已有可返回的结果，None 表示需要调用
-            sample_tokens()。当前 GPU Worker 对空调度返回空输出，对成功的
-            forward 暂存 logits 并返回 None。
+            model_output: ModelRunnerOutput 表示该轮已有可返回的结果，None 表示需要调用
+                sample_tokens()。当前 GPU Worker 对空调度返回空输出，对成功的
+                forward 暂存 logits 并返回 None。
 
         Side Effects:
             具体实现同步 Worker 请求镜像、准备模型输入并执行 forward。有 token
@@ -259,7 +259,8 @@ class WorkerBase:
         过滤未完成 prefill 的候选，并通过同步 CPU 结果返回有效 token。
 
         Returns:
-            ModelRunnerOutput，包含请求 ID、请求行映射和有效 sampled token IDs。
+            output: 同步时为包含请求 ID、行映射和有效 token IDs 的 ModelRunnerOutput；
+                异步时为 AsyncModelRunnerOutput，调用 get_output() 后取得实际结果。
 
         Raises:
             RuntimeError: 具体 GPU Worker 没有待采样状态，例如未 forward 或重复
@@ -460,7 +461,7 @@ class WorkerWrapperBase:
             attr: Wrapper 上未找到的属性名，由 Python 属性查找机制传入。
 
         Returns:
-            真实 Worker 的同名属性值或绑定方法，保持原有对象引用。
+            attr_value: 真实 Worker 的同名属性值或绑定方法，保持原有对象引用。
 
         Raises:
             AttributeError: 底层对象不存在该属性；Worker 尚未创建时，通常表现为

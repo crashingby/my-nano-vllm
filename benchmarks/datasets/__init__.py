@@ -15,6 +15,9 @@ DATASET_REGISTRY: dict[str, type[BenchmarkDataset]] = {
 def get_dataset(config: DatasetConfig) -> BenchmarkDataset:
     """选择并构造本地适配器，不读取记录、不创建 tokenizer 或 Engine。
 
+    Returns:
+        dataset: 持有指定配置的本地数据集适配器；尚未读取样本或创建 Engine。
+
     Raises:
         ValueError: 名称未注册。
         FileNotFoundError: 适配器的数据路径不存在。

@@ -42,8 +42,8 @@ class LogitsProcessor(nn.Module):
             embedding_bias: 上游保留的本 rank 词表 bias 参数，Qwen3 传 None。
 
         Returns:
-            TP rank 0 返回 [num_rows, vocab_size]；其他 rank 返回 None。
-            单卡直接返回完整 logits。保留全部输入行，不区分 prefill/decode。
+            logits: TP rank 0 返回 [num_rows, vocab_size]；其他 rank 返回 None。
+                单卡直接返回完整 logits。保留全部输入行，不区分 prefill/decode。
 
         Side Effects:
             TP 模式调用 gather 汇集词表分片；不修改 hidden states 或权重。
@@ -51,7 +51,11 @@ class LogitsProcessor(nn.Module):
         return self._get_logits(hidden_states, lm_head, embedding_bias)
 
     def _gather_logits(self, logits: torch.Tensor) -> torch.Tensor | None:
-        """按 TP rank 顺序汇集词表分片，只有 rank 0 持有完整 logits。"""
+        """按 TP rank 顺序汇集词表分片，只有 rank 0 持有完整 logits。
+
+        Returns:
+            logits: 按 TP rank 拼接的完整词表分数；非输出 rank 返回 None。
+        """
         # 当前默认进程组就是 TP 组，沿用项目现有的原生 CUDA/NCCL 通信路径。
         tp_size = dist.get_world_size()
         if tp_size == 1:
@@ -73,7 +77,11 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         embedding_bias: torch.Tensor | None,
     ) -> torch.Tensor | None:
-        """先计算本地词表分数，再汇集并返回原始词表范围。"""
+        """先计算本地词表分数，再汇集并返回原始词表范围。
+
+        Returns:
+            logits: 去除词表 padding 后的 logits；非输出 rank 为 None。
+        """
         # 上游通过 lm_head.quant_method.apply 执行；当前未引入量化方法框架，
         # 直接使用对应非量化实现的 F.linear，继续由 PyTorch 执行矩阵乘。
         logits = F.linear(hidden_states, lm_head.weight, bias=embedding_bias)

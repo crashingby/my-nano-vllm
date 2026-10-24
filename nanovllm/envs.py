@@ -24,7 +24,7 @@ def get_vllm_port() -> int | None:
     """读取通信起始端口；未设置 VLLM_PORT 时由网络工具向系统申请端口。
 
     Returns:
-        配置的整数端口，或表示未设置的 None。此处只解析配置，不绑定 socket。
+        port: 配置的整数端口，或表示未设置的 None。此处只解析配置，不绑定 socket。
 
     Raises:
         ValueError: 环境变量不能解析成整数。当前不保留上游 Kubernetes URI 诊断。
@@ -57,8 +57,8 @@ def __getattr__(name: str) -> Any:
         name: 访问的属性名，例如 VLLM_HOST_IP，由 Python 属性查找机制传入。
 
     Returns:
-        对应读取函数的结果；当前为字符串、整数或 None。每次访问重新读取，
-        不将结果写入模块属性，因此后续环境变量变化仍然可见。
+        env_value: 对应读取函数的结果；当前为字符串、整数或 None。每次访问重新读取，
+            不将结果写入模块属性，因此后续环境变量变化仍然可见。
 
     Raises:
         AttributeError: 属性没有登记；不将未知配置误当成空值。

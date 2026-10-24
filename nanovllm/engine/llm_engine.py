@@ -1,6 +1,6 @@
-"""nano-vLLM 的同步 Engine。
+"""nano-vLLM 的单进程连续批处理 Engine。
 
-LLMEngine 是当前单进程、同步执行 MVP 中的中心编排层：
+LLMEngine 编排同步或异步调度，并通过初始化时绑定的 step_fn 统一驱动：
 
 1. 接收用户 prompt 并构造 Request。
 2. 调用 Scheduler 形成一次连续批处理的 SchedulerOutput。
@@ -53,7 +53,7 @@ logger = init_logger(__name__)
 
 
 class LLMEngine:
-    """同步连续批处理 Engine。
+    """支持同步与异步调度的连续批处理 Engine，generate() 阻塞至请求完成。
 
     Attributes:
         vllm_config: 调用方传入的完整配置引用；初始化时回写 EOS、物理 KV block
@@ -63,13 +63,16 @@ class LLMEngine:
         available_gpu_memory_for_kv_cache: profiling 得到的 KV 字节预算，测量前为 -1。
         request_block_hasher: 所有 Request 共享的完整逻辑 block 哈希构造函数。
         scheduler: 请求队列、调度决策和 Scheduler 侧 KV block 元数据的所有者。
+        batch_queue: 异步模式保存结果 Future 与原始计划的 FIFO 队列，同步时为 None。
+        step_fn: 初始化时选定的单步入口，绑定同步 step 或 step_with_batch_queue；
+            返回增量输出与本次新提交的 token 数，调用方无需再次判断模式。
         _request_id_counter: 自动生成 request ID 的单调递增计数器。
         _is_closed: 关闭入口已经开始执行的标记，用于拒绝新请求和重复关闭。
     """
     def __init__(self, vllm_config: NanovllmConfig) -> None:
         """使用完整配置创建 tokenizer、执行端、正式 KV cache 和 Scheduler。
 
-        当前保留单个 LLMEngine 编排同步推理。执行端启动和 KV 初始化顺序参考
+        当前由单个 LLMEngine 编排推理。执行端启动和 KV 初始化顺序参考
         vLLM EngineCore：Executor 构造负责加载权重，显存测量与 KV 规划随后进行，
         正式 KV 初始化和预热结束后，Scheduler 才能使用确定的物理 block 容量。
 
@@ -144,6 +147,11 @@ class LLMEngine:
         if self.batch_queue_size > 1:
             self.batch_queue = deque(maxlen=self.batch_queue_size)
 
+        # 沿用 vLLM：两种执行路径保持并列，只在初始化时按是否启用队列选择入口。
+        self.step_fn: Callable[[], tuple[dict[int, EngineCoreOutputs], int]] = (
+            self.step if self.batch_queue is None else self.step_with_batch_queue
+        )
+
         # 自动 ID 只需在当前 Engine 内唯一；调用者也可显式传入 request_id。
         self._request_id_counter = count()
         # close() 必须幂等，因为它既可能被用户调用，也会被 atexit 调用。
@@ -165,8 +173,8 @@ class LLMEngine:
             vllm_config: 当前完整配置，提供模型长度、KV 策略和可选 block 数覆盖值。
 
         Returns:
-            Scheduler 与唯一 Worker 共同使用的 KVCacheConfig。num_blocks 包含
-            保留空块 0，请求可分配 block 数为 num_blocks - 1。
+            scheduler_kv_cache_config: Scheduler 与唯一 Worker 共同使用的 KVCacheConfig。num_blocks 包含
+                保留空块 0，请求可分配 block 数为 num_blocks - 1。
 
         Side Effects:
             更新 available_gpu_memory_for_kv_cache、cache_config.num_gpu_blocks
@@ -212,7 +220,7 @@ class LLMEngine:
         """等待在途结果，结束剩余请求，再关闭执行端和进程级资源。
 
         用户调用和 atexit 回调共享该入口。关闭期间只回收已经提交的 Future，
-        不再调用 step() 提交新批次，也不向调用方交付生成结果。所有在途结果
+        不再调用 step_fn() 提交新批次，也不向调用方交付生成结果。所有在途结果
         处理完后，释放 Scheduler 请求，再清理 Worker、进程组和空闲设备缓存。
 
         Raises:
@@ -221,13 +229,13 @@ class LLMEngine:
 
         Side Effects:
             标记 Engine 已关闭，注销 atexit 回调，排空在途队列并取消剩余请求，
-            重置全局分布式状态。调用方应在 step() 返回后调用；重复关闭不再执行
+            重置全局分布式状态。调用方应在 step_fn() 返回后调用；重复关闭不再执行
             清理，仍被外部引用的 tensor 不会因清空 allocator 缓存而释放。
         """
         # 显式调用与退出回调可能重复进入；关闭流程只执行一次。
         if self._is_closed:
             return
-        # 先阻止后续请求和 step()，即使下游清理报错，也不能继续复用部分关闭的执行端。
+        # 先阻止后续请求和两种单步入口，即使下游清理报错，也不能继续复用部分关闭的执行端。
         self._is_closed = True
         # 注册的 bound method 会持有 self；显式关闭时解除该引用，允许随后删除 Engine。
         atexit.unregister(self.close)
@@ -257,7 +265,7 @@ class LLMEngine:
         """生成当前 Engine 内尚未使用的自动 request ID。
 
         Returns:
-            格式为 ``request-N`` 的唯一请求 ID。
+            request_id: 格式为 ``request-N`` 的唯一请求 ID。
         """
         while True:
             request_id = f"request-{next(self._request_id_counter)}"
@@ -300,7 +308,7 @@ class LLMEngine:
             priority: 预留给未来优先级调度的排序键；当前 Scheduler 仍采用 FCFS。
 
         Returns:
-            最终注册到 Scheduler 的 request ID。
+            request_id: 最终注册到 Scheduler 的 request ID。
 
         Raises:
             RuntimeError: Engine 已关闭时抛出。
@@ -343,7 +351,7 @@ class LLMEngine:
             request_id: 要取消的请求 ID。
 
         Returns:
-            找到并取消活跃请求时返回 ``True``；请求不存在或已结束时返回 ``False``.
+            aborted: 找到并取消活跃请求时返回 ``True``；请求不存在或已结束时返回 ``False``.
         """
         request = self.scheduler.requests.get(request_id)
         if request is None or request.is_finished():
@@ -360,11 +368,17 @@ class LLMEngine:
 
         执行顺序对应 vLLM EngineCore.step()，省略结构化输出和异步取消队列。
         请求进度、前缀缓存、停止判断及资源回收均由 Scheduler 和 Manager 维护。
+        本方法只实现同步路径；通用驱动循环应调用初始化时绑定的 step_fn。
 
         Returns:
-            第一个元素按 client_index 分组，每条输出只包含本轮新增 token。
-            第二个元素是实际调度 token 数，供 benchmark 累计计算工作量。
-            空闲时返回 ({}, 0)；零 token 清理批次仍会被送到 Worker。
+            (engine_core_outputs, num_scheduled_tokens):
+                engine_core_outputs: 按 client_index 分组的本轮真实增量，每条仅包含新接受的 token。
+                num_scheduled_tokens: 本轮计划的 total_num_scheduled_tokens，统计实际输入计算量；空闲时为 0。
+
+            空闲时返回 ({}, 0)；零 token 清理计划仍会送到 Worker。
+
+        Raises:
+            RuntimeError: Engine 已开始关闭，不能再安排或回收单步工作。
 
         Side Effects:
             调度时推进已承诺执行的进度，执行和采样后更新请求状态及完成通知。
@@ -372,15 +386,12 @@ class LLMEngine:
         """
         if self._is_closed:
             raise RuntimeError("Cannot step a closed LLMEngine")
-        # 目前暂时用这个方式使用batch_queue()分支
-        if self.batch_queue is not None:
-            return self.step_with_batch_queue()
         if not self.scheduler.has_requests():
             return {}, 0
 
         scheduler_output = self.scheduler.schedule()  # 已保存 forward 之前的输入快照。
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
-        model_output = future.result()  # 同步消费本批结果，下一阶段再加入在途队列。
+        model_output = future.result()  # model_output 是 UniProc forward 的返回值，通常为 None。
         if model_output is None:
             model_output = self.model_executor.sample_tokens()  # 消费当前 forward 的 logits。
         engine_core_outputs = self.scheduler.update_from_output(
@@ -395,21 +406,30 @@ class LLMEngine:
 
         每次调用最多提交一个批次。队列尚未填满时优先继续提交；
         队列达到容量或没有新的调度工作时，等待最旧批次并更新 Scheduler。
+        异步模式初始化时将 step_fn 直接绑定到本方法，不经过同步 step。
 
         Returns:
-            第一个元素是本次回收结果产生的增量输出，尚未回收时为空字典。
-            第二个元素是本次新提交的 token 数，纯回收调用返回零。
+            (engine_core_outputs, num_scheduled_tokens):
+                engine_core_outputs: 本次回收的旧批次增量；仅提交、尚未回收时为空字典。
+                num_scheduled_tokens: 本次新提交批次的输入计算量；纯回收时为 0，可能与输出属于不同批次。
+
+        Raises:
+            RuntimeError: Engine 已开始关闭，不能再安排或回收单步工作。
+            AssertionError: 未启用批次队列，或进入时队列没有预留提交空位。
 
         Side Effects:
             提交 forward 和 sampling，维护在途队列，并在结果回收后更新
             Scheduler。每批 forward 返回后的临时 logits 都会立即交给采样。
         """
+        # step_fn 可直接进入队列路径，关闭检查必须由本入口独立完成。
+        if self._is_closed:
+            raise RuntimeError("Cannot step a closed LLMEngine")
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
         # 本方法返回前始终保留至少一个空位，防止有界 deque 覆盖旧结果。
         assert len(batch_queue) < self.batch_queue_size
-        # 返回值统计本次提交量，与本次回收的是哪一批结果分开。
+        # num_scheduled_tokens 统计本次提交量，与回收旧批次的 engine_core_outputs 分开。
         num_scheduled_tokens = 0
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
@@ -458,12 +478,19 @@ class LLMEngine:
         return engine_core_outputs, num_scheduled_tokens
 
     def has_requests(self) -> bool:
-        """判断是否还有调度、结果回收或 Worker 清理工作。"""
+        """判断是否还有调度、结果回收或 Worker 清理工作。
+
+        Returns:
+            has_requests: 仍有活跃请求、Worker 清理通知或在途结果时为 True。
+        """
         return self.scheduler.has_requests() or bool(self.batch_queue)
     def is_finished(self) -> bool:
         """判断用户请求和在途结果是否均已结束。
 
         Worker 完成通知仍由 has_requests() 判断，保持原有清理语义。
+
+        Returns:
+            is_finished: Scheduler 已无活跃请求且 Engine 在途队列为空时为 True；不包含待下发清理通知。
         """
         return self.scheduler.is_finish() and not self.batch_queue
 
@@ -486,15 +513,15 @@ class LLMEngine:
             use_tqdm: 是否显示进度条。
 
         Returns:
-            与输入 prompts 顺序一致的结果列表；每项包含 ``text`` 和 ``token_ids``。
-            文本解码跳过特殊 token，token_ids 保留真实采样结果。
+            outputs: 与输入 prompts 顺序一致的结果列表；每项包含 ``text`` 和 ``token_ids``。
+                文本解码跳过特殊 token，token_ids 保留真实采样结果。
 
         Raises:
             RuntimeError: Engine 已关闭时抛出。
             ValueError: sampling_params 列表长度与 prompts 不匹配，或 prompt 长度无效。
 
         Side Effects:
-            注册请求并多次调用 step()，更新 KV cache 和请求状态。整批结束后，
+            注册请求并多次调用 step_fn()，更新 KV cache 和请求状态。整批结束后，
             若 Engine 已无其他活跃请求，再发送一次零 token 调度清理 Worker 镜像。
         """
         if self._is_closed:
@@ -536,7 +563,7 @@ class LLMEngine:
         try:
             while len(finished_request_ids) < len(request_ids):
                 step_start_time = perf_counter()
-                engine_core_outputs, num_scheduled_tokens = self.step()
+                engine_core_outputs, num_scheduled_tokens = self.step_fn()
                 step_elapsed = perf_counter() - step_start_time
                 # 展示本轮 packed token 吞吐；零 token 清理轮与零时间间隔不计算速率。
                 if num_scheduled_tokens > 0 and step_elapsed > 0:
@@ -564,11 +591,11 @@ class LLMEngine:
                             progress_bar.update(1)
 
             # 最后一批请求结束后不会自然出现下一轮 forward，显式送达剩余清理通知。
-            # 仍有其他活跃请求时，由后续正常 step() 一并处理，不额外推进它们的生成。
+            # 仍有其他活跃请求时，由后续 step_fn() 一并处理，不额外推进它们的生成。
             if self.scheduler.is_finish():
                 # 所有逻辑请求均已结束，排空迟到结果和 Worker 清理批次。
                 while self.has_requests():
-                    self.step()
+                    self.step_fn()
         finally:
             progress_bar.close()
         return [

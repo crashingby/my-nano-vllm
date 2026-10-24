@@ -15,7 +15,11 @@ class AlpacaDataset(BenchmarkDataset):
     )
 
     def load_data(self) -> Iterator[DatasetSample]:
-        """按源文件顺序组织 instruction 和可选 input，保留可定位的记录 ID。"""
+        """按源文件顺序组织 instruction 和可选 input，保留可定位的记录 ID。
+
+        Yields:
+            sample: 由 instruction 和可选 input 构造的 DatasetSample，保留源记录 ID。
+        """
         if self.config.subset is not None:
             raise ValueError("AlpacaDataset does not support --dataset-subset")
         if not self.dataset_path.is_file() or self.dataset_path.suffix != ".parquet":

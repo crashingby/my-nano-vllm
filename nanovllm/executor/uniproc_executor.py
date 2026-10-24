@@ -29,20 +29,47 @@ from nanovllm.outputs import ModelRunnerOutput,AsyncModelRunnerOutput
 logger = init_logger(__name__)
 
 class AsyncOutputFuture(Future):
+    """在调用 result() 时回收设备输出，并缓存结果或异常。
+
+    该 Future 不启动线程，也不会因为 GPU 自行完成就变为 done。首次 result()
+    主动调用异步输出的 get_output()，等待 D2H 完成；后续调用复用已保存结果。
+    """
+
     def __init__(self, async_output: AsyncModelRunnerOutput, single_value: bool):
+        """持有尚未回收的输出包装器和公共 RPC 的返回形状约定。
+
+        Args:
+            async_output: 保持设备结果、CPU 拷贝和完成事件存活的输出对象。
+            single_value: 为 True 时 result() 返回单个输出，否则返回单元素列表。
+        """
+        # 持有包装器直到回收，不能只保存一个可能尚未完成的 CPU tensor。
         self.async_output = async_output
         self.single_value = single_value
         super().__init__()
 
     def result(self, timeout=None):
+        """首次等待设备结果，随后返回缓存或重新抛出异常。
+
+        Args:
+            timeout: 当前仅接受 None；事件回收不支持按秒中断等待。
+
+        Returns:
+            model_output: 单个 ModelRunnerOutput，或包含它的单元素列表。
+
+        Side Effects:
+            首次调用会阻塞到输出可读，并将结果或异常写入当前 Future。
+            调用方应串行消费；这里没有为并发 get_output() 添加额外锁。
+        """
         if timeout is not None:
             raise RuntimeError("timeout not implemented")
 
+        # GPU 完成不改变 Future 状态，只有显式回收才会执行 set_result。
         if not super().done():
             try:
                 output = self.async_output.get_output()
                 self.set_result(output if self.single_value else [output])
             except Exception as e:
+                # 缓存同一个异常，重复 result() 不会再次读取一次性设备输出。
                 self.set_exception(e)
         return super().result()
 
@@ -121,7 +148,7 @@ class UniProcExecutor(Executor):
         该网络工具会读取 VLLM_PORT；本静态方法固定在 127.0.0.1 上申请系统端口。
 
         Returns:
-            操作系统实际分配的端口号，调用结束时探测 socket 已关闭。
+            port: 操作系统实际分配的端口号，调用结束时探测 socket 已关闭。
 
         Side Effects:
             临时创建、绑定并关闭 TCP socket，不持有端口租约。关闭到真正创建
@@ -130,7 +157,7 @@ class UniProcExecutor(Executor):
         # socket_fd 绑定 port=0，让操作系统分配空闲端口，with 退出时立即关闭。
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as socket_fd:
             socket_fd.bind(("127.0.0.1", 0))
-            # getsockname() 返回实际监听地址，第二项是系统选择的端口。
+            # getsockname() 返回实际绑定的 (address, port)，本方法取整数 port。
             return int(socket_fd.getsockname()[1])
 
     def _distributed_args(self) -> tuple[str, int, int]:
@@ -141,9 +168,10 @@ class UniProcExecutor(Executor):
         方括号，设备编号的解析只使用已由 DeviceConfig 规范化的 torch.device。
 
         Returns:
-            (distributed_init_method, 0, local_rank)。配置 cuda 时 local_rank=0，
-            配置 cuda:1 时 local_rank=1；这是当前进程可见的设备编号，受
-            CUDA_VISIBLE_DEVICES 映射影响，不改变单 Worker 的全局 rank。
+            (distributed_init_method, rank, local_rank):
+                distributed_init_method: 进程组初始化的 TCP 会合 URI。
+                rank: 当前唯一 Worker 的全局 rank，固定为 0。
+                local_rank: 进程可见的 CUDA device index；cuda 对应 0，cuda:1 对应 1，不改变全局 rank。
 
         Side Effects:
             网络工具可能短暂创建探测 socket，但不初始化 CUDA、创建 process group
@@ -185,9 +213,9 @@ class UniProcExecutor(Executor):
                 即使 Worker 返回 None，也分别保持 None 与 [None] 的区别。
 
         Returns:
-            同步为 result 或 [result]；Future 形式的 result() 返回同样的值。
-            普通 KV 查询默认保留列表；执行与采样入口显式 single_value=True，
-            直接向调用方返回单个结果或单结果 Future。
+            根据调用方式返回以下分支之一：
+                result: non_block=False 时的单值或 rank 结果列表，由 single_value 决定。
+                future: non_block=True 时的 Future，其 result() 返回相同的单值或列表。
 
         Raises:
             NotImplementedError: 同步调用时找不到目标方法，由 run_method 抛出。
@@ -239,9 +267,9 @@ class UniProcExecutor(Executor):
             non_block: 是否以单结果 Future 交付返回值，执行本身仍在当前线程调用。
 
         Returns:
-            当前 GPU Worker 对空调度返回空 ModelRunnerOutput，对成功 forward
-            返回 None。non_block=True 时将相同的值保存在 Future 中，不增加
-            rank 列表这一层包装。
+            output: 当前 GPU Worker 对空调度返回空 ModelRunnerOutput，对成功 forward
+                返回 None。non_block=True 时将相同的值保存在 Future 中，不增加
+                rank 列表这一层包装。
 
         Raises:
             Exception: 同步执行错误直接传播；若 Future 已完成且失败，本方法也
@@ -278,8 +306,8 @@ class UniProcExecutor(Executor):
                 延后等待 D2H；Worker 的 Python 调用仍在本线程完成。
 
         Returns:
-            ModelRunnerOutput，或 result() 为该对象的 Future。输出包含请求 ID、
-            请求行映射和有效 token 列表，未完成 prefill 的请求行为 []。
+            output: ModelRunnerOutput，或 result() 为该对象的 Future。输出包含请求 ID、
+                请求行映射和有效 token 列表，未完成 prefill 的请求行为 []。
 
         Raises:
             RuntimeError: 同步调用时没有待采样状态，由 GPU Worker / Runner 抛出。
@@ -322,5 +350,8 @@ class UniProcExecutor(Executor):
 
         Worker 在本线程提交 forward 和 sampling，AsyncOutputFuture 延后等待
         D2H；Runner 通过 GPU token 回填准备下一轮输入，无需先取得 CPU token。
+
+        Returns:
+            supports_async_scheduling: 当前 UniProc 支持延后回收设备输出，固定为 True；不表示存在后台线程。
         """
         return True

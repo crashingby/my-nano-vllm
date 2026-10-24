@@ -89,7 +89,7 @@ class ModelConfig:
         """返回模型架构注册表，不导入或构造具体模型。
 
         Returns:
-            与 vLLM 一样返回进程内 ModelRegistry 实例；当前只登记 Qwen3。
+            registry: 与 vLLM 一样返回进程内 ModelRegistry 实例；当前只登记 Qwen3。
         """
         # 延迟导入避免配置模块和模型选择工具之间形成初始化循环。
         from nanovllm.model_executor.models import ModelRegistry
@@ -100,7 +100,7 @@ class ModelConfig:
         """返回模型词表大小。
 
         Returns:
-            Hugging Face 配置中声明的全局 token 词表大小。
+            vocab_size: Hugging Face 配置中声明的全局 token 词表大小。
 
         Raises:
             ValueError: 当前模型配置没有有效的正整数 ``vocab_size`` 时抛出。
@@ -123,7 +123,7 @@ class ModelConfig:
             parallel_config: 当前模型并行配置，提供 tensor_parallel_size。
 
         Returns:
-            单个 rank 负责的 Query head 数，不是 KV head 数。
+            num_attention_heads: 单个 rank 负责的 Query head 数，不是 KV head 数。
         """
         # 这里只读取结构并计算分片数量，执行器支持范围由 Executor.get_class() 检查。
         num_heads = self.hf_config.num_attention_heads
@@ -154,7 +154,7 @@ def _get_and_verify_dtype(
         dtype: 用户指定的精度字符串或 torch.dtype。
 
     Returns:
-        模型参数、Runner 和 auto KV cache 共同使用的 torch.dtype。
+        torch_dtype: 模型参数、Runner 和 auto KV cache 共同使用的 torch.dtype。
 
     Raises:
         ValueError: 精度名称未知，或解析结果不是当前支持的浮点类型。

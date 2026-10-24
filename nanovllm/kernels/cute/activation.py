@@ -22,7 +22,19 @@ def silu_and_mul_kernel(
     rows_per_block: cutlass.Constexpr[int],
     elements_per_thread: cutlass.Constexpr[int],
 ) -> None:
-    """由连续输入 [T, 2H] 写入独立输出 [T, H]，中间计算保持 FP32。"""
+    """由连续输入 [T, 2H] 写入独立输出 [T, H]，中间计算保持 FP32。
+
+    Args:
+        x: 展平的 gate/up 输入，类型与布局由 DLPack 推导。
+        output: 展平的独立输出，不与输入重叠。
+        num_tokens: 输入行数 T，行索引使用 64 位避免大 tensor 地址溢出。
+        hidden_size: 每个 gate/up 分片的列数 H，编译期常量。
+        rows_per_block: 每 CTA 的行数，也是 warp 数；每 warp 处理一行。
+        elements_per_thread: 每 lane 连续处理的元素数，影响向量访存和列循环步长。
+
+    Side Effects:
+        按网格步长循环写满输出，列尾不能整除时使用 mask，不读取 CPU 数值。
+    """
     thread_id, _, _ = cute.arch.thread_idx()
     block_id, _, _ = cute.arch.block_idx()
     num_blocks, _, _ = cute.arch.grid_dim()
@@ -69,7 +81,21 @@ def _get_autotuned_silu_and_mul(
     hidden_size: int,
     input_alignment: int,
 ) -> Callable[..., None]:
-    """缓存元数据特化的调优入口；官方装饰器按 token 数缓存最佳配置。"""
+    """创建并缓存元数据特化的调优入口，由官方装饰器按 token 数选择配置。
+
+    Args:
+        device_index: CUDA 设备编号，决定 SM 数与持久网格上限。
+        dtype: 输入精度，用元素字节数换算候选向量宽度。
+        hidden_size: 每行输出列数，闭包中的编译期常量。
+        input_alignment: 输入指针对齐字节数；参与外层缓存键，避免复用不兼容特化。
+
+    Returns:
+        launch: 持有最佳 kernel 缓存的 autotune_jit 入口；仅创建入口还没有测量某个 T。
+
+    Side Effects:
+        外层 lru_cache 保存入口，首次调用不能处于 Graph 捕获中。
+        实际计时、候选编译和最佳配置缓存由返回入口首次处理该 T 时完成。
+    """
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
             "CuTe SiluAndMul must be autotuned before CUDA Graph capture; run eager warmup first"
@@ -77,6 +103,7 @@ def _get_autotuned_silu_and_mul(
     elements_per_128_bits = 16 // dtype.itemsize  # 候选元素数直接由 PyTorch dtype 换算。
     max_blocks = current_platform.num_compute_units(device_index) * 4  # 保留四倍 SM 上限。
 
+    # 外层缓存隔离设备/精度/H/对齐，内层只需按 T 保存最佳 CTA 和向量宽度。
     @autotune_jit(
         params_dict={
             "rows_per_block": [1, 2, 4, 8],
@@ -98,7 +125,20 @@ def _get_autotuned_silu_and_mul(
         rows_per_block: cutlass.Constexpr[int] = 4,
         elements_per_thread: cutlass.Constexpr[int] = elements_per_128_bits,
     ) -> None:
-        """接收 DLPack 推导类型和布局的 Tensor，按候选配置发射 kernel。"""
+        """按候选 CTA 形状发射持久网格，后续行由 kernel 内部循环领取。
+
+        Args:
+            x: DLPack 视图，类型、对齐和布局由编译器特化。
+            output: 独立输出视图。
+            num_tokens: 本次输入行数，也是调优缓存变化键。
+            stream: 发射 CUDA 工作的流句柄。
+            rows_per_block: 每 CTA 的 warp/行数，调优器枚举该参数。
+            elements_per_thread: 每 lane 连续元素数，调优器枚举该参数。
+
+        Side Effects:
+            在给定流提交 kernel；网格最多使用四倍 SM 数的 CTA，不在此等待完成。
+        """
+        # 小 T 只启动覆盖所需行的 CTA，大 T 由 kernel 的行步进循环消化。
         num_blocks = (num_tokens + rows_per_block - 1) // rows_per_block
         if num_blocks > max_blocks:
             num_blocks = cutlass.Int64(max_blocks)
@@ -114,7 +154,11 @@ def _get_autotuned_silu_and_mul(
 
 
 def _supports_silu_and_mul(x: torch.Tensor) -> bool:
-    """只接受连续 CUDA 浮点输入，最后一维必须包含两个非空、等长分片。"""
+    """只接受连续 CUDA 浮点输入，最后一维必须包含两个非空、等长分片。
+
+    Returns:
+        is_supported: 输入满足 CUDA、浮点精度、连续布局和最后一维非空等长分片约束时为 True。
+    """
     return (
         x.is_cuda
         and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
@@ -131,6 +175,9 @@ def silu_and_mul_cutedsl(x: torch.Tensor) -> torch.Tensor:
 
     Args:
         x: 连续 CUDA FP16/BF16/FP32 Tensor，形状为 [..., 2H]，H 为正整数。
+
+    Returns:
+        output: 独立的 [..., H] 输出，与输入同设备、同精度；输入保持原值。
 
     Side Effects:
         首次编译和冷 L2 调优需在 Graph 捕获前预热；后续使用当前 stream。

@@ -25,7 +25,7 @@ def _natural_sort_key(filepath: str) -> list[str | int]:
         filepath: checkpoint 文件路径。
 
     Returns:
-        交替包含文本和整数的排序键，忽略父目录。
+        sort_key: 交替包含文本和整数的排序键，忽略父目录。
     """
     # s 是文件名按数字边界拆出的片段；数字转整数以避免纯字符串排序。
     return [
@@ -45,7 +45,7 @@ def filter_duplicate_safetensors_files(
         index_file: 索引文件名，通常是 model.safetensors.index.json。
 
     Returns:
-        索引引用的候选文件；不存在索引时原样返回输入列表。
+        hf_weights_files: 索引引用的候选文件；不存在索引时原样返回输入列表。
 
     Raises:
         FileNotFoundError: 索引存在，但引用的某个权重分片不在本地。
@@ -79,7 +79,7 @@ def enable_tqdm(use_tqdm_on_load: bool) -> bool:
         use_tqdm_on_load: LoadConfig 中的文件加载进度开关。
 
     Returns:
-        当前进程是否应输出进度条；不会初始化 distributed。
+        show_progress: 当前进程是否应输出进度条；不会初始化 distributed。
     """
     return use_tqdm_on_load and (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
@@ -97,7 +97,9 @@ def safetensors_weights_iterator(
         use_tqdm_on_load: 是否显示文件级加载进度。
 
     Yields:
-        (原始 checkpoint 权重名称, CPU tensor)。设备搬运及 TP 切片由参数加载器负责。
+        (name, param):
+            name: checkpoint 中的原始权重名称。
+            param: 该权重的 CPU tensor；设备搬运与 TP 切片由后续参数加载器负责。
 
     Side Effects:
         每次打开一个文件并在遍历结束或生成器关闭时释放对应文件上下文。

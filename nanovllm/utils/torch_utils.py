@@ -67,9 +67,9 @@ def current_stream() -> torch.cuda.Stream:
     当前只支持 CUDA，省略 ROCm、CPU 占位对象及其他平台的查询分支。
 
     Returns:
-        本线程缓存的 Stream 原对象。若已通过 torch.cuda.set_stream 或
-        torch.cuda.stream 选择了 stream，直接返回该对象；否则懒创建一个
-        当前设备上的非默认 stream，将它设为当前 stream 后返回。
+        stream: 本线程缓存的 Stream 原对象。若已通过 torch.cuda.set_stream 或
+            torch.cuda.stream 选择了 stream，直接返回该对象；否则懒创建一个
+            当前设备上的非默认 stream，将它设为当前 stream 后返回。
 
     Side Effects:
         首次未缓存时分配 stream 并改变当前 stream，不能当作纯查询接口。
@@ -96,8 +96,8 @@ def weak_ref_tensor(tensor: Any) -> Any:
         tensor: 原始 Tensor，或需要原样透传的其他对象。
 
     Returns:
-        与输入共享数据地址、shape、stride、dtype 和 device 的新 Tensor。
-        不复制数据，也不持有原始 Tensor 或其 storage 的强引用。
+        weak_tensor: 与输入共享数据地址、shape、stride、dtype 和 device 的新 Tensor。
+            不复制数据，也不持有原始 Tensor 或其 storage 的强引用。
 
     Notes:
         该别名自身不能保活原始分配；调用方必须保证数据地址仍然有效。
@@ -122,8 +122,8 @@ def weak_ref_tensors(
             容器中的非 Tensor 项原样透传，不递归处理嵌套容器。
 
     Returns:
-        单个 Tensor 的非 owning 别名，或保持 list/tuple 类型的新容器。
-        输入容器不被修改；各 Tensor 的数据不复制。
+        weak_tensors: 单个 Tensor 的非 owning 别名，或保持 list/tuple 类型的新容器。
+            输入容器不被修改；各 Tensor 的数据不复制。
 
     Raises:
         ValueError: 顶层类型不属于 Tensor、list 或 tuple。

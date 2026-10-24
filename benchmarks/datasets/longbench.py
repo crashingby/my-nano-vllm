@@ -18,7 +18,11 @@ class LongBenchDataset(BenchmarkDataset):
     DEFAULT_DATASET_PATH = Path.home() / "datasets/LongBench/data"
 
     def _get_files(self) -> list[Path]:
-        """解析输入文件，目录模式默认只选原版子集，避免混入重叠的 LongBench-E。"""
+        """解析输入文件，目录模式默认只选原版子集，避免混入重叠的 LongBench-E。
+
+        Returns:
+            files: 本轮需要读取的本地数据文件路径列表，按确定顺序排列。
+        """
         path = self.dataset_path
         if path.is_file():
             if path.suffix != ".jsonl":
@@ -45,7 +49,11 @@ class LongBenchDataset(BenchmarkDataset):
 
     @staticmethod
     def _build_prompt(record: dict[str, Any], sample_id: str) -> str:
-        """组合 context 和任务，不读取 answers，避免把参考答案泄漏到输入。"""
+        """组合 context 和任务，不读取 answers，避免把参考答案泄漏到输入。
+
+        Returns:
+            prompt: 由 context 和任务指令组成的用户输入文本，不包含参考答案。
+        """
         context = record.get("context")
         task_input = record.get("input")
         if not isinstance(context, str) or not context.strip():
@@ -60,7 +68,11 @@ class LongBenchDataset(BenchmarkDataset):
         return f"Summarize the main points of the following text:\n\n{context.strip()}\n\nSummary:"
 
     def load_data(self) -> Iterator[DatasetSample]:
-        """按文件名及文件内顺序逐条读取，sample_id 保留子集名和记录下标。"""
+        """按文件名及文件内顺序逐条读取，sample_id 保留子集名和记录下标。
+
+        Yields:
+            sample: 带用户文本与可定位 sample_id 的 DatasetSample，按文件及记录顺序产出。
+        """
         for path in self._get_files():
             for index, record in enumerate(iter_jsonl(path)):
                 sample_id = f"{path.stem}:{index}"

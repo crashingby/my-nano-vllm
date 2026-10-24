@@ -77,8 +77,8 @@ class VocabParallelEmbedding(nn.Module):
             input_: token ID tensor，普通 packed 输入为 [num_tokens]。
 
         Returns:
-            input_.shape + [embedding_dim] 的 embedding。每个 TP rank 都获得
-            相同的完整结果，例如输入 [4] 返回 [4, embedding_dim]。
+            output_parallel: input_.shape + [embedding_dim] 的 embedding。每个 TP rank 都获得
+                相同的完整结果，例如输入 [4] 返回 [4, embedding_dim]。
 
         Side Effects:
             TP size > 1 时执行 all_reduce；不修改输入 ID 或模型权重。

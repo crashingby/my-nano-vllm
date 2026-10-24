@@ -162,7 +162,7 @@ def shutdown(self) -> None:
 
 **状态变化：** 调用 Wrapper 的 `shutdown()`，由已创建的 GPU Worker 恢复 Python GC 扫描范围，并委托 Runner 清理模型执行资源。Wrapper 中真实 Worker 尚为 None 时，该委托可以直接结束。执行器保留 `driver_worker` 引用，重复调用的处理由下游决定。
 
-**调用时机：** 停止提交模型任务、当前同步 step 返回后，由 `LLMEngine.close()` 调用；Worker 初始化异常的处理路径也会调用它。正常退出时，Engine 随后调用 `cleanup_dist_env_and_memory()` 收尾进程级通信状态。
+**调用时机：** 停止提交模型任务、当前 `step_fn()` 返回后，由 `LLMEngine.close()` 先回收在途 Future，再调用本方法；Worker 初始化异常的处理路径也会调用它。正常退出时，Engine 随后调用 `cleanup_dist_env_and_memory()` 收尾进程级通信状态。
 
 本方法负责执行端的关闭委托。张量存储的实际回收还取决于其他引用和 allocator；启动失败时的额外分布式清理由 `_init_executor()` 组织。
 

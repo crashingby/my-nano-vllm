@@ -1,7 +1,7 @@
-"""闭环回放本地同步 Engine，测量 TTFT、TPOT、ITL 和输出 TPS。
+"""闭环回放本地 Engine，测量同步或异步调度的 TTFT、TPOT、ITL 和输出 TPS。
 
 当前 Engine 返回每轮增量 token 和完成标记。本脚本保留活跃 Request 引用，
-每轮 step() 返回后观察实际输出长度的增长，完成请求即使已从 Scheduler 移除，
+每轮 step_fn() 返回后观察实际输出长度的增长，完成请求即使已从 Scheduler 移除，
 也能记录最后一个 token。测量包含 Engine 排队、执行和结果提交的本地耗时。
 """
 
@@ -42,6 +42,9 @@ def _submit_requests(
 
     arrival_time 在 add_request() 前采集，因此入队开销进入 TTFT。待提交样本在
     benchmark 侧的等待不计入请求延迟；提交成功后才更新活跃集合和工作量计数。
+
+    Returns:
+        next_request_idx: 下一个尚未提交的 requests 下标；已提交请求的时间戳和计数同时更新。
     """
     while next_request_idx < len(requests) and len(active_requests) < max_active:
         sample = requests[next_request_idx]  # 数据已经编码，提交过程无需 tokenizer。
@@ -51,7 +54,7 @@ def _submit_requests(
             sampling_params=sampling_params[next_request_idx],
             request_id=sample.request_id,
         )
-        # 当前同步 Engine 的 Scheduler 持有真实 Request；保留引用以跨越完成时的删除。
+        # Scheduler 持有真实 Request；保留引用以跨越完成时的删除。
         request = llm.scheduler.requests[request_id]
         latency = RequestLatency(request_id, sample.prompt_len, arrival_time)
         active_requests[request_id] = (request, latency)  # 只读生成长度，不修改推理状态。
@@ -77,7 +80,7 @@ def replay_requests(
         max_active: 闭环回放的活跃请求数上限，包含 Engine 中排队的已提交请求。
 
     Returns:
-        包含公共吞吐计数、TPS 和逐请求时间轴的 LatencyBenchmarkStats。
+        stats: 包含公共吞吐计数、TPS 和逐请求时间轴的 LatencyBenchmarkStats。
 
     Side Effects:
         提交并执行请求，更新模型 KV、采样 RNG 和 prefix cache。计时结束后额外
@@ -107,7 +110,8 @@ def replay_requests(
         )
     with nvtx_range("benchmark_loop"):
         while active_requests or next_request_idx < len(requests):
-            engine_core_outputs, num_tokens = llm.step()
+            # 只在选定入口回收结果后记时，异步提前提交本身不计为 token 可见。
+            engine_core_outputs, num_tokens = llm.step_fn()
             step_time = perf_counter() - start_time  # 返回后立即取时，同轮 token 共用此值。
             stats.num_engine_steps += 1
             stats.num_scheduled_tokens += num_tokens
@@ -156,12 +160,16 @@ def replay_requests(
         raise RuntimeError("Latency replay did not complete every request")
     # 异步队列和最终 Worker 清理全部收尾，不计入吞吐和请求延迟。
     while llm.has_requests():
-        llm.step()
+        llm.step_fn()
     return stats
 
 
 def run_benchmark(config: BenchmarkConfig) -> LatencyBenchmarkStats:
-    """复用公共启动流程执行一次本地 Engine 延迟测试，并按需保存 JSON 报告。"""
+    """复用公共启动流程执行一次本地 Engine 延迟测试，并按需保存 JSON 报告。
+
+    Returns:
+        stats: 本次回放的 LatencyBenchmarkStats，含吞吐和逐请求延迟时间轴。
+    """
     return run_engine_benchmark(config, replay_requests)
 
 

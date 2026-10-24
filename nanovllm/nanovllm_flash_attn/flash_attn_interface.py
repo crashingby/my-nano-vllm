@@ -28,7 +28,13 @@ DEFAULT_FA_VERSION: int = 2  # 当前没有移植 FA3/FA4 的扩展和 Python �
 
 
 def _is_fa2_supported() -> tuple[bool, str | None]:
-    """同时检查扩展和当前 GPU；查询发生在显式调用时，而非包导入时。"""
+    """同时检查扩展和当前 GPU；查询发生在显式调用时，而非包导入时。
+
+    Returns:
+        (is_supported, unsupported_reason):
+            is_supported: 扩展与当前 GPU 都满足 FA2 执行条件时为 True。
+            unsupported_reason: 不可执行时的原因字符串；支持时为 None。
+    """
     if not FA2_AVAILABLE:
         return False, f"FA2 is unavailable due to: {FA2_UNAVAILABLE_REASON}"
     from nanovllm.platforms import current_platform
@@ -40,12 +46,20 @@ def _is_fa2_supported() -> tuple[bool, str | None]:
 
 
 def is_fa_version_supported(fa_version: int) -> bool:
-    """返回指定 FA 版本是否可执行；FA3/FA4 明确返回 False。"""
+    """返回指定 FA 版本是否可执行；FA3/FA4 明确返回 False。
+
+    Returns:
+        is_supported: 指定 FA 版本当前可执行时为 True；未移植版本返回 False。
+    """
     return fa_version_unsupported_reason(fa_version) is None
 
 
 def fa_version_unsupported_reason(fa_version: int) -> str | None:
-    """给出扩展、GPU 能力或未移植版本的原因，支持时返回 None。"""
+    """给出扩展、GPU 能力或未移植版本的原因，支持时返回 None。
+
+    Returns:
+        unsupported_reason: 指定 FA 版本无法执行的原因字符串；支持时为 None。
+    """
     if fa_version == 2:
         return _is_fa2_supported()[1]
     if fa_version in (3, 4):
@@ -54,7 +68,11 @@ def fa_version_unsupported_reason(fa_version: int) -> str | None:
 
 
 def maybe_contiguous(tensor: torch.Tensor | None) -> torch.Tensor | None:
-    """仅在 head 最内层维度不连续时复制，保留 paged cache 的真实外层 stride。"""
+    """仅在 head 最内层维度不连续时复制，保留 paged cache 的真实外层 stride。
+
+    Returns:
+        tensor: 满足 head 最内层连续约束的 tensor；无需复制或输入为 None 时原样返回。
+    """
     if tensor is not None and tensor.stride(-1) != 1:
         return tensor.contiguous()
     return tensor
@@ -109,13 +127,21 @@ def flash_attn_varlen_func(
         fa_version: 当前只支持 2；不会把请求的 FA3/FA4 静默降级为 FA2。
         num_splits: 当前只能为 0；已安装上游扩展不能显式指定 KV 分割数量。
         window_size: 只接受 None 或 ``(-1, -1)``，当前没有 sliding window。
-        q_v, scheduler_metadata, q_descale, k_descale, v_descale: 保留 vLLM
-            调用中的默认 None，但当前没有 FA3/量化实现。
-        dropout_p, softcap, alibi_slopes, deterministic, return_attn_probs:
-            仅接受各自默认值，当前只提供普通推理前向。
+        q_v: FA3 兼容参数，当前必须为 None。
+        scheduler_metadata: FA3 调度元数据，当前必须为 None。
+        q_descale: Query 量化反缩放参数，当前必须为 None。
+        k_descale: Key 量化反缩放参数，当前必须为 None。
+        v_descale: Value 量化反缩放参数，当前必须为 None。
+        dropout_p: 当前只提供推理前向，必须为 0.0。
+        softcap: logits 软截断参数，当前必须为 0.0。
+        alibi_slopes: ALiBi 位置偏置参数，当前必须为 None。
+        deterministic: backward 确定性兼容参数，当前必须为 False。
+        return_attn_probs: 当前不导出完整注意力概率，必须为 False。
 
     Returns:
-        默认返回 output；return_softmax_lse=True 时返回 ``(output, lse)``。
+        默认返回单个 tensor；启用额外返回时返回二元组：
+            output: 默认返回的 Attention 输出 tensor。
+            softmax_lse: return_softmax_lse=True 时额外返回的 log-sum-exp，此时整体为 (output, softmax_lse)。
 
     Side Effects:
         out 非空时直接写入该 tensor；绝不更新 KV cache。缓存更新必须由后端
@@ -215,7 +241,7 @@ def flash_attn_varlen_func(
         return_softmax_lse and dropout_p > 0,  # 与 vLLM 一致，LSE 单独返回。
         None,  # 无 dropout，无需随机数生成器。
     )
-    # 上游返回 [out, lse, dropout_mask, rng_state]，vLLM 只暴露前两个。
+    # result 为上游的 [out, lse, dropout_mask, rng_state]；本接口暴露 output 和 softmax_lse。
     output = result[0] if out is None else out  # 显式保证预分配 buffer 的 Python 对象身份。
     softmax_lse = result[1]
     return (output, softmax_lse) if return_softmax_lse else output

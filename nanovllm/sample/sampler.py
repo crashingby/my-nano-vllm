@@ -28,7 +28,7 @@ class Sampler(nn.Module):
             sampling_metadata: 当前 batch 的 temperature 和已有 processor 容器。
 
         Returns:
-            保留在 logits 所在设备上的 SamplerOutput，不执行 CPU 同步。
+            sampler_output: 保留在 logits 所在设备上的 SamplerOutput，不执行 CPU 同步。
 
         Side Effects:
             输入原本为 FP32 时，temperature 和 processor 可原地修改 logits；
@@ -37,7 +37,7 @@ class Sampler(nn.Module):
         logits = logits.to(torch.float32)  # 对齐 vLLM，采样计算统一使用 FP32。
         logits = self.apply_logits_processors(logits, sampling_metadata)
         sampled = self.sample(logits, sampling_metadata)  # 每行选择一个词表下标。
-        sampled = sampled.to(torch.int32)  # 缩小返回 tensor，与 vLLM 输出类型一致。
+        sampled = sampled.to(torch.int32)  # sampled_token_ids 以 int32 保存在 SamplerOutput 中，与 vLLM 输出类型一致。
         return SamplerOutput(sampled_token_ids=sampled.unsqueeze(-1))
 
     def apply_logits_processors(
@@ -49,6 +49,9 @@ class Sampler(nn.Module):
 
         当前默认容器为空；保留调用边界，与 InputBatch 的 update_state 配套。
         处理器可以原地修改输入，也可以返回替代 tensor。
+
+        Returns:
+            logits: 经过现有非 argmax 不变处理器的 logits；可能为原对象或替代 tensor。
         """
         for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
             logits = processor.apply(logits)
@@ -60,6 +63,9 @@ class Sampler(nn.Module):
 
         当前只支持正 temperature，省去 vLLM 对混合 greedy 请求的零温度替换。
         小于 1 会使分布更集中，大于 1 会使分布更平缓。
+
+        Returns:
+            logits: 按请求 temperature 原地缩放后的同一个 logits tensor。
         """
         return logits.div_(temp.unsqueeze(dim=1))
 
@@ -72,6 +78,9 @@ class Sampler(nn.Module):
 
         当前无 logprobs，因此省去 vLLM 返回元组中的 processed_logprobs。
         本方法会原地缩放 logits，并消耗默认设备 RNG 状态。
+
+        Returns:
+            sampled: 每个请求随机采样的 token ID，形状为 [num_reqs]。
         """
         logits = self.apply_temperature(logits, sampling_metadata.temperature)
         # 对齐 vLLM：不影响 argmax 的处理器放在 temperature 缩放之后。

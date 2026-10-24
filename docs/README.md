@@ -4,6 +4,14 @@
 
 首次运行先阅读 [安装与运行环境](installation.md)，完成依赖安装、GPU 检查和算子验证。
 
+## Engine 与请求驱动
+
+| 文档 | 阅读内容 |
+| --- | --- |
+| [LLMEngine](engine/LLMEngine.md) | 请求入口、step_fn 的同步与异步路径、generate 的增量累计及资源收尾。 |
+| [SchedulerOutput](core/sched/output-zh.md) | Scheduler 下发的执行计划及各字段的语义。 |
+| [异步调度执行链](core/sched/AsyncScheduler-zh.md) | 输出占位、跨批次依赖、GPU token 回填与输入/输出同步。 |
+
 ## 执行器与 Worker
 
 | 文档 | 阅读内容 |
@@ -39,7 +47,14 @@
 | kernel | [Triton SiluAndMul 的持久化调度与自动调优](kernels/triton/activation/SiluAndMul.md)。 |
 | kernel | [CuTe DSL SiluAndMul 的线程映射、访存与官方调优](kernels/cute/activation/SiluAndMul.md)。 |
 
-端到端吞吐与延迟测试见 [Benchmark 文档](../benchmarks/README.md)。算子测试位于
+## 性能记录
+
+| 文档 | 对比内容 |
+| --- | --- |
+| [CUDA Graph 与 eager](performance/cuda_graph.md) | 关闭异步调度，记录固定负载下的吞吐、首 token 延迟与逐 token 延迟。 |
+| [异步调度的性能与重叠](performance/async_schedule.md) | 分别比较 eager、CUDA Graph 下的同步与异步调度，用 Nsight 量化跨批次 CPU/GPU 重叠。 |
+
+端到端吞吐与延迟测试的用法见 [Benchmark 文档](../benchmarks/README.md)。算子测试位于
 [`tests/test_ops`](../tests/test_ops)，在项目根目录运行：
 
 ```shell

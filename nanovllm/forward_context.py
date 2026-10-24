@@ -103,7 +103,7 @@ def get_forward_context() -> ForwardContext:
     """取得当前已经安装的模型 forward 上下文。
 
     Returns:
-        当前活动的 ForwardContext 引用，不创建副本。
+        forward_context: 当前活动的 ForwardContext 引用，不创建副本。
 
     Raises:
         AssertionError: 在 ``set_forward_context()`` 或
@@ -118,7 +118,11 @@ def get_forward_context() -> ForwardContext:
 
 
 def is_forward_context_available() -> bool:
-    """判断当前是否存在活动的模型 forward 上下文，不改变任何状态。"""
+    """判断当前是否存在活动的模型 forward 上下文，不改变任何状态。
+
+    Returns:
+        is_available: 当前存在活动 ForwardContext 时为 True，否则为 False。
+    """
     return _forward_context is not None
 
 
@@ -140,8 +144,8 @@ def create_forward_context(
         slot_mapping: 按层名组织的 KV 写入坐标；None 表示当前没有写入映射。
 
     Returns:
-        引用原始注册表、metadata 和 slot mapping 的 ForwardContext。
-        Graph 模式与描述符原样传递；slot_mapping 为 None 时独立创建空字典。
+        forward_context: 引用原始注册表、metadata 和 slot mapping 的 ForwardContext。
+            Graph 模式与描述符原样传递；slot_mapping 为 None 时独立创建空字典。
 
     Raises:
         AssertionError: 将组合配置模式当作具体运行模式传入时抛出。

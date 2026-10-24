@@ -13,7 +13,7 @@ def sha256(input:Any) -> bytes:
         input: 任意可 pickle 的结构化 Python 对象。
 
     Returns:
-        固定 32 字节的 SHA-256 digest。
+        digest: 固定 32 字节的 SHA-256 digest。
     """
     input_bytes = pickle.dumps(
         input,
@@ -28,7 +28,7 @@ def get_hash_fn_by_name(hash_fn_name: str) -> Callable[[Any], bytes]:
         hash_fn_name: prefix cache 配置中的 hash 算法名称。
 
     Returns:
-        对结构化 Python 对象求 hash 的函数。
+        hash_function: 对结构化 Python 对象求 hash 的函数。
 
     Raises:
         ValueError: 当前 nano-vLLM 尚未支持该算法时抛出。

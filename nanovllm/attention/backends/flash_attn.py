@@ -51,22 +51,38 @@ class FlashAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        """当前上游 FA2 CUDA 扩展要求 paged KV page 大小为 256 的倍数。"""
+        """当前上游 FA2 CUDA 扩展要求 paged KV page 大小为 256 的倍数。
+
+        Returns:
+            supported_kernel_block_sizes: FA2 kernel page 大小约束，当前为 256 的正整数倍。
+        """
         return [MultipleOf(256)]
 
     @staticmethod
     def get_name() -> str:
-        """返回用于后端选择和日志的稳定名称。"""
+        """返回用于后端选择和日志的稳定名称。
+
+        Returns:
+            backend_name: 固定为 "FLASH_ATTN" 的后端标识。
+        """
         return "FLASH_ATTN"
 
     @staticmethod
     def get_impl_cls() -> type["FlashAttentionImpl"]:
-        """返回当前后端的单层 Attention 实现类。"""
+        """返回当前后端的单层 Attention 实现类。
+
+        Returns:
+            impl_cls: 当前后端的 FlashAttentionImpl 类。
+        """
         return FlashAttentionImpl
 
     @staticmethod
     def get_builder_cls() -> type["FlashAttentionMetadataBuilder"]:
-        """返回当前后端的批次元数据构造器类。"""
+        """返回当前后端的批次元数据构造器类。
+
+        Returns:
+            builder_cls: 当前后端的 FlashAttentionMetadataBuilder 类。
+        """
         return FlashAttentionMetadataBuilder
 
     @staticmethod
@@ -87,7 +103,7 @@ class FlashAttentionBackend(AttentionBackend):
             cache_dtype_str: 缓存数据类型名称；当前布局不依赖它。
 
         Returns:
-            依次为 page、K/V、token、KV head、head 维度的形状。
+            kv_cache_shape: 依次为 page、K/V、token、KV head、head 维度的形状。
         """
         # 布局规划必须符合实际加载的 FA2 扩展约束，不能沿用 vLLM 扩展的 16 对齐。
         if block_size <= 0 or block_size % 256 != 0:
@@ -107,7 +123,7 @@ class FlashAttentionBackend(AttentionBackend):
                 当前每层独立分配，常规调用传 False。
 
         Returns:
-            相对于逻辑形状的维度排列。
+            stride_order: 相对于逻辑形状的维度排列。
         """
         if include_num_layers_dimension:
             return (1, 0, 2, 3, 4, 5)
@@ -182,9 +198,9 @@ class FlashAttentionMetadataBuilder(
             kv_cache_spec: 当前 AttentionGroup 的缓存规格；默认能力不读取此参数。
 
         Returns:
-            UNIFORM_BATCH。普通 decode 的每请求 query 长度为 1，属于这个范围；
-            混合 prefill/decode 的 FULL 策略需由配置解析器降级。
-            这是后端能力声明，不代表 Runner 已完成捕获或支持 spec decode。
+            cudagraph_support: UNIFORM_BATCH。普通 decode 的每请求 query 长度为 1，属于这个范围；
+                混合 prefill/decode 的 FULL 策略需由配置解析器降级。
+                这是后端能力声明，不代表 Runner 已完成捕获或支持 spec decode。
         """
         return cls._cudagraph_support
 
@@ -243,7 +259,7 @@ class FlashAttentionMetadataBuilder(
             fast_build: 上游保留的快速构建选项；当前始终使用同一构建路径。
 
         Returns:
-            可由组内所有 Attention 层复用的后端元数据。
+            attn_metadata: 可由组内所有 Attention 层复用的后端元数据。
         """
         # 普通 decoder 路径直接复用公共字段，无需 cascade 的前缀/后缀拆分。
         return FlashAttentionMetadata(
@@ -325,9 +341,9 @@ class FlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
             output: [T, num_heads, head_size]，包装层预分配的可写输出。
 
         Returns:
-            原始 output 对象。仅更新前 num_actual_tokens 行；完整 Graph 路径
-            该前缀可包含 dummy query，超出前缀的尾部保持原值。
-            profiling 将整个 output 填零。
+            output: 原始 output 对象。仅更新前 num_actual_tokens 行；完整 Graph 路径
+                该前缀可包含 dummy query，超出前缀的尾部保持原值。
+                profiling 将整个 output 填零。
 
         Raises:
             AssertionError: 未选出当前设备和 head_size 支持的 FA 版本。
@@ -339,7 +355,7 @@ class FlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
         assert self.vllm_flash_attn_version is not None, (
             "FlashAttention version not detected."
         )
-        # profiling 没有真实请求边界，填零后返回，避免读取未绑定的缓存。
+        # profiling 没有真实请求边界，返回填零的 output，避免读取未绑定的缓存。
         if attn_metadata is None:
             return output.fill_(0)
 
@@ -375,7 +391,7 @@ class FlashAttentionImpl(AttentionImpl[FlashAttentionMetadata]):
             block_table=block_table,
             fa_version=self.vllm_flash_attn_version,
         )
-        # 返回完整原对象，保持上层统一的输出形状；执行前缀由 metadata 指定。
+        # 返回完整的原始 output，保持统一输出形状；执行前缀由 metadata 指定。
         return output
 
     def do_kv_cache_update(

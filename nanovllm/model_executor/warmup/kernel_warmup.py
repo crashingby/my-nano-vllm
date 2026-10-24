@@ -48,7 +48,11 @@ def kernel_warmup(worker: Worker) -> None:
     """
     # 与上游的后端检测 helper 对应，只将后端名称替换为当前支持的 FLASH_ATTN。
     def _is_flash_attn_backend(backend: type[AttentionBackend]) -> bool:
-        """查询稳定后端名；未提供名称的后端不能进入 FA2 专用预热路径。"""
+        """查询稳定后端名；未提供名称的后端不能进入 FA2 专用预热路径。
+
+        Returns:
+            is_flash_attn_backend: 后端稳定名称为 FLASH_ATTN 时为 True；无法取得名称时为 False。
+        """
         try:
             return backend.get_name() == "FLASH_ATTN"
         except NotImplementedError:
