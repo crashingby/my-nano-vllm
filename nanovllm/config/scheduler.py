@@ -28,6 +28,8 @@ class SchedulerConfig:
         long_prefill_token_threshold: 长 prefill 的 token 阈值，供调度策略使用。
         enable_chunked_prefill: 分块 prefill 的策略选项，默认开启。
         async_scheduling: 是否请求异步调度，默认关闭；需要执行链配套支持。
+        watermark: 接纳等待或被抢占请求时预留的 KV block 总容量比例，范围为
+            [0, 1)。仅本轮已有请求被调度时生效，0.0 保留原有接纳行为。
     """
     DEFAULT_MAX_NUM_BATCHED_TOKENS: ClassVar[int] = 2048
     DEFAULT_MAX_NUM_SEQS: ClassVar[int] = 128
@@ -45,6 +47,8 @@ class SchedulerConfig:
     policy: SchedulerPolicy = "fcfs"
     # 现有 Engine 默认仍走同步路径，避免省略字段时意外请求异步能力。
     async_scheduling: bool = False
+    # 预留余量抑制过度接纳；首个请求和已运行请求的继续计算不受此门槛限制。
+    watermark: float = Field(default=0.0, ge=0.0, lt=1.0)
 
     def __post_init__(self) -> None:
         """在字段校验后检查调度预算不会超过 Runner 的 token buffer 容量。

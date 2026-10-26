@@ -80,6 +80,7 @@ def _save_result(config: BenchmarkConfig, stats: BenchmarkStats) -> None:
     assert config.result_path is not None
     model_config = config.vllm_config.model_config  # 只导出可序列化的配置摘要。
     scheduler_config = config.vllm_config.scheduler_config
+    cache_config = config.vllm_config.cache_config  # 记录缓存开关与接纳策略，避免不同策略混测。
     report = {
         "config": {
             "model": model_config.model,
@@ -89,7 +90,14 @@ def _save_result(config: BenchmarkConfig, stats: BenchmarkStats) -> None:
             "max_model_len": model_config.max_model_len,
             "max_active": scheduler_config.max_num_seqs,
             "max_num_batched_tokens": scheduler_config.max_num_batched_tokens,
-            "gpu_memory_utilization": config.vllm_config.cache_config.gpu_memory_utilization,
+            "gpu_memory_utilization": cache_config.gpu_memory_utilization,
+            "block_size": cache_config.block_size,
+            # 当前单 group 的实际调度与 hash 粒度均已校验为最终 block_size。
+            "scheduler_block_size": cache_config.block_size,
+            "hash_block_size": cache_config.block_size,
+            "enable_prefix_caching": cache_config.enable_prefix_caching,
+            "prefix_match_unit": cache_config.prefix_match_unit,
+            "watermark": scheduler_config.watermark,
             "dataset": asdict(config.dataset_config),
             "num_prompts_requested": config.num_prompts,
             "sampling_params": asdict(config.sampling_params),

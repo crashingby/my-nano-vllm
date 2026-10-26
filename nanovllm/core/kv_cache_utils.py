@@ -28,6 +28,49 @@ BlockHash = NewType("BlockHash", bytes)
 # 首个逻辑 block 的固定父 hash；Engine 创建 hasher 前必须初始化。
 NONE_HASH: BlockHash
 
+
+def resolve_kv_cache_block_sizes(
+    kv_cache_config: KVCacheConfig,
+    vllm_config: NanovllmConfig,
+) -> tuple[int, int]:
+    """按正式 KV 规格解析调度对齐粒度与 Request hash 粒度。
+
+    沿用 vLLM 的单 group 规则：两者均为最终 block_size。未来引入不同 group
+    大小或上下文并行时，应在这里扩展解析规则，并同步缓存查询与登记算法。
+
+    Args:
+        kv_cache_config: 显存规划完成后的 Scheduler KV 配置。
+        vllm_config: 含前缀缓存开关及可选 prefix_match_unit 的完整配置。
+
+    Returns:
+        (scheduler_block_size, hash_block_size):
+            scheduler_block_size: 调度与前缀命中使用的 token 对齐单位。
+            hash_block_size: Request 每个 block_hash 覆盖的 token 数。
+
+    Raises:
+        NotImplementedError: KV 配置不是当前支持的单 group 布局。
+        ValueError: 启用缓存时 prefix_match_unit 与实际 block_size 不一致。
+    """
+    groups = kv_cache_config.kv_cache_groups
+    if len(groups) != 1:
+        raise NotImplementedError("Block-size resolution requires one KV cache group")
+    # 使用正式规格，而非可能在初始化前尚未回写的容量配置镜像。
+    scheduler_block_size = groups[0].kv_cache_spec.block_size
+    cache_config = vllm_config.cache_config
+    # 对齐上游：关闭哈希消费者时忽略细粒度设置，仍返回真实分配粒度。
+    if (
+        cache_config.enable_prefix_caching
+        and cache_config.prefix_match_unit not in (None, scheduler_block_size)
+    ):
+        raise ValueError(
+            f"Invalid prefix_match_unit={cache_config.prefix_match_unit}; "
+            "with a single KV cache group, prefix-cache hits land on the "
+            f"block size ({scheduler_block_size})"
+        )
+    hash_block_size = scheduler_block_size  # 当前每个物理块对应一个完整 hash。
+    return scheduler_block_size, hash_block_size
+
+
 def init_none_hash(hash_fn:Callable[[Any],bytes])->None:
     """初始化首个逻辑 block 使用的父 hash。"""
     global NONE_HASH

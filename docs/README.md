@@ -53,6 +53,7 @@
 | --- | --- |
 | [CUDA Graph 与 eager](performance/cuda_graph.md) | 关闭异步调度，记录固定负载下的吞吐、首 token 延迟与逐 token 延迟。 |
 | [异步调度的性能与重叠](performance/async_schedule.md) | 分别比较 eager、CUDA Graph 下的同步与异步调度，用 Nsight 量化跨批次 CPU/GPU 重叠。 |
+| [前缀缓存收益](performance/prefix_cache.md) | 核对 Qwen 模板，对比短输入与共享长 system 下缓存开关的计算量、吞吐和延迟。 |
 
 端到端吞吐与延迟测试的用法见 [Benchmark 文档](../benchmarks/README.md)。算子测试位于
 [`tests/test_ops`](../tests/test_ops)，在项目根目录运行：

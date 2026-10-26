@@ -35,6 +35,7 @@ from nanovllm.core.kv_cache_utils import (
     get_kv_cache_configs,
     get_request_block_hasher,
     init_none_hash,
+    resolve_kv_cache_block_sizes,
 )
 from nanovllm.core.sched.scheduler import Scheduler
 from nanovllm.core.sched.async_scheduler import AsyncScheduler
@@ -61,7 +62,8 @@ class LLMEngine:
         tokenizer: 将字符串 prompt 编码为 token IDs、将 completion 解码为文本。
         model_executor: 创建和调用 Worker 的执行端；当前选择单卡 UniProcExecutor。
         available_gpu_memory_for_kv_cache: profiling 得到的 KV 字节预算，测量前为 -1。
-        request_block_hasher: 所有 Request 共享的完整逻辑 block 哈希构造函数。
+        request_block_hasher: 所有 Request 共享的完整逻辑 block 哈希构造函数；
+            关闭前缀缓存时为 None，不生成无消费者的 hash。
         scheduler: 请求队列、调度决策和 Scheduler 侧 KV block 元数据的所有者。
         batch_queue: 异步模式保存结果 Future 与原始计划的 FIFO 队列，同步时为 None。
         step_fn: 初始化时选定的单步入口，绑定同步 step 或 step_with_batch_queue；
@@ -88,7 +90,7 @@ class LLMEngine:
         Side Effects:
             读取本地 tokenizer；创建 Worker、初始化设备并加载权重；
             执行显存 profiling，分配正式 KV cache，并按配置预热和捕获 CUDA Graph。
-            随后初始化 prefix hash 根节点，创建 Scheduler，注册进程退出时的关闭回调。
+            随后在启用前缀缓存时初始化 hash 根节点，创建 Scheduler 并注册关闭回调。
             启动结果直接回写传入配置，包括 EOS、KV 容量和编译统计等运行时字段。
         """
         # 沿用 vLLM 的配置传递方式：外层负责组装，Engine 与执行端共享完整配置。
@@ -115,18 +117,21 @@ class LLMEngine:
         # kv_cache_config 是 Scheduler 使用的最终方案；返回前 Worker 已完成 KV 初始化和预热。
         kv_cache_config = self._initialize_kv_caches(self.vllm_config)
 
-        # caching_hash_fn 是配置选择的底层摘要算法；所有请求共享同一个 prefix hash 根。
-        caching_hash_fn = get_hash_fn_by_name(
-            self.vllm_config.cache_config.prefix_caching_hash_algo,
+        # 正式 KV 规划后统一解析，Scheduler 与 Request hasher 使用同一粒度协议。
+        scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+            kv_cache_config, self.vllm_config,
         )
-        init_none_hash(caching_hash_fn)
-        # KV 规划可能更新 block_size，必须使用最终大小划分 Request 的完整逻辑 blocks。
-        self.request_block_hasher: Callable[[Request], list[BlockHash]] = (
-            get_request_block_hasher(
-                block_size=self.vllm_config.cache_config.block_size,
+        self.request_block_hasher: Callable[[Request], list[BlockHash]] | None = None
+        if self.vllm_config.cache_config.enable_prefix_caching:
+            # 只有启用缓存才建立哈希根与共享 hasher，避免关闭后仍逐 token 维护 hash。
+            caching_hash_fn = get_hash_fn_by_name(
+                self.vllm_config.cache_config.prefix_caching_hash_algo,
+            )
+            init_none_hash(caching_hash_fn)
+            self.request_block_hasher = get_request_block_hasher(
+                block_size=hash_block_size,
                 caching_hash_fn=caching_hash_fn,
             )
-        )
 
         self.async_scheduling = (
             self.vllm_config.scheduler_config.async_scheduling
@@ -136,6 +141,8 @@ class LLMEngine:
         self.scheduler: Scheduler = scheduler_cls(
             vllm_config=self.vllm_config,
             kv_cache_config=kv_cache_config,
+            block_size=scheduler_block_size,
+            hash_block_size=hash_block_size,
             include_finished_set=True,
         )
         # 当前只有单 Worker，异步模式先允许两批工作在途。

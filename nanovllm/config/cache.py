@@ -3,6 +3,8 @@
 from dataclasses import field
 from typing import Literal
 
+from pydantic import Field
+
 from nanovllm.config.utils import config
 # 保留缓存精度的类型别名；当前未提供独立 dtype 字段，实际 KV 精度跟随模型。
 CacheDType = Literal[
@@ -26,8 +28,12 @@ class CacheConfig:
         gpu_memory_utilization: 当前实例的预算占设备总显存的比例，不是占启动时
             空闲显存的比例。Worker 从该预算扣除权重、峰值激活、非 PyTorch 分配
             和 Graph 估算占用，剩余部分才是候选 KV 字节预算。
+        enable_prefix_caching: 是否生成和复用完整块的前缀 hash，默认开启。
+            关闭后仍正常分配请求 KV，但不创建 Request hasher 或查询、登记缓存。
+        prefix_match_unit: 可选的前缀 hash token 粒度。当前只有一个 KV group，
+            启用缓存时只能省略或等于最终 block_size；关闭缓存时不使用此设置。
         prefix_caching_hash_algo: 完整逻辑 block 的 prefix hash 算法，当前仅支持
-            sha256；Engine 据此初始化哈希根并创建所有请求共享的 block hasher。
+            sha256；启用缓存时 Engine 据此创建哈希根与所有请求共享的 block hasher。
         num_gpu_blocks_override: 可选的用户指定 block 数。非 ``None`` 时，KV cache
             规划器用它替代根据显存预算计算的 block 数，仍会执行 profiling。
             该总数包含空块 0，正式规划还会检查能否容纳最大上下文和保留空块。
@@ -48,6 +54,10 @@ class CacheConfig:
     block_size: int = 256
     # 权重、激活、Graph 和 KV 共同使用这一总显存预算，不表示 KV 独占的比例。
     gpu_memory_utilization: float = 0.92
+    # 沿用 vLLM 的开关命名；关闭时仍分配 KV，只停止跨请求前缀复用。
+    enable_prefix_caching: bool = True
+    # 单 group 暂不支持更细 hash；与最终 KV 规格的关系在资源规划后解析。
+    prefix_match_unit: int | None = Field(default=None, gt=0)
     # prefix cache 的 block 哈希算法；当前哈希工具仅实现 sha256。
     prefix_caching_hash_algo: Literal["sha256"] = "sha256"
     # 覆盖规划出的总 block 数；None 表示使用预算推导结果，包含保留空块 0。
@@ -68,13 +78,20 @@ class CacheConfig:
         """校验不会依赖模型结构或 GPU 状态的缓存参数。
 
         Raises:
-            ValueError: block 大小、显存比例或显式 block 数不满足基本约束时抛出。
+            ValueError: block 大小、匹配粒度、显存比例或显式 block 数不满足约束。
         """
         # page 大小必须为正，随后按当前 FA2 paged kernel 的粒度约束检查。
         if self.block_size <= 0:
             raise ValueError("block_size must be positive")
         if self.block_size % 256 != 0:
             raise ValueError("block_size must be divisible by 256")
+        # 当前仅支持单 group；尽早拒绝无效匹配粒度，避免加载模型后才报错。
+        # 正式 KV 规划后仍会按实际规格再次解析，防止配置镜像与实际布局脱节。
+        if self.enable_prefix_caching and self.prefix_match_unit not in (None, self.block_size):
+            raise ValueError(
+                "With one KV cache group, prefix_match_unit must equal "
+                f"block_size ({self.block_size}) or be unset"
+            )
         # 这里校验预算比例的取值范围；实际空闲显存是否足够由 Worker 启动时检查。
         if not 0 < self.gpu_memory_utilization <= 1:
             raise ValueError(

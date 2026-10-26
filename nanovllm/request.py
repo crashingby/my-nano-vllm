@@ -99,7 +99,8 @@ class Request:
         num_preemptions: 请求被抢占的累计次数，可供后续统计或策略使用。
         block_hashes: 已经形成完整 token block 的逻辑 hash 链。第 i 项对应第 i 个
             完整逻辑 block；它描述 token 内容，不描述物理 KV 内存位置。
-        _block_hasher: Engine 在启动时创建、所有 Request 共享的增量 hash 函数。
+        _block_hasher: Engine 创建、所有 Request 共享的增量 hash 函数；关闭前缀
+            缓存时为 None，此时不维护 block_hashes。
     """
 
     def __init__(

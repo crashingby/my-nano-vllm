@@ -58,6 +58,11 @@ LongBench 走同一公共流程：非空 input 放在长 context 后作为任务
 MultiNews、VCSUM 等空 input 的摘要记录补充摘要指令。answers 不进入模型输入。
 当前模板用于系统吞吐测试，不声明与 LongBench 官方逐任务质量评分模板完全相同。
 
+默认只提供 user 消息。传入 `--system-prompt "共享指令"` 后，公共编码层会将
+相同的 system 消息放在每条 user 消息前。system 也计入输入长度，超长策略
+只截断 user，保留完整 system。缓存开关的实测对照和共享指令全文见
+[前缀缓存收益](../docs/performance/prefix_cache.md)。
+
 ## 安装与启动
 
 在项目根目录运行，推荐使用模块入口；原来的直接脚本启动方式也保留：
@@ -174,6 +179,7 @@ truncate 会改变原始任务内容，适用于性能负载控制。它保留�
 | --dataset-name | alpaca | 注册表中的适配器名称。 |
 | --dataset-path | 适配器默认路径 | 本地文件或目录。 |
 | --dataset-subset | 不指定 | 子集名称，目前由 LongBench 支持。 |
+| --system-prompt | 不指定 | 所有请求共享的 system 文本，去除首尾空白后放在 user 消息前；省略时保持原有单 user 模板。 |
 | --num-prompts | 128 | 最多接受的有效请求数量。 |
 | --max-active | 16 | Scheduler/Runner 的请求槽位容量，也是回放并发上限。 |
 | --max-tokens | 128 | 每请求目标输出长度。 |
@@ -186,11 +192,20 @@ truncate 会改变原始任务内容，适用于性能负载控制。它保留�
 | --max-model-len | 4096 | prompt 与 output 的总上下文容量。 |
 | --max-num-batched-tokens | 1024 | 单轮真实 token 预算，必须不小于 max-active。 |
 | --gpu-memory-utilization | 0.9 | 当前实例占设备总显存的预算，示例使用 0.5。 |
+| --block-size | 256 | Manager KV block 的 token 数，当前须为 256 的倍数。 |
+| --enable-prefix-caching / --no-enable-prefix-caching | 开启 | 控制前缀复用；关闭后也不生成 Request block hashes。 |
+| --prefix-match-unit | 不指定 | 前缀 hash 的 token 粒度；当前单 group 启用缓存时须与 block-size 相等。关闭缓存时忽略。 |
+| --watermark | 0.0 | 接纳等待或恢复请求时额外保留的总 KV block 比例，范围 [0, 1)。 |
 | --max-prompt-tokens | 不指定 | 含模板的输入上限，同时受剩余模型上下文约束。 |
 | --long-prompt-policy | error | 超长输入的报错、过滤或截断策略。 |
 
 seed 固定的是生成前随机数初态，不保证不同 batch 调度或 Graph 模式生成逐字相同
 的文本。需要固定工作量时，同时使用 --ignore-eos 和相同的输入/输出长度策略。
+
+`watermark` 只在本轮已有请求被安排执行时影响新接纳的 WAITING/PREEMPTED 请求；
+首个请求和 RUNNING 请求继续计算不受该门槛限制。预留块数为
+`int(watermark * num_blocks)`，0.0 保持原有行为。JSON 报告同时记录缓存开关、请求的
+匹配单位、实际 scheduler/hash block 粒度和 watermark，便于核对对比负载。
 
 ## 同步与异步调度对比
 

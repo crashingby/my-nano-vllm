@@ -25,6 +25,8 @@ class DatasetConfig:
         name: 注册的数据集名称，当前为 alpaca 或 longbench。
         path: 本地文件或目录；None 使用对应适配器的默认位置。
         subset: 可选子集名，例如 multi_news；是否支持由具体适配器检查。
+        system_prompt: 可选的共享 system 文本，去除首尾空白后放在 user 消息前。
+            None 保持原有单 user 模板，模板构造和编码均在推理计时之外。
         max_prompt_tokens: 应用 chat template 后的输入 token 上限；None 表示
             只受模型上下文减去目标输出长度后的剩余容量限制。
         long_prompt_policy: 超长输入的处理方式。error 报错、skip 跳过，truncate
@@ -34,11 +36,16 @@ class DatasetConfig:
     name: str = "alpaca"  # 用于注册表选择适配器，不通过文件扩展名猜测数据语义。
     path: str | None = None  # 路径默认值归各数据集适配器所有。
     subset: str | None = None  # 子集选择不进入吞吐回放逻辑。
+    system_prompt: str | None = None  # 直接接收共享文本，不依赖仓库中的提示词文件。
     max_prompt_tokens: int | None = None  # 单位是当前 tokenizer 的 token，不是字符。
     long_prompt_policy: Literal["error", "skip", "truncate"] = "error"
 
     def __post_init__(self) -> None:
-        """校验公共长度选项；文件存在性和字段格式稍后由适配器检查。"""
+        """规范化共享文本并校验长度选项；数据文件与字段稍后由适配器检查。"""
+        if self.system_prompt is not None:
+            self.system_prompt = self.system_prompt.strip()  # 报告与实际编码使用同一文本。
+            if not self.system_prompt:
+                raise ValueError("system_prompt must not be empty")
         if self.max_prompt_tokens is not None and self.max_prompt_tokens < 1:
             raise ValueError("max_prompt_tokens must be positive")
         if self.long_prompt_policy not in ("error", "skip", "truncate"):
@@ -92,6 +99,9 @@ def parse_args(
     parser.add_argument("--dataset-name", default="alpaca", help="注册的数据集名称。")
     parser.add_argument("--dataset-path", help="本地数据文件或目录，省略时使用适配器默认值。")
     parser.add_argument("--dataset-subset", help="子集名，例如 LongBench 的 multi_news。")
+    parser.add_argument(
+        "--system-prompt", help="所有请求共享的 system 文本，省略时仅有 user 消息。",
+    )
     parser.add_argument("--num-prompts", type=int, default=128, help="最多接受的有效样本数。")
     parser.add_argument("--max-active", type=int, default=16, help="Scheduler/Runner 请求容量。")
     parser.add_argument("--max-tokens", type=int, default=128, help="每请求目标输出长度上限。")
@@ -111,6 +121,19 @@ def parse_args(
         help="单轮共享 token 预算，默认 1024；增大可减少 prefill 分块轮数。",
     )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--block-size", type=int, default=256, help="Manager KV block 的 token 数，当前须为 256 的倍数。")
+    parser.add_argument(
+        "--enable-prefix-caching", action=argparse.BooleanOptionalAction, default=True,
+        help="开启前缀缓存；--no-enable-prefix-caching 同时关闭请求 hash 生成和缓存复用。",
+    )
+    parser.add_argument(
+        "--prefix-match-unit", type=int,
+        help="前缀 hash 的 token 粒度；当前单 group 启用缓存时须等于 block-size。",
+    )
+    parser.add_argument(
+        "--watermark", type=float, default=0.0,
+        help="接纳等待/恢复请求时预留的总 KV block 比例，范围 [0, 1)，默认关闭。",
+    )
     parser.add_argument("--max-prompt-tokens", type=int, help="含 chat template 的输入 token 上限。")
     parser.add_argument(
         "--long-prompt-policy", choices=("error", "skip", "truncate"), default="error",
@@ -130,13 +153,20 @@ def parse_args(
                     max_num_seqs=args.max_active,
                     max_num_batched_tokens=args.max_num_batched_tokens,
                     async_scheduling=args.async_scheduling,
+                    watermark=args.watermark,
                 ),
-                cache_config=CacheConfig(gpu_memory_utilization=args.gpu_memory_utilization),
+                cache_config=CacheConfig(
+                    block_size=args.block_size,
+                    gpu_memory_utilization=args.gpu_memory_utilization,
+                    enable_prefix_caching=args.enable_prefix_caching,
+                    prefix_match_unit=args.prefix_match_unit,
+                ),
             ),
             dataset_config=DatasetConfig(
                 name=args.dataset_name,
                 path=args.dataset_path,
                 subset=args.dataset_subset,
+                system_prompt=args.system_prompt,
                 max_prompt_tokens=args.max_prompt_tokens,
                 long_prompt_policy=args.long_prompt_policy,
             ),
@@ -151,4 +181,3 @@ def parse_args(
         )
     except ValueError as exc:
         parser.error(str(exc))
-

@@ -54,6 +54,8 @@ class Scheduler:
         self,
         vllm_config: NanovllmConfig,
         kv_cache_config: KVCacheConfig,
+        block_size: int,
+        hash_block_size: int | None = None,
         include_finished_set: bool = False,
         log_stats: bool = False,
     ) -> None:
@@ -63,6 +65,8 @@ class Scheduler:
             vllm_config: 全局推理配置，提供请求数和单轮 token budget 等调度限制。
             kv_cache_config: 当前 Worker 已确定的 KV cache 分配方案。其中
                 ``num_blocks`` 是包含保留空块的物理总数，请求可用容量为其减一。
+            block_size: Engine 解析的 scheduler_block_size，单位为 token。
+            hash_block_size: Request 哈希粒度，None 时沿用 block_size；当前两者须相等。
             include_finished_set: 是否向各 client 输出独立的完成请求集合。
             log_stats: 是否记录并返回调度和前缀缓存统计。
         """
@@ -80,6 +84,10 @@ class Scheduler:
             else self.scheduler_config.max_num_batched_tokens
         )
         self.max_model_len = vllm_config.model_config.max_model_len
+        self.block_size: int = block_size  # 调度对齐粒度，沿用 vLLM Scheduler 的字段名。
+        self.hash_block_size: int = (
+            block_size if hash_block_size is None else hash_block_size
+        )  # 与 Engine 为 Request 创建的 hasher 保持一致。
         # 普通自回归文本生成每步只采样一个 token。
         self.num_sampled_tokens_per_step = 1
         # 当前 KVCacheManager 只维护一张 block table，因此只接受单 group。
@@ -93,7 +101,11 @@ class Scheduler:
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
+            scheduler_block_size=self.block_size,
+            hash_block_size=self.hash_block_size,
+            enable_caching=self.cache_config.enable_prefix_caching,
             log_stats=self.log_stats,
+            watermark=self.scheduler_config.watermark,
         )
 
         # requests 是活跃逻辑请求的权威表，调度输出更新进度时通过它回查 Request。
@@ -459,6 +471,7 @@ class Scheduler:
                     num_new_tokens=num_new_tokens,
                     num_new_computed_tokens=num_new_local_computed_tokens,
                     new_computed_blocks=new_computed_blocks,
+                    has_scheduled_reqs=bool(num_scheduled_tokens),
                 )
                 # 队首资源不足时保持 FCFS，不跳过它让后继请求插队。
                 if new_blocks is None:

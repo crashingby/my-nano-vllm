@@ -18,7 +18,7 @@ from nanovllm.core.kv_cache_utils import (
 )
 from nanovllm.kv_cache_interface import KVCacheConfig
 from nanovllm.metrics.stats import PrefixCacheStats
-from nanovllm.request import Request
+from nanovllm.request import Request, RequestStatus
 
 
 @dataclass
@@ -131,16 +131,25 @@ class KVCacheManager:
         self,
         kv_cache_config: KVCacheConfig,
         max_model_len: int,
+        scheduler_block_size: int,
+        hash_block_size: int,
         enable_caching: bool = True,
         log_stats: bool = False,
+        watermark: float = 0.0,
     ) -> None:
         """根据 Worker 已确定的单组配置创建物理块元数据。
 
         Args:
             kv_cache_config: 物理块总数和唯一 KV group 的规格。
             max_model_len: token slots 可达到的最大序列长度。
+            scheduler_block_size: 调度与命中边界的 token 粒度，当前须等于 group block_size。
+            hash_block_size: Request 每个前缀 hash 的 token 粒度，当前须等于 group block_size。
             enable_caching: 是否登记和查询完整块的本地前缀缓存。
             log_stats: 是否记录前缀查询和命中 token 数。
+            watermark: 新接纳请求时额外保留的总 block 容量比例，默认 0.0。
+
+        Raises:
+            ValueError: watermark 不在 [0, 1)，或粒度不满足当前一块一 hash 的约束。
 
         Side Effects:
             创建 CPU 侧块对象、空闲队列和索引，并永久取走 block 0 作为空块。
@@ -159,7 +168,20 @@ class KVCacheManager:
         self.block_size: int = (  # token/block，调度器和 Worker 必须使用一致的单位。
             kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
         )
+        # 当前缓存索引按物理块下标直接访问 Request hashes，不能接受不同的粒度。
+        if scheduler_block_size != self.block_size or hash_block_size != self.block_size:
+            raise ValueError(
+                "Single-group KV cache requires scheduler_block_size == "
+                f"hash_block_size == block_size ({self.block_size}), got "
+                f"{scheduler_block_size} and {hash_block_size}"
+            )
+        self.scheduler_block_size: int = scheduler_block_size
+        self.hash_block_size: int = hash_block_size
         self.num_gpu_blocks: int = kv_cache_config.num_blocks  # 包含不可分配的 block 0。
+        if not 0.0 <= watermark < 1.0:
+            raise ValueError("watermark must be in the interval [0, 1)")
+        # 对齐 vLLM：比例乘包含 null block 的总容量，并向下取整为预留 block 数。
+        self.watermark_blocks: int = int(watermark * kv_cache_config.num_blocks)
         # 一次建立固定身份的块对象；引用计数、hash 与空闲链表都操作这些对象。
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(self.num_gpu_blocks)
@@ -217,7 +239,7 @@ class KVCacheManager:
             return self.empty_kv_cache_blocks, 0
         max_cache_hit_length = request.num_tokens - 1  # 即使全部历史命中也要产生最新 logits。
         computed_blocks: list[KVCacheBlock] = []
-        max_num_blocks = max_cache_hit_length // self.block_size
+        max_num_blocks = max_cache_hit_length // self.scheduler_block_size
         # Full attention 只能跳过从位置 0 开始的连续前缀，中间缺块后不再继续查找。
         for block_hash in request.block_hashes[:max_num_blocks]:
             block = self.get_cached_block(block_hash)
@@ -240,6 +262,7 @@ class KVCacheManager:
         num_new_tokens: int,
         num_new_computed_tokens: int = 0,
         new_computed_blocks: KVCacheBlocks | None = None,
+        has_scheduled_reqs: bool = False,
     ) -> KVCacheBlocks | None:
         """按上游顺序检查容量、引用命中块、分配新块并登记完整前缀。
 
@@ -248,6 +271,8 @@ class KVCacheManager:
             num_new_tokens: 本轮新增计算 token 数，不含前缀命中。
             num_new_computed_tokens: 本次新命中的前缀 token 数。
             new_computed_blocks: 与新命中 token 对应的物理块包装。
+            has_scheduled_reqs: 本轮是否已调度其他请求；仅对 WAITING/PREEMPTED
+                的接纳启用 watermark，不影响 RUNNING 请求继续执行。
 
         Returns:
             new_blocks: 本次新增块的包装；容量不足返回 None，且不改变映射和引用。
@@ -284,7 +309,14 @@ class KVCacheManager:
             block.ref_cnt == 0 and not block.is_null
             for block in new_computed_block_list
         )
-        if num_new_blocks + num_evictable_blocks > self.get_num_free_blocks():
+        # 首个请求必须仍可启动；本轮已有工作时才对新增/恢复请求保留安全余量。
+        watermark_blocks = 0
+        if has_scheduled_reqs and request.status in (
+            RequestStatus.WAITING, RequestStatus.PREEMPTED,
+        ):
+            watermark_blocks = self.watermark_blocks
+        required_blocks = num_new_blocks + num_evictable_blocks + watermark_blocks
+        if required_blocks > self.get_num_free_blocks():
             return None  # 容量检查必须早于 touch 和任何请求状态修改。
 
         req_blocks = self.req_to_blocks[request.request_id]

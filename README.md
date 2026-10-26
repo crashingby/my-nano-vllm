@@ -104,6 +104,13 @@ finally:
 
 `silu_and_mul_backend` 可选 `torch`、`triton`、`cutedsl`，默认 `torch` 使用 `torch.compile`。后端在模型层构造时绑定；选用 `cutedsl` 前安装对应 extra。
 
+前缀缓存由 `CacheConfig(enable_prefix_caching=True)` 控制，关闭时也停止生成请求
+block hashes。`prefix_match_unit` 可省略；当前单 KV group 启用缓存时须等于
+`block_size`。`SchedulerConfig(watermark=0.0)` 控制接纳等待/恢复请求时的 KV 余量，
+范围为 `[0, 1)`，默认 0.0；例如 0.05 表示按总 block 数向下取整预留 5%。
+`example.py` 和两个 benchmark 对应提供 `--block-size`、
+`--no-enable-prefix-caching`、`--prefix-match-unit` 和 `--watermark`。
+
 ## 测试与文档
 
 在项目根目录执行算子测试：

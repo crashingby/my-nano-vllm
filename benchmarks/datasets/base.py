@@ -70,6 +70,7 @@ class BenchmarkDataset(ABC):
         self.dataset_path = Path(path).expanduser()
         if not self.dataset_path.exists():
             raise FileNotFoundError(f"Dataset path not found: {self.dataset_path}")
+        self.system_prompt: str | None = config.system_prompt  # 配置已规范化；None 保持单 user 模板。
 
     @abstractmethod
     def load_data(self) -> Iterator[DatasetSample]:
@@ -80,8 +81,7 @@ class BenchmarkDataset(ABC):
         """
         raise NotImplementedError
 
-    @staticmethod
-    def _encode_prompt(tokenizer: PreTrainedTokenizerBase, prompt: str) -> list[int]:
+    def _encode_prompt(self, tokenizer: PreTrainedTokenizerBase, prompt: str) -> list[int]:
         """应用统一对话模板并编码，关闭 Qwen3 thinking。
 
         模板已经提供角色和特殊 token，因此 encode 不再重复添加特殊 token。
@@ -90,8 +90,12 @@ class BenchmarkDataset(ABC):
         Returns:
             prompt_ids: 应用统一聊天模板并编码后的 token ID 列表，包含模板特殊 token。
         """
+        messages: list[dict[str, str]] = []  # system 位于可变 user 文本前，保留完整共享前缀。
+        if self.system_prompt is not None:
+            messages.append({"role": "system", "content": self.system_prompt})
+        messages.append({"role": "user", "content": prompt})
         chat_prompt = tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
+            messages,
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=False,
@@ -116,6 +120,7 @@ class BenchmarkDataset(ABC):
         template_tokens = len(self._encode_prompt(tokenizer, ""))
         content_ids = tokenizer.encode(prompt, add_special_tokens=False)
         keep = min(len(content_ids), max_prompt_tokens - template_tokens)
+        # 模板开销包含完整 system；只缩减 user，避免长度限制破坏共享前缀。
         # 每次失败都减少保留量，保证分词边界变化不会导致无限重试。
         while keep > 0:
             head = (keep + 1) // 2

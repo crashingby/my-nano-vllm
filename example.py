@@ -24,6 +24,13 @@ def main() -> None:
         "--gpu-memory-utilization", type=float, default=0.9, help="当前实例的 GPU 显存预算比例。",
     )
     parser.add_argument("--cuda-graph", action="store_true", help="启用 FULL decode CUDA Graph。")
+    parser.add_argument("--block-size", type=int, default=256, help="Manager KV block 的 token 数。")
+    parser.add_argument(
+        "--enable-prefix-caching", action=argparse.BooleanOptionalAction, default=True,
+        help="开启前缀复用；--no-enable-prefix-caching 同时关闭 Request hash 生成。",
+    )
+    parser.add_argument("--prefix-match-unit", type=int, help="当前启用缓存时须等于 block-size。")
+    parser.add_argument("--watermark", type=float, default=0.0, help="新请求接纳时的 KV 预留比例，范围 [0, 1)。")
     args = parser.parse_args()
     path = os.path.expanduser(args.model)
     # 当前示例只有同进程单卡 Worker，使用回环地址建立本地 process group 即可。
@@ -40,8 +47,14 @@ def main() -> None:
         scheduler_config=SchedulerConfig(
             max_num_batched_tokens=256,
             max_num_seqs=4,
+            watermark=args.watermark,
         ),
-        cache_config=CacheConfig(gpu_memory_utilization=args.gpu_memory_utilization),
+        cache_config=CacheConfig(
+            block_size=args.block_size,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            enable_prefix_caching=args.enable_prefix_caching,
+            prefix_match_unit=args.prefix_match_unit,
+        ),
     )
     logger.info("Initializing LLM")
     llm = LLM(vllm_config=vllm_config)

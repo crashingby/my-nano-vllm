@@ -98,7 +98,7 @@ tokenize=True)` 得到 token IDs 后提交。`results` 的 `text` 和 `token_ids
 | 创建执行端 | `executor_class(vllm_config)` | Worker 已初始化设备并加载权重，正式 KV 尚未分配。 |
 | 查询规格与显存预算 | `get_kv_cache_specs()`、`determine_available_memory()` | 得到模型 KV 规格及可用于 KV 的字节预算。 |
 | 规划并初始化 KV | `get_kv_cache_configs()`、`initialize_from_config()` | 分配正式 KV，完成启动预热和配置要求的 Graph 捕获。 |
-| 初始化前缀哈希 | `init_none_hash()`、`get_request_block_hasher()` | 使用最终 `block_size` 建立请求共享的逻辑 block 哈希规则。 |
+| 解析粒度与前缀哈希 | `resolve_kv_cache_block_sizes()`、`get_request_block_hasher()` | 解析 scheduler/hash block 大小；仅启用前缀缓存时建立哈希根与共享 hasher。 |
 | 创建调度器及执行入口 | `Scheduler` / `AsyncScheduler`、`step_fn` | Scheduler 获得确定的 KV 容量，Engine 可开始接收请求。 |
 
 Scheduler 需要知道最终物理 KV 容量，才能做资源分配，因此在 KV 规划后创建。
@@ -109,6 +109,15 @@ Graph 捕获也要使用正式 KV 和输入 buffer 的地址，所以发生在�
 配置对象会在启动时回写 EOS、实际 KV block 数和编译统计等运行时信息。
 **每个 Engine 应创建独立配置**，不要把一个已初始化实例的配置当作无状态模板复用。
 
+`CacheConfig.enable_prefix_caching` 默认开启，关闭后 Request 的 hasher 为 `None`，
+KV 仍正常分配，但不查询或登记跨请求的前缀缓存。当前单 group、无上下文并行，
+`scheduler_block_size`、`hash_block_size` 和 group 的 `block_size` 相等；启用缓存时，
+显式设置的 `prefix_match_unit` 也须与之相等。
+
+`SchedulerConfig.watermark` 默认 0.0。非零时，本轮已有工作后再接纳等待/恢复请求，
+需要额外留下 `int(watermark * num_blocks)` 个空闲块；首个请求和已运行请求继续
+计算不受此门槛影响。这一策略由 Scheduler 传递给 KVCacheManager。
+
 ### 后续执行会用到哪些成员
 
 | 成员 | 语义 |
@@ -116,7 +125,7 @@ Graph 捕获也要使用正式 KV 和输入 buffer 的地址，所以发生在�
 | `vllm_config`、`tokenizer` | 完整配置，以及字符串编码、最终 completion 解码所需的 tokenizer。 |
 | `model_executor` | Engine 访问 Worker 的边界，负责执行端生命周期、模型执行及采样调用。 |
 | `available_gpu_memory_for_kv_cache` | profiling 测得的 KV 字节预算，不是剩余显存的实时查询结果。 |
-| `request_block_hasher` | 构造 Request 时使用的完整逻辑 block 哈希函数。 |
+| `request_block_hasher` | 构造 Request 时使用的共享 block 哈希函数，关闭前缀缓存时为 `None`。 |
 | `scheduler` | 请求队列、逻辑进度和 Scheduler 侧 KV 管理的所有者。 |
 | `async_scheduling`、`batch_queue_size` | 初始化时确定的执行策略；当前同步容量记为 1，异步容量为 2。 |
 | `batch_queue` | 异步时保存 `(结果 Future, 原始 SchedulerOutput)`；同步时为 `None`。 |
