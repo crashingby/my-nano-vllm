@@ -5,4 +5,6 @@ vLLM ``distributed`` 包相近，避免 Worker、模型层以后需要跨目录�
 """
 
 
+from .communication_op import *
 from .parallel_state import *
+from .utils import *

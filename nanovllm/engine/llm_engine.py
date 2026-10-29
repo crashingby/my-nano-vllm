@@ -60,7 +60,7 @@ class LLMEngine:
         vllm_config: 调用方传入的完整配置引用；初始化时回写 EOS、物理 KV block
             数和编译耗时，执行端与 Scheduler 从同一对象读取子配置。
         tokenizer: 将字符串 prompt 编码为 token IDs、将 completion 解码为文本。
-        model_executor: 创建和调用 Worker 的执行端；当前选择单卡 UniProcExecutor。
+        model_executor: 按配置创建和调用 Worker 的 uni、mp 或自定义执行端。
         available_gpu_memory_for_kv_cache: profiling 得到的 KV 字节预算，测量前为 -1。
         request_block_hasher: 所有 Request 共享的完整逻辑 block 哈希构造函数；
             关闭前缀缓存时为 None，不生成无消费者的 hash。
@@ -145,7 +145,7 @@ class LLMEngine:
             hash_block_size=hash_block_size,
             include_finished_set=True,
         )
-        # 当前只有单 Worker，异步模式先允许两批工作在途。
+        # 单机纯 TP 的各 Worker 执行同一批次序列，异步模式先允许两批工作在途。
         self.batch_queue_size = 2 if self.async_scheduling else 1
         self.batch_queue: (
             deque[tuple[Future[ModelRunnerOutput], SchedulerOutput]] | None
@@ -173,14 +173,15 @@ class LLMEngine:
         """测量 KV 字节预算、规划物理 pages，并初始化和预热执行端。
 
         由 __init__() 在权重加载后调用，流程沿用 vLLM EngineCore 的同名接口。
-        当前仅有一个 Worker 和一个 FullAttention group，因此该 Worker 的配置
-        可以直接供 Scheduler 使用，不需要跨 Worker 的调度布局投影。
+        纯 TP 的各 Worker 使用相同的逻辑 KV 布局和统一 block 数，因此 rank 0
+        的配置可直接供 Scheduler 使用。KV 初始化和模型预热分别由两个
+        Executor 接口执行，前者全部成功返回后才进入后者。
 
         Args:
             vllm_config: 当前完整配置，提供模型长度、KV 策略和可选 block 数覆盖值。
 
         Returns:
-            scheduler_kv_cache_config: Scheduler 与唯一 Worker 共同使用的 KVCacheConfig。num_blocks 包含
+            scheduler_kv_cache_config: Scheduler 使用的统一逻辑 KVCacheConfig。num_blocks 包含
                 保留空块 0，请求可分配 block 数为 num_blocks - 1。
 
         Side Effects:
@@ -190,11 +191,11 @@ class LLMEngine:
         """
         # start 记录 profiling、KV 分配和预热这一整个启动阶段的起点，单位为秒。
         start = perf_counter()
-        # kv_cache_specs 按 Worker rank 收集 layer_name -> KVCacheSpec；当前列表长度为 1。
+        # kv_cache_specs 按 Worker rank 收集 layer_name -> KVCacheSpec。
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
         # available_gpu_memory 的每一项是对应 Worker 可用于 KV 的字节预算，不是 block 数。
         available_gpu_memory = self.model_executor.determine_available_memory()
-        # 当前唯一 Worker 就是 rank 0；保留原始 profiling 预算，便于启动后查看显存规划。
+        # 保留 rank 0 的原始 profiling 预算；各 rank 的实际预算全部交给规划器。
         self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
         # kv_cache_configs 按 rank 描述实际分配方案；规划器校验预算并应用 block 数覆盖值。
         kv_cache_configs = get_kv_cache_configs(
@@ -202,7 +203,7 @@ class LLMEngine:
             kv_cache_specs,
             available_gpu_memory,
         )
-        # 单卡下 Worker 配置与 Scheduler 布局相同，直接使用同一个配置对象。
+        # 纯 TP 各 rank 的层布局一致，规划器已把容量收缩到共同的最小 block 数。
         scheduler_kv_cache_config = kv_cache_configs[0]
         # 容量镜像包含空块 0；Scheduler 仍以正式 KVCacheConfig 作为实际分配依据。
         vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
@@ -213,8 +214,10 @@ class LLMEngine:
             vllm_config.cache_config.block_size = min(
                 group.kv_cache_spec.block_size for group in kv_cache_groups
             )
-        # 此接口会先分配和绑定正式 KV，再预热和捕获图，保证 Graph 引用最终 KV 地址。
+        # 先等待所有 Worker 分配和绑定正式 KV，确保后续 Graph 使用最终存储地址。
         self.model_executor.initialize_from_config(kv_cache_configs)
+        # 再独立触发预热与 Graph 捕获，由 Executor 汇总各 rank 的编译时间。
+        self.model_executor.compile_or_warm_up_model()
         # elapsed 是整个 KV 启动阶段的墙钟耗时，与 Executor 汇总的模型级编译时间不同。
         elapsed = perf_counter() - start
         logger.info(

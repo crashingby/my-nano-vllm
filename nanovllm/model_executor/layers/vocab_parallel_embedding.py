@@ -6,15 +6,21 @@ VocabParallelEmbedding 执行 token 查表，ParallelLMHead 保存输出投影�
 """
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
+
+from nanovllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
+from nanovllm.model_executor.utils import set_weight_attrs
 
 
 class VocabParallelEmbedding(nn.Module):
     """保存本 rank 的词表分片，并汇总各 rank 的 embedding 结果。
 
-    当前默认进程组就是 TP 组，构造前须初始化 torch.distributed。
+    构造前须初始化 TP 组；词表分片使用组内 rank，不依赖默认 world 布局。
     不对词表补齐，因此 num_embeddings 必须能被 TP size 整除。
     """
 
@@ -34,8 +40,8 @@ class VocabParallelEmbedding(nn.Module):
             实际精度和设备沿用模型加载期间的默认 dtype 与设备上下文。
         """
         super().__init__()
-        self.tp_rank = dist.get_rank()  # 当前项目 world 与 TP 组一致。
-        self.tp_size = dist.get_world_size()  # 各 rank 持有不同的词表行区间。
+        self.tp_rank = get_tensor_model_parallel_rank()  # 组内编号决定本地词表区间。
+        self.tp_size = get_tensor_model_parallel_world_size()
         assert num_embeddings % self.tp_size == 0
         self.num_embeddings = num_embeddings  # checkpoint 中未分片的词表行数。
         self.embedding_dim = embedding_dim  # 每行 embedding 的元素数。
@@ -47,7 +53,7 @@ class VocabParallelEmbedding(nn.Module):
             torch.empty(self.num_embeddings_per_partition, embedding_dim)
         )
         # 模型权重加载器通过 Parameter 上的接口完成 TP 切片。
-        self.weight.weight_loader = self.weight_loader
+        set_weight_attrs(self.weight, {"weight_loader": self.weight_loader})
 
     def weight_loader(
         self,
@@ -95,7 +101,8 @@ class VocabParallelEmbedding(nn.Module):
         output_parallel = F.embedding(masked_input.long(), self.weight)
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-            dist.all_reduce(output_parallel)  # 每个 token 只有所属 rank 提供非零贡献。
+            # 每个 token 只有所属 TP rank 提供非零贡献，组内求和恢复完整 embedding。
+            output_parallel = tensor_model_parallel_all_reduce(output_parallel)
         return output_parallel
 
 

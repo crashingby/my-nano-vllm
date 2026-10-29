@@ -5,7 +5,7 @@ Executor 负责创建 Worker、组织调用并适配结果。Engine 通过此边
 请求调度与 KV 规划位于 Engine / Scheduler 一侧，输入准备与模型执行位于 Worker /
 GPUModelRunner 一侧。
 
-当前具体实现为单卡 UniProcExecutor，接口沿用 vLLM 的 rank 有序结果协议。
+具体实现包括 UniProcExecutor 和单机 MultiprocExecutor，沿用 vLLM 的 rank 有序结果协议。
 profile、sleep/wake 和额外 dummy batch 入口仍然保留，其 Worker 能力尚未接入；
 这些预留方法不参与当前正常启动和推理流程。
 """
@@ -24,7 +24,7 @@ from nanovllm.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from nanovllm.core.sched.output import SchedulerOutput
 from nanovllm.outputs import ModelRunnerOutput
 from nanovllm.worker.worker_base import WorkerBase,CompilationTimes
-
+from nanovllm.utils.import_utils import resolve_obj_by_qualname
 logger = init_logger(__name__)
 
 
@@ -38,13 +38,14 @@ FailureCallback = Callable[[], None]
 class Executor(ABC):
     """约定 Worker 的创建、KV 初始化、执行调用及结果返回方式。
 
-    当前 get_class() 只选择 TP=1 的 UniProcExecutor，其 Worker 与调用方位于
-    同一进程。基类仍以按 rank 排列的列表表示普通 RPC 结果，模型执行接口则
+    get_class() 按配置选择 uni、mp 或自定义实现。基类以按 rank 排列的列表
+    表示普通 RPC 结果，模型执行接口则
     向 Engine 返回单个 ModelRunnerOutput、None 或子类提供的单结果 Future。
 
     构造完成时 Worker 已加载权重，正式 KV cache 尚未分配。调用方应先查询
     get_kv_cache_specs() 与 determine_available_memory()，用规划器生成配置，
-    再调用 initialize_from_config() 分配正式 KV 并预热，随后才能执行真实请求。
+    再调用 initialize_from_config() 分配正式 KV，最后调用
+    compile_or_warm_up_model() 完成预热，随后才能执行真实请求。
 
     execute_model() 的默认实现仅处理同步调用；sample_tokens() 保留上游的
     取首项写法。当前 UniProcExecutor 覆盖这两个方法，负责单结果与 Future
@@ -60,28 +61,48 @@ class Executor(ABC):
     supports_pp: bool = False
     @staticmethod
     def get_class(vllm_config: NanovllmConfig) -> type[Executor]:
-        """根据已支持的并行范围，返回具体 Executor 类但不创建其实例。
+        """按配置解析具体 Executor 类，不创建 Worker 或查询 GPU。
 
         Args:
-            vllm_config: 当前完整配置，使用 parallel_config.tensor_parallel_size
-                判断能否选择单进程实现。配置对象可以表达大于 1 的 TP size，
-                但当前没有对应的多进程 Executor。
+            vllm_config: 当前完整配置，parallel_config 已将默认后端解析为 uni 或 mp。
 
         Returns:
-            executor_class: UniProcExecutor 类；Worker 创建与模型加载发生在随后构造实例时。
+            executor_class: 具体执行器类；资源创建与模型加载发生在随后构造实例时。
 
         Raises:
-            NotImplementedError: tensor_parallel_size 不为 1。
+            TypeError: 自定义类或导入路径没有指向 Executor 子类。
+            ValueError: 后端未解析或无法识别。
         """
-        # 在创建 Worker 和 CUDA 资源前拒绝当前执行器不能承载的 TP 配置。
-        if vllm_config.parallel_config.tensor_parallel_size != 1:
-            raise NotImplementedError(
-                "Tensor parallel execution is not implemented yet"
-            )
+        executor_class: type[Executor]
+        parallel_config = vllm_config.parallel_config
+        distributed_executor_backend = parallel_config.distributed_executor_backend
+        if isinstance(distributed_executor_backend, type):
+            if not issubclass(distributed_executor_backend, Executor):
+                raise TypeError(
+                    "distributed_executor_backend must be a subclass of "
+                    f"Executor. Got {distributed_executor_backend}."
+                )
+            executor_class = distributed_executor_backend
+        elif distributed_executor_backend == "mp":
+            from nanovllm.executor.multiproc_executor import MultiprocExecutor
 
-        # 延迟导入具体子类，避免 abstract 与 uniproc_executor 在模块加载时循环依赖。
-        from nanovllm.executor.uniproc_executor import UniProcExecutor
-        return UniProcExecutor
+            executor_class = MultiprocExecutor
+        elif distributed_executor_backend == "uni":
+            from nanovllm.executor.uniproc_executor import UniProcExecutor
+
+            executor_class = UniProcExecutor
+        elif isinstance(distributed_executor_backend, str):
+            executor_class = resolve_obj_by_qualname(distributed_executor_backend)
+            if not isinstance(executor_class, type) or not issubclass(executor_class, Executor):
+                raise TypeError(
+                    "distributed_executor_backend must be a subclass of "
+                    f"Executor. Got {executor_class}."
+                )
+        else:
+            raise ValueError(
+                f"Unknown distributed executor backend: {distributed_executor_backend}"
+            )
+        return executor_class
     def __init__(self, vllm_config: NanovllmConfig) -> None:
         """保存配置、创建并加载 Worker，随后初始化预留的休眠状态。
 
@@ -98,6 +119,12 @@ class Executor(ABC):
         """
         # Worker 创建与后续 RPC 均使用同一配置；预热统计也写回此对象。
         self.vllm_config=vllm_config
+        self.model_config = vllm_config.model_config
+        self.cache_config = vllm_config.cache_config
+        self.load_config = vllm_config.load_config
+        self.parallel_config = vllm_config.parallel_config
+        self.scheduler_config = vllm_config.scheduler_config
+        self.device_config = vllm_config.device_config
         # 由具体子类完成资源创建；返回时权重已加载，正式 KV cache 仍待规划。
         self._init_executor()
         # 初始未休眠是控制状态，不代表已经分配 KV 或完成预热。
@@ -118,39 +145,50 @@ class Executor(ABC):
         raise NotImplementedError
     def initialize_from_config(
         self,
-        kv_cache_configs:list[KVCacheConfig],
-    )->None:
-        """下发正式 KV 分配方案，完成预热并汇总模型级编译时间。
+        kv_cache_configs: list[KVCacheConfig],
+    ) -> None:
+        """下发各 rank 的正式 KV 方案，完成缓存分配与运行时绑定。
 
-        在权重加载、显存 profiling 和 Engine KV 规划后调用。先将完整配置列表
-        交给 Wrapper 按 global_rank 取出本地方案；初始化成功后，再触发
-        compile_or_warm_up_model()。该顺序使正式 Graph 捕获使用最终 KV 地址。
+        在权重加载、显存 profiling 和 Engine KV 规划后调用。完整配置列表
+        交给 Wrapper 按 global_rank 取出本地方案。本接口返回后，Engine
+        再显式调用 compile_or_warm_up_model()，使用最终 KV 地址预热和捕获图。
 
         Args:
             kv_cache_configs: 按全局 Worker rank 排列的分配计划。单卡输入为
                 [config0]，Wrapper 最终调用 worker.initialize_from_config(config0)。
 
         Side Effects:
-            Worker 分配并绑定正式 KV，创建 Attention metadata Builder，预热
-            模型执行与采样路径，并按配置捕获 Graph。最后回写
-            compilation_config.compilation_time，单位为秒；该统计不等于整个
-            预热或 Graph 捕获的墙钟时间。任一步骤失败均继续向上传播。
+            Worker 分配并绑定正式 KV，创建 Attention metadata Builder 和
+            Dispatcher keys；不执行模型预热、Graph 捕获或编译耗时汇总。
+            任意 rank 初始化失败时继续向上传播异常。
         """
         # 配置列表作为一个位置参数传给 Wrapper，由其按 global_rank 选择本地配置。
         self.collective_rpc(
             "initialize_from_config",
             args=(kv_cache_configs,),
         )
-        # compilation_times 按 RPC rank 保存每个 Worker 的 CompilationTimes；
-        # 先完成正式 KV 初始化，再执行内核、Graph 和 sampler 的启动准备。
-        compilation_times: list[CompilationTimes]=self.collective_rpc("compile_or_warm_up_model")
-        # compilation_times 非空时才回填统计；当前列表只有一个 Worker 的编译时间记录。
+
+    def compile_or_warm_up_model(self) -> None:
+        """触发各 Worker 预热与 Graph 捕获，并汇总模型级编译时间。
+
+        由 Engine 在 initialize_from_config() 成功返回后单独调用。Worker
+        返回 CompilationTimes，Executor 消费按 rank 排列的结果列表，并把
+        并行 Worker 中最大的模型级编译耗时回写到父进程配置。
+
+        Side Effects:
+            Worker 预热内核与采样路径，按配置捕获 Graph 并重置采样随机状态。
+            回写 compilation_config.compilation_time，单位为秒；该数值不是
+            整个预热阶段的墙钟时间。任意 rank 预热失败时继续向上传播异常。
+        """
+        compilation_times: list[CompilationTimes] = self.collective_rpc(
+            "compile_or_warm_up_model"
+        )
+        # 多进程配置不共享内存；显式汇总所有 rank 的返回值，反映并行编译耗时。
         if compilation_times:
-            # t 是某个 Worker 的秒数统计；沿用 vLLM 取最大值，表达并行启动的编译耗时。
             self.vllm_config.compilation_config.compilation_time = max(
                 t.language_model for t in compilation_times
             )
-            
+
     def register_failure_callback(
         self,
         callback: FailureCallback,
@@ -385,8 +423,8 @@ class Executor(ABC):
     def execute_dummy_batch(self) -> None:
         """保留向 Worker 提交额外 dummy batch 的接口，当前 GPU Worker 尚未实现。
 
-        正常启动预热已由 initialize_from_config() 内的 compile_or_warm_up_model()
-        完成。本方法只转发同名命令；当前 UniProc 调用会因目标方法不存在而抛出
+        正常启动预热由独立的 compile_or_warm_up_model() 完成。本方法只转发
+        同名命令；当前 UniProc 调用会因目标方法不存在而抛出
         NotImplementedError，保留此入口不表示已具备额外 dummy 执行能力。
         """
         # 将预留命令交给统一 RPC 解析，当前不以其他 Worker 方法替代该命令。

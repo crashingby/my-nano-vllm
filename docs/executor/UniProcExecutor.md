@@ -282,7 +282,8 @@ Wrapper 按 `rpc_rank=0` 选择第 0 项，用它构造 GPU Worker。`init_devic
 1. `get_kv_cache_specs()` 通过本地 RPC 收集 `[specs0]`。
 2. `determine_available_memory()` 通过本地 RPC 测量并返回 `[budget0]`。
 3. Engine 为 rank 0 规划 `config0`，调用 `initialize_from_config([config0])`。
-4. Wrapper 选择 `config0` 交给 GPU Worker；基类随后调用预热入口，完成内核准备、按配置捕获图及采样预热。
+4. Wrapper 选择 `config0` 交给 GPU Worker，完成正式 KV 分配与绑定。
+5. Engine 单独调用 Executor 的 `compile_or_warm_up_model()`，再经 RPC 转发到 Worker，完成内核准备、按配置捕获图及采样预热，并汇总编译时间。
 
 这让正式图捕获使用最终分配的 KV 地址。构造与 KV 规划分为前后两个阶段，Engine 用真实加载后的预算决定可分配容量。
 

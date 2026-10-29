@@ -12,7 +12,7 @@ from __future__ import annotations
 import ipaddress
 import socket
 import warnings
-
+from uuid import uuid4
 import nanovllm.envs as envs
 from nanovllm.logger import init_logger
 
@@ -98,6 +98,14 @@ def get_tcp_uri(ip: str, port: int) -> str:
     else:
         return f"tcp://{ip}:{port}"
 
+
+def get_open_zmq_ipc_path() -> str:
+    base_rpc_path = envs.VLLM_RPC_BASE_PATH
+    return f"ipc://{base_rpc_path}/{uuid4()}"
+
+
+def get_open_zmq_inproc_path() -> str:
+    return f"inproc://{uuid4()}"
 
 def get_open_port() -> int:
     """查询一个当前可绑定的通信端口，沿用 vLLM 的公开入口。

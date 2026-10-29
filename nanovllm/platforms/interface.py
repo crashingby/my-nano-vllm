@@ -3,7 +3,7 @@
 """保留 vLLM 的平台与设备能力接口，目前只定义 CUDA 所需的公共约定。"""
 
 from __future__ import annotations
-
+import functools
 import enum
 import platform
 from typing import Any, NamedTuple
@@ -15,6 +15,32 @@ from nanovllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+_assigned_physical_gpu_ids: list[int] | None = None
+
+def set_assigned_physical_gpu_ids(ids: list[int]) -> None:
+    """Set the physical GPU IDs assigned to this worker process.
+    Called during worker init so that device_id_to_physical_device_id()
+    can map local_rank to the correct physical device without relying
+    on CUDA_VISIBLE_DEVICES.
+
+    Idempotent: a second call with the same value is a no-op.
+    Raises RuntimeError if called again with a different value.
+
+    This is expected to run during single-threaded worker initialization."""
+    global _assigned_physical_gpu_ids
+    if _assigned_physical_gpu_ids is not None:
+        if _assigned_physical_gpu_ids != ids:
+            raise RuntimeError(
+                f"set_assigned_physical_gpu_ids called with conflicting values: "
+                f"existing={_assigned_physical_gpu_ids}, new={ids}"
+            )
+        return
+    _assigned_physical_gpu_ids = ids
+
+def get_assigned_physical_gpu_ids() -> list[int] | None:
+    return _assigned_physical_gpu_ids
+
+@functools.cache
 def in_wsl() -> bool:
     """按 vLLM 的 uname 检测流程判断宿主是否处于 WSL，不查询 CUDA。
 
@@ -336,6 +362,10 @@ class Platform:
             fp8_dtype: 当前平台使用的 FP8 dtype 标识，不执行量化或分配 tensor。
         """
         return torch.float8_e4m3fn
+    @classmethod
+    def use_all_gather(cls) -> bool:
+        """Whether to use allgather in LogitsProcessor to gather the logits."""
+        return True
 
     @classmethod
     def use_custom_allreduce(cls) -> bool:

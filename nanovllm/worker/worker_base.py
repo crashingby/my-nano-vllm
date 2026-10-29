@@ -47,7 +47,7 @@ class WorkerBase:
     具体 Worker 应遵守的调用约定，Executor 通过 WorkerWrapperBase 访问这些接口。
 
     正常启动先调用 init_device() 和 load_model()，再查询 KV 规格、测量显存并
-    下发正式 KV 分配方案，最后执行 compile_or_warm_up_model()。GPU Worker 的
+    下发正式 KV 分配方案，最后独立执行 compile_or_warm_up_model()。GPU Worker 的
     显存测量和 KV 初始化入口由具体类提供，Wrapper 按同名方法转发。
 
     Attributes:
@@ -214,7 +214,8 @@ class WorkerBase:
 
         Side Effects:
             具体实现可触发 JIT、更新固定输入缓冲区、捕获 Graph，并调整进程级
-            GC 策略。模拟采样可以消耗 RNG 状态，但不提交真实请求的生成结果。
+            GC 策略。模拟采样消耗 RNG 后应恢复正式推理的随机初态，不提交
+            真实请求的生成结果。
         """
         raise NotImplementedError
     @property
@@ -392,6 +393,8 @@ class WorkerWrapperBase:
         )
         # 保存同一个配置引用，不从 kwargs 中移除，Worker(**kwargs) 仍接收该对象。
         self.vllm_config = vllm_config
+
+        shared_worker_lock = kwargs.pop("shared_worker_lock", None)
         # 延迟导入 GPU 实现，避免 gpu_worker 继承 WorkerBase 时形成模块循环依赖。
         from nanovllm.worker.gpu_worker import Worker
         # 沿用 vLLM 的构造上下文，使 get_current_config() 可读取本实例配置；
@@ -452,7 +455,8 @@ class WorkerWrapperBase:
 
         Python 先查找 Wrapper 自己的方法和字段，找不到才进入此处。因此
         init_device()、initialize_from_config() 使用 Wrapper 的显式适配，
-        get_kv_cache_spec()、execute_model()、sample_tokens() 等访问由此转发。
+        compile_or_warm_up_model()、get_kv_cache_spec()、execute_model()、
+        sample_tokens() 等访问由此转发。
 
         对方法名返回绑定到真实 Worker 的方法对象，调用方随后执行该方法；
         本函数不立即调用方法，不缓存属性，也不额外安装配置上下文。

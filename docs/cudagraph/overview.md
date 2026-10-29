@@ -403,7 +403,7 @@ PIECEWISE 片段如果主要依赖 packed token 行数，Dispatcher 可以让 ke
 1. 加载模型，按配置给模型安装 FULL Wrapper。
 2. 进行模型内存 profiling；启用 Graph 时，`profile_cudagraph_memory()` 使用临时 KV 环境估算图内存，随后清理临时图和绑定。
 3. 根据正式内存预算分配 KV cache，解析 Attention 能力，初始化 Dispatcher keys 和 metadata Builder。
-4. `compile_or_warm_up_model()` 预热相关 kernel，调用 `capture_model()`，按 Dispatcher 计划预热并捕获各个档位。
+4. `_compile_or_warm_up_model()` 预热相关 kernel，调用 `capture_model()`，按 Dispatcher 计划预热并捕获各个档位。
 5. 关闭新增捕获许可，在线请求使用已经捕获的图或回退 eager。
 
 `_dummy_run()` 准备合法的 dummy 输入和 metadata，`_warmup_and_capture()` 组织预热及捕获调用，真正的 `torch.cuda.graph()` 在 `CUDAGraphWrapper` 内部执行。各模式内按大尺寸到小尺寸捕获，使用共享 Graph pool；pool 是 PyTorch allocator 的分配复用机制，不是 CUDA Runtime 新增的一种图节点。

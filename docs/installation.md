@@ -10,7 +10,7 @@
 | Python | `>=3.10,<3.13`，对应 Python 3.10～3.12。 |
 | GPU | NVIDIA CUDA GPU；项目的 FA2 路径要求计算能力至少 SM 8.0，模型 Attention 使用 FP16/BF16。 |
 | PyTorch | CUDA 构建，满足项目最低 API 要求；按驱动与平台选择 wheel。 |
-| C++ 工具链 | 启用 CUDA Graph 时，需要 C++ 编译器与 Ninja 构建项目的 host 扩展。 |
+| C++ 工具链 | 启用 CUDA Graph 或 spinloop 等待扩展时，需要 C++ 编译器与 Ninja。 |
 | CUDA Toolkit | 从源码构建 FlashAttention 时需要可用的 `nvcc` 与兼容工具链。 |
 
 系统驱动、PyTorch 自带的 CUDA runtime，以及 `nvcc` 所属的 Toolkit 是不同层次。安装 PyTorch 时使用 [官方安装页](https://pytorch.org/get-started/locally/) 生成适合当前机器的命令，先确认 GPU 可用。
@@ -26,6 +26,7 @@
 | `numpy`、`pydantic` | CPU 输入准备、元数据与配置类型。 | 必需。 |
 | `safetensors`、`tqdm` | 本地权重读取与进度显示。 | 必需。 |
 | `typing-extensions`、`cloudpickle` | 类型兼容、执行方法序列化。 | 必需。 |
+| `pyzmq` | 多 Worker 消息队列通知与超大消息传递。 | 必需。 |
 | `ninja` | 构建按需加载的 LibTorch host 扩展。 | 基础安装包含。 |
 | `nvidia-cutlass-dsl` | CuTe DSL 的编译与运行支持，导入名为 `cutlass`。 | `cutedsl` extra。 |
 | `pyarrow` | 读取 Benchmark 的 Parquet 数据集。 | `benchmark` extra；JSONL 读取使用标准库。 |
@@ -91,6 +92,27 @@ MAX_JOBS=4 python -m pip install "flash-attn>=2.8.3,<2.9" --no-build-isolation
 ```
 
 项目的 `_nanovllm_C` 扩展只编译 host C++，无需 `nvcc`；FA2 的源码构建则包含 CUDA，两者的工具链要求不同。
+
+### 可选的 spinloop 等待扩展
+
+共享内存消息队列默认使用 Python/ZMQ 等待路径。需要使用原生 CPU 等待循环时，
+在启动进程前设置 `VLLM_USE_SPINLOOP_EXT=1`。仅设置此变量不会开启多 Worker；
+它只影响使用消息队列的执行路径。
+
+```shell
+export VLLM_USE_SPINLOOP_EXT=1
+python -c "from nanovllm.spinloop import spinloop; print(spinloop(b'0', lambda: True, timeout=0.1))"
+```
+
+首次导入使用当前 Python 的头文件，通过 PyTorch/Ninja 编译
+[`csrc/spinloop.cpp`](../nanovllm/csrc/spinloop.cpp)，后续进程复用构建缓存。
+无需安装 vLLM 或使用其 Python 3.11 ABI 产物，也不需要 `nvcc`。
+可用 `TORCH_EXTENSIONS_DIR` 指定缓存目录；将 `VLLM_USE_SPINLOOP_EXT` 设为 `0`
+或取消该变量可关闭队列的扩展路径。队列加载扩展失败时会输出原因并回退到
+Python/ZMQ；直接导入 `nanovllm.spinloop` 失败则抛出 `ImportError`。
+
+本机 Intel CPU 使用 PAUSE 回退路径；支持条件满足的 AMD CPU 可使用
+MONITORX/MWAITX。具体收益需要单独测量，不改变共享内存队列协议。
 
 ### 安装项目
 

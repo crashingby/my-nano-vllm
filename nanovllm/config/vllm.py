@@ -24,6 +24,7 @@ from nanovllm.config.parallel import ParallelConfig
 from nanovllm.config.scheduler import SchedulerConfig
 from nanovllm.config.utils import config
 from nanovllm.logger import init_logger
+from nanovllm.model_executor.layers.quantization import QuantizationConfig
 
 logger = init_logger(__name__)
 
@@ -48,7 +49,7 @@ class NanovllmConfig:
         eos: 初始 -1 表示尚未加载 tokenizer；Engine 加载后会用实际 EOS token ID
             覆盖该字段，供请求结束判断和 Scheduler 使用。
         parallel_config: TP size、派生 world_size 和 Worker 回写的 rank；当前
-            Engine 只选择 TP=1 的单进程执行器。
+            支持同进程单 Worker 或单机多进程 TP。
         cache_config: KV 分配策略及正式初始化后的容量镜像，真实分配方案由
             Engine 根据 Worker 规格和显存预算生成。
         compilation_config: CUDA Graph 策略、捕获尺寸、编译统计及静态 module 表；
@@ -56,6 +57,8 @@ class NanovllmConfig:
         load_config: checkpoint 加载格式、加载进度显示及可选目标设备。
         device_config: 模型执行设备描述；具体 GPU 由 Worker 按 local_rank 绑定。
         kernel_config: 各模型层在构造时绑定的算子实现，例如 SiLU × Mul 的后端。
+        quant_config: 可选的线性层权重方法配置，None 使用普通精度；当前没有
+            内置量化算法或按名称解析配置的入口，须传入具体子类实例。
     """
 
     # 模型配置必须显式提供，因为其中的 model 路径没有合理默认值。
@@ -78,9 +81,11 @@ class NanovllmConfig:
     device_config: DeviceConfig = field(default_factory=DeviceConfig)
     # 后端选择随 Engine 独立保存，模型层读取后绑定函数，不改全局 IR 默认策略。
     kernel_config: KernelConfig = field(default_factory=KernelConfig)
+    # 当前仅向 Qwen 的线性层传递；embedding、LMHead 和 KV cache 仍保留普通精度。
+    quant_config: QuantizationConfig | None = None
 
     def __post_init__(self) -> None:
-        """在总配置构造时检查容量，并完成后端无关的 Graph 配置解析。
+        """检查模型分片与调度容量，并完成后端无关的 Graph 配置解析。
 
         先检查 Scheduler 的 token budget 和请求容量，再处理 enforce_eager 与
         默认 Graph 策略，最后推导尺寸。例如未显式指定策略且未强制 eager 时，
@@ -94,9 +99,12 @@ class NanovllmConfig:
             不探测 GPU、加载权重或执行 Graph 捕获。
 
         Raises:
-            ValueError: Scheduler 容量关系不成立，或显式最大尺寸与尺寸列表冲突。
+            ValueError: 模型维度不能按 TP 分片、Scheduler 容量关系不成立，
+                或显式最大尺寸与尺寸列表冲突。
             AssertionError: 启用 Graph 时尺寸上限小于 1，或显式尺寸列表为空。
         """
+        # 模型结构与 TP 描述都已确定，先在父进程拒绝不支持的分片方案。
+        self.model_config.verify_with_parallel_config(self.parallel_config)
         # ModelConfig 已先校验并收紧 max_model_len；Scheduler 仅处理批处理容量关系。
         self.scheduler_config.verify_with_model_config(
             self.model_config.max_model_len,

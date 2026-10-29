@@ -2,7 +2,7 @@
 
 [`Executor`](../../nanovllm/executor/abstract.py) 是 Engine 操作执行端的公共入口。Engine 通过它查询 KV 存储规格与显存预算、下发分配方案，再逐轮提交调度结果并取得采样输出。具体 Executor 创建 Worker 端点，负责把这些调用送到执行端并整理返回值。
 
-一个 Executor 随 Engine 创建并持续使用。基类保存同一个 `vllm_config` 引用，构造时调用子类的 `_init_executor()` 建立执行环境；Worker 端点由子类持有。当前选择的 UniProcExecutor 在该阶段完成设备初始化和权重加载，随后 Engine 查询预算、规划正式 KV，再调用基类的 `initialize_from_config()` 完成执行准备。
+一个 Executor 随 Engine 创建并持续使用。基类保存同一个 `vllm_config` 引用，构造时调用子类的 `_init_executor()` 建立执行环境；Worker 端点由子类持有。当前选择的 UniProcExecutor 在该阶段完成设备初始化和权重加载，随后 Engine 查询预算、规划正式 KV，再依次调用 `initialize_from_config()` 和 `compile_or_warm_up_model()`，完成缓存分配与执行准备。
 
 基类主要组织调用顺序和结果。请求的权威进度由 Engine / Scheduler 保存，Worker / GPUModelRunner 保存执行侧请求镜像、输入 buffer、模型和 KV cache。每轮的 `SchedulerOutput` 与 `ModelRunnerOutput` 作为调用参数和返回值经过 Executor，供两侧同步进度。
 
@@ -181,7 +181,7 @@ available_memory = executor.determine_available_memory()
 rank0_budget_bytes = available_memory[0]
 ```
 
-### initialize_from_config()：下发 KV 方案并预热执行端
+### initialize_from_config()：下发并分配正式 KV
 
 ```python
 def initialize_from_config(
@@ -191,19 +191,54 @@ def initialize_from_config(
     ...
 ```
 
-**输入：** Engine 已规划的 KVCacheConfig 列表，按全局 Worker rank 排列。单卡输入为 `[config0]`，Wrapper 按自身 global rank 选取本地配置，交给 Worker 初始化。
+**输入：** Engine 已规划的 KVCacheConfig 列表，按全局 Worker rank 排列。Wrapper 按自身 global rank 选择本地配置，交给 Worker 初始化。
 
 **返回：** None。
 
-**状态变化：** 先通过 RPC 下发正式 KV 方案，Worker 分配并绑定 KV；成功后调用 `compile_or_warm_up_model()`，完成 kernel、模型、采样及配置要求的 Graph 捕获准备。最后收集 `CompilationTimes`，把各 Worker 的 `language_model` 最大值写入 `vllm_config.compilation_config.compilation_time`。
+**状态变化：** 通过 RPC 下发正式 KV 方案，Worker 分配并绑定 KV、创建 Attention metadata Builder 和 Dispatcher keys。此接口不执行模型预热、Graph 捕获或编译耗时汇总。
 
-**调用时机：** KV 规格查询、显存测量和 Engine KV 规划完成后，真实请求开始执行前。
+**调用时机：** KV 规格查询、显存测量和 Engine KV 规划完成后。
+
+### compile_or_warm_up_model()：预热并汇总编译耗时
+
+```python
+def compile_or_warm_up_model(self) -> None:
+    ...
+```
+
+**调用时机：** Engine 等待 `initialize_from_config()` 在所有 Worker 上成功返回后，单独调用此接口。正式 KV 地址已确定，Worker 才能进行内核、模型、sampler 预热及配置要求的 Graph 捕获。
+
+**返回与状态变化：** Worker 返回本 rank 的 `CompilationTimes`；Executor 收集按 rank 排列的结果，将 `language_model` 最大值写入 `vllm_config.compilation_config.compilation_time`，自身返回 None。任一 Worker 失败时异常继续向上传播。
 
 ```python
 executor.initialize_from_config(kv_cache_configs)
+executor.compile_or_warm_up_model()
 ```
 
-例如 Worker 返回 `CompilationTimes(language_model=0.25)`，单 Worker 的 RPC 结果为 `[CompilationTimes(language_model=0.25)]`，配置中的模型级编译时间回写为 0.25 秒。当前模型级编译统计通常为 0.0，整个预热和 Graph 捕获的耗时由其他计时项记录。
+例如各 Worker 分别返回 `CompilationTimes(language_model=0.25)` 和 `CompilationTimes(language_model=0.30)`，配置中的模型级编译时间回写为 0.30 秒。当前模型级编译统计通常为 0.0，整个预热和 Graph 捕获的墙钟耗时由 Engine 的初始化计时记录。
+
+```mermaid
+sequenceDiagram
+    participant E as Engine
+    participant X as Executor
+    participant R as WorkerWrapper
+    participant W as Worker
+    E->>X: initialize_from_config(configs)
+    X->>R: RPC：initialize_from_config(configs)
+    R->>W: initialize_from_config(configs[global_rank])
+    W-->>R: KV 分配与绑定完成
+    R-->>X: 当前 rank 初始化完成
+    X-->>E: 全部 rank 初始化完成
+    E->>X: compile_or_warm_up_model()
+    X->>R: RPC：compile_or_warm_up_model()
+    R->>W: 转发公开预热接口
+    W-->>R: CompilationTimes
+    R-->>X: 当前 rank 的编译统计
+    X->>X: 汇总各 rank 的最大编译耗时
+    X-->>E: 预热完成
+```
+
+图中省略了每个 rank 的重复调用。两次 RPC 对应两个独立阶段：先分配正式 KV，再预热执行路径。Worker 的 `_compile_or_warm_up_model()` 是内部实现，Engine 和 Executor 均调用公开接口。
 
 ## 每轮模型执行与采样
 
@@ -354,7 +389,7 @@ def execute_dummy_batch(self) -> None:
 
 **状态变化：** 具体 dummy 执行行为由 Worker 扩展定义。
 
-**调用时机：** 上层需要额外 dummy batch 时。当前正常启动的预热通过 `initialize_from_config()` 内的 `compile_or_warm_up_model()` 完成。
+**调用时机：** 上层需要额外 dummy batch 时。当前正常启动的预热通过独立的 `compile_or_warm_up_model()` 完成。
 
 ### profile()：提交性能 trace 的开始或停止命令
 
@@ -431,11 +466,12 @@ kv_cache_configs = get_kv_cache_configs(
     budgets_by_rank,
 )
 executor.initialize_from_config(kv_cache_configs)
+executor.compile_or_warm_up_model()
 ```
 
 假设查询得到 `specs_by_rank=[specs0]`、`budgets_by_rank=[536870912]`。Engine 规划器用 rank 0 的层规格和 512 MiB 字节预算生成 `config0`，结果列表为 `[config0]`。
 
-`initialize_from_config()` 把整份列表作为一个 RPC 参数传给端点，Wrapper 按 global rank 0 取出 config0，Worker 完成正式 KV 分配。随后 Executor 调用预热入口并收集 `[CompilationTimes(...)]`，回写模型级编译时间。正式 Graph 捕获因此使用已经确定的 KV 存储地址。
+`initialize_from_config()` 把整份列表作为一个 RPC 参数传给端点，Wrapper 按 global rank 0 取出 config0，Worker 完成正式 KV 分配。Engine 随后单独调用 Executor 的 `compile_or_warm_up_model()`；Executor 收集 `[CompilationTimes(...)]` 并回写模型级编译时间。正式 Graph 捕获因此使用已经确定的 KV 存储地址。
 
 ### 推理：六个 Query 最后返回三行请求结果
 

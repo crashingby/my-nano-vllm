@@ -64,7 +64,8 @@ def run_benchmark(
     with nvtx_range("init_llm"):
         llm = LLM(vllm_config=config.vllm_config)
     try:
-        set_random_seed(config.seed)  # 启动预热可能消耗 RNG，正式回放前重置生成初态。
+        # 通过 RPC 重置模型所在进程，mp 模式下父进程的 RNG 不决定采样结果。
+        set_random_seed(llm, model_config.seed)
         stats = replay(llm, requests, config.sampling_params, max_active)
         stats.log()  # 排序分位数和打印报告均发生在回放计时之后。
         if config.result_path is not None:
@@ -81,11 +82,18 @@ def _save_result(config: BenchmarkConfig, stats: BenchmarkStats) -> None:
     model_config = config.vllm_config.model_config  # 只导出可序列化的配置摘要。
     scheduler_config = config.vllm_config.scheduler_config
     cache_config = config.vllm_config.cache_config  # 记录缓存开关与接纳策略，避免不同策略混测。
+    parallel_config = config.vllm_config.parallel_config
+    backend = parallel_config.distributed_executor_backend
     report = {
         "config": {
             "model": model_config.model,
             "dtype": str(model_config.dtype),
             "enforce_eager": model_config.enforce_eager,
+            "tensor_parallel_size": parallel_config.tensor_parallel_size,
+            "distributed_executor_backend": (
+                backend if isinstance(backend, str)
+                else f"{backend.__module__}.{backend.__qualname__}"
+            ),
             "async_scheduling": scheduler_config.async_scheduling,
             "max_model_len": model_config.max_model_len,
             "max_active": scheduler_config.max_num_seqs,

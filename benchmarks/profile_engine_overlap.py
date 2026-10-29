@@ -238,7 +238,8 @@ def main() -> None:
             replace(params, max_tokens=output_len, ignore_eos=True),
             use_tqdm=False,
         )
-        set_random_seed(config.seed)  # 预热消耗 RNG，采集前恢复正式回放的初态。
+        # 真实请求预热也会消耗随机数，采集前重置所有 Worker 的 RNG。
+        set_random_seed(llm, config.vllm_config.model_config.seed)
         tracer = _OverlapTrace(llm)
         started = False
         try:

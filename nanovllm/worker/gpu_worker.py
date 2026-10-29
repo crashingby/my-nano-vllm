@@ -4,7 +4,7 @@ Executor 通过 WorkerWrapperBase 调用本模块的 Worker；Worker 负责绑�
 初始化通信环境、测量可用显存，并编排模型加载、KV 初始化和启动预热。
 GPUModelRunner 持有模型、KV tensor、固定输入缓冲区及请求镜像，负责实际执行。
 
-当前只接入单卡同步 Executor。保留 vLLM 的 Worker 接口与调用顺序，省略尚未
+通过同进程或多进程 Executor 调用。保留 vLLM 的 Worker 接口与调用顺序，省略尚未
 支持的 PP/DP、CuMem sleep/wake、KV transfer、profiler 和模型级编译分支。
 """
 
@@ -31,6 +31,7 @@ from nanovllm.utils.mem_utils import (
     format_gib,memory_profiling,
     memory_profiling,
     )
+from nanovllm.utils.torch_utils import set_torch_threads_for_runtime,set_random_seed
 from nanovllm.utils.mem_constants import GiB_bytes
 from nanovllm.utils.gc_utils import freeze_gc_heap
 from .utils import request_memory
@@ -41,8 +42,9 @@ logger = init_logger(__name__)
 class Worker(WorkerBase):
     """为一个模型执行 rank 管理 CUDA 资源，并向 Executor 暴露统一入口。
 
-    当前 UniProcExecutor 只创建 rank 0 的 Worker。rank 表示通信身份，local_rank
-    表示本机可见 GPU 编号；保留两者以对齐 vLLM，设备绑定始终使用 local_rank。
+    UniProcExecutor 创建 rank 0 的 Worker，MultiprocExecutor 为每个 TP rank
+    创建独立进程。rank 表示通信身份，local_rank 表示本机可见 GPU 编号，
+    设备绑定始终使用 local_rank。
 
     启动和执行按以下顺序组织。KV spec 与可用字节数交给 Engine 生成
     KVCacheConfig；Worker 接收该分配方案后，才创建正式 KV cache 和捕获图。
@@ -164,7 +166,7 @@ class Worker(WorkerBase):
             self.local_rank,
             current_platform.dist_backend,
         )
-
+        set_random_seed(self.model_config.seed)
         # 先回收不可达 Python 对象，使其不再持有临时 tensor。
         gc.collect()
         # 再归还 allocator 的空闲缓存；仍被对象引用的显存不会被 empty_cache() 释放。
@@ -200,6 +202,7 @@ class Worker(WorkerBase):
         with set_current_config(self.vllm_config):
             # 模型构造与加载全部归 Runner，Worker 不持有第二份模型实例。
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+        set_torch_threads_for_runtime()
 
     def get_model(self) -> torch.nn.Module:
         """查询 Runner 持有的原始模型，绕过外层执行 Wrapper。
@@ -351,8 +354,8 @@ class Worker(WorkerBase):
     
     def initialize_from_config(
         self,
-        kv_cache_config:KVCacheConfig,
-    )->None:
+        kv_cache_config: KVCacheConfig,
+    ) -> None:
         """接收 Engine 的 KV 分配方案，回填容量镜像并委托 Runner 创建缓存。
 
         determine_available_memory() 仅返回字节预算；KVCacheConfig 中的 block
@@ -425,8 +428,21 @@ class Worker(WorkerBase):
         """
         # 沿用 Runner 的同步 CPU 结果协议，Worker 不额外复制或重新排列采样行。
         return self.model_runner.sample_tokens()
-
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        """提供 Worker 的公开预热入口，返回本 rank 的 compilation_times。
+
+        Executor 在各 rank 的 initialize_from_config() 完成后调用本接口，
+        具体执行委托给私有实现；跨 rank 的耗时汇总由 Executor 负责。
+
+        Returns:
+            compilation_times: 本 rank 的模型级编译统计，单位为秒。
+
+        Side Effects:
+            预热内核和 sampler，按配置捕获 Graph、重置随机状态并冻结 GC 堆。
+        """
+        return self._compile_or_warm_up_model()
+
+    def _compile_or_warm_up_model(self) -> CompilationTimes:
         """在正式 KV cache 分配后预热内核、捕获 Graph 并预热采样路径。
 
         必须在 initialize_from_config() 完成后、正式请求进入 InputBatch 前调用。
@@ -434,8 +450,8 @@ class Worker(WorkerBase):
         启动执行才能使用与真实推理一致的地址和布局。
 
         沿用 vLLM 的顺序：编译尺寸预热、kernel_warmup、capture_model、
-        显存诊断、词表投影和 sampler 预热，最后冻结 Python GC 跟踪堆并返回
-        编译统计。当前没有模型级编译，warmup_sizes 保持空列表。
+        显存诊断、词表投影和 sampler 预热，再恢复随机种子，最后冻结 Python
+        GC 跟踪堆并返回编译统计。当前没有模型级编译，warmup_sizes 保持空列表。
 
         enforce_eager=True 只跳过 Graph 捕获，内核和 sampler 仍会预热。
         FA2 内核预热由 kernel_warmup() 使用至多 16 token 的 mixed batch 完成，
@@ -567,6 +583,8 @@ class Worker(WorkerBase):
         # _dummy_sampler_run 按这些行的形状另建随机输入，预热 LMHead 和 temperature
         # sampler；不消费真实 execute_model_state，也不将候选 token 回写请求。
         self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
+        # 启动加载和模拟采样会消耗随机数；正式推理前让所有 TP rank 恢复统一初态。
+        set_random_seed(self.model_config.seed)
         # 预热结束后冻结当前 Python GC 跟踪对象，减少常驻对象的后续循环 GC 扫描。
         # 这是进程级 GC 策略，不是冻结 CUDA Graph pool，也不是禁用未来对象的 GC。
         freeze_gc_heap()

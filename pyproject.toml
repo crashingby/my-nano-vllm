@@ -23,6 +23,8 @@ dependencies = [
     "typing-extensions",
     "msgspec", # EngineCoreOutput / EngineCoreOutputs 的数据结构。
     "cloudpickle", # Executor 的 callable 序列化入口。
+    "pyzmq", # 多 Worker 消息队列的通知与超大消息传递。
+    "setproctitle", # 设置 Worker 的操作系统进程标题，便于识别各 rank。
     "ninja", # 为按需编译 LibTorch 扩展提供构建工具。
 ]
 

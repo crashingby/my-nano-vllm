@@ -38,6 +38,7 @@ class ModelConfig:
             float/float32 或相应 torch.dtype，构造后统一为 torch.dtype。
             auto 保留声明的 FP16/BF16；FP32 或未声明时选择 FP16。当前暂不做
             vLLM 的平台能力自适应选择，也不改变 hf_config 中的原始精度。
+        seed: Worker 初始化和预热后使用的随机种子；同一 TP 组使用相同值。
         hf_config: 从 ``model`` 目录读取的 Hugging Face 配置。它是派生状态，不能
             由调用方传入，以免模型路径与结构配置不一致。
     """
@@ -50,6 +51,9 @@ class ModelConfig:
     enforce_eager: bool = False
     # HF 只提供 auto 的候选精度，运行时消费者统一读取这个已解析的字段。
     dtype: str | torch.dtype = "auto"
+
+    seed: int = 0  # 每个 Worker 读取该值，避免只重置父进程的采样状态。
+
     # Hugging Face 配置必须由 model 路径派生，禁止调用方注入另一个模型的配置。
     hf_config: PretrainedConfig = field(init=False)
 
@@ -113,11 +117,61 @@ class ModelConfig:
             )
         return vocab_size
 
+    def verify_with_parallel_config(self, parallel_config: ParallelConfig) -> None:
+        """在创建 Worker 前检查当前分片实现要求的 TP 整除关系。
+
+        Query heads、词表与 MLP 中间维度须能被 TP size 整除，词表暂不补齐。
+        KV heads 沿用 Qwen Attention 的分配规则：数量不少于 TP 时均分；
+        少于 TP 时复制，要求 TP size 是 KV head 数的整数倍。
+
+        Args:
+            parallel_config: 已解析 TP size 和执行器后端的并行配置。
+
+        Raises:
+            ValueError: 分片维度非正、无法均分，或 KV head 复制数不是整数。
+
+        本方法仅读取 HF 结构，不查询 GPU、不创建通信组或分配模型参数。
+        """
+        tp_size = parallel_config.tensor_parallel_size
+        num_heads = self.hf_config.num_attention_heads
+        dimensions = {
+            "num_attention_heads": num_heads,
+            "vocab_size": self.get_vocab_size(),
+            "intermediate_size": self.hf_config.intermediate_size,
+        }
+        # 逐项报出实际模型维度，避免启动子进程后才在权重加载器中触发断言。
+        for name, dimension in dimensions.items():
+            if dimension <= 0 or dimension % tp_size != 0:
+                raise ValueError(
+                    f"{name} ({dimension}) must be positive and divisible by "
+                    f"tensor_parallel_size ({tp_size})."
+                )
+
+        total_num_kv_heads = getattr(self.hf_config, "num_key_value_heads", num_heads)
+        if total_num_kv_heads <= 0:
+            raise ValueError(
+                f"num_key_value_heads ({total_num_kv_heads}) must be positive."
+            )
+        if total_num_kv_heads >= tp_size:
+            # 每个 rank 加载同样数量的完整 KV heads。
+            if total_num_kv_heads % tp_size != 0:
+                raise ValueError(
+                    f"num_key_value_heads ({total_num_kv_heads}) must be divisible "
+                    f"by tensor_parallel_size ({tp_size}) when partitioning KV heads."
+                )
+        else:
+            # 每个 rank 至少保留一个 KV head，连续 rank 按整数个副本共享源 head。
+            if tp_size % total_num_kv_heads != 0:
+                raise ValueError(
+                    f"tensor_parallel_size ({tp_size}) must be divisible by "
+                    f"num_key_value_heads ({total_num_kv_heads}) when replicating KV heads."
+                )
+
     def get_num_attention_heads(self, parallel_config: ParallelConfig) -> int:
         """返回当前 TP rank 的 Query head 数，供 Runner 建立执行布局。
 
         沿用 vLLM 的同名接口：模型总 Query head 数除以 TP size。当前只注册
-        Qwen3，结构信息直接来自 hf_config；实际 Engine 目前只选择 TP=1 执行器。
+        Qwen3，结构信息来自 hf_config；总配置构造时已检查 TP 整除关系。
 
         Args:
             parallel_config: 当前模型并行配置，提供 tensor_parallel_size。

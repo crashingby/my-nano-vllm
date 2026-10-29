@@ -12,6 +12,7 @@ from nanovllm.config import (
     CacheConfig,
     ModelConfig,
     NanovllmConfig,
+    ParallelConfig,
     SchedulerConfig,
 )
 from nanovllm.sampling_params import SamplingParams
@@ -67,11 +68,16 @@ class BenchmarkConfig:
     sampling_params: SamplingParams = field(
         default_factory=lambda: SamplingParams(temperature=0.6, max_tokens=128),
     )
-    seed: int = 0  # 在 Engine 启动后重置生成随机数，避免启动预热消耗影响初态。
+    seed: int | None = None  # 缺省跟随 ModelConfig.seed，显式值覆盖 Worker 的种子。
     result_path: str | None = None  # 可选 JSON 报告路径，写入发生在性能计时结束后。
 
     def __post_init__(self) -> None:
         """检查回放规模与输出预算，避免模型加载后才发现无效工作量。"""
+        # 保留 benchmark 的 seed 参数，同时把最终值写入真正传给 Worker 的配置。
+        if self.seed is None:
+            self.seed = self.vllm_config.model_config.seed
+        else:
+            self.vllm_config.model_config.seed = self.seed
         if self.num_prompts < 1:
             raise ValueError("num_prompts must be positive")
         # 每条请求至少保留一个输入 token；完整输入是否装得下由数据集层检查。
@@ -110,6 +116,11 @@ def parse_args(
     parser.add_argument("--seed", type=int, default=0, help="生成随机种子，不保证跨模式逐字一致。")
     parser.add_argument("--result-path", help="可选 JSON 报告路径，包含配置摘要与实际指标。")
     parser.add_argument("--enforce-eager", action="store_true", help="禁用 CUDA Graph。")
+    parser.add_argument("--tensor-parallel-size", type=int, default=1, help="单机 TP Worker 数量。")
+    parser.add_argument(
+        "--distributed-executor-backend", choices=("uni", "mp"),
+        help="执行器后端；省略时 TP=1 使用 uni，TP>1 使用 mp。",
+    )
     parser.add_argument(
         "--async-scheduling", action=argparse.BooleanOptionalAction, default=False,
         help="启用异步调度与在途批次队列；默认关闭，可用 --no-async-scheduling 显式关闭。",
@@ -148,6 +159,11 @@ def parse_args(
                     model=str(Path(args.model_path).expanduser()),
                     enforce_eager=args.enforce_eager,
                     max_model_len=args.max_model_len,
+                    seed=args.seed,
+                ),
+                parallel_config=ParallelConfig(
+                    tensor_parallel_size=args.tensor_parallel_size,
+                    distributed_executor_backend=args.distributed_executor_backend,
                 ),
                 scheduler_config=SchedulerConfig(
                     max_num_seqs=args.max_active,

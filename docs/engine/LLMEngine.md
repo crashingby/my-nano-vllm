@@ -97,7 +97,8 @@ tokenize=True)` 得到 token IDs 后提交。`results` 的 `text` 和 `token_ids
 | 选择执行端、加载 tokenizer | `Executor.get_class()`、`AutoTokenizer.from_pretrained()` | 确认支持的执行方式，将主 EOS ID 写入配置。 |
 | 创建执行端 | `executor_class(vllm_config)` | Worker 已初始化设备并加载权重，正式 KV 尚未分配。 |
 | 查询规格与显存预算 | `get_kv_cache_specs()`、`determine_available_memory()` | 得到模型 KV 规格及可用于 KV 的字节预算。 |
-| 规划并初始化 KV | `get_kv_cache_configs()`、`initialize_from_config()` | 分配正式 KV，完成启动预热和配置要求的 Graph 捕获。 |
+| 规划并初始化 KV | `get_kv_cache_configs()`、`initialize_from_config()` | 生成各 rank 的方案，分配并绑定正式 KV。 |
+| 预热执行路径 | `compile_or_warm_up_model()` | KV 初始化全部完成后，单独预热、按配置捕获 Graph，并汇总编译耗时。 |
 | 解析粒度与前缀哈希 | `resolve_kv_cache_block_sizes()`、`get_request_block_hasher()` | 解析 scheduler/hash block 大小；仅启用前缀缓存时建立哈希根与共享 hasher。 |
 | 创建调度器及执行入口 | `Scheduler` / `AsyncScheduler`、`step_fn` | Scheduler 获得确定的 KV 容量，Engine 可开始接收请求。 |
 

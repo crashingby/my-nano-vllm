@@ -22,7 +22,7 @@ logger = init_logger(__name__)
 def kernel_warmup(worker: Worker) -> None:
     """在正式 KV cache 分配后，用小型 mixed batch 执行一次真实 FA2 forward。
 
-    由 Worker.compile_or_warm_up_model() 在 CUDA Graph 捕获前调用，即使
+    由 Worker._compile_or_warm_up_model() 在 CUDA Graph 捕获前调用，即使
     enforce_eager=True 也执行。只为全部采用 FLASH_ATTN 的 Attention groups
     预热；当前没有 DeepGEMM、FlashInfer、pooling 或跨 rank autotune 分支。
 

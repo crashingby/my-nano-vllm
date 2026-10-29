@@ -4,21 +4,74 @@
 
 调用方使用 ``import nanovllm.envs as envs``，再访问 envs.VLLM_HOST_IP 等属性。
 属性查询经过模块级 __getattr__()，调用 environment_variables 中对应的读取函数，
-而不是在导入时固化环境变量。当前只接入网络初始化需要的主机地址和端口配置，
+而不是在导入时固化环境变量。当前接入网络初始化与共享内存消息队列所需配置，
 保留上游名称便于对照源码，不引入环境变量缓存或未使用的部署配置。
 """
 
 from __future__ import annotations
-
+import functools
 import os
+import tempfile
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any,Literal
 
 if TYPE_CHECKING:
     # 仅供编辑器和类型检查器识别；运行时不绑定这些属性，访问时才读取实际环境。
     VLLM_HOST_IP: str = ""
     VLLM_PORT: int | None = None
+    VLLM_RINGBUFFER_WARNING_INTERVAL: int = 60
+    VLLM_RPC_BASE_PATH: str = tempfile.gettempdir()
+    VLLM_USE_SPINLOOP_EXT: bool = False,
+    VLLM_MQ_MAX_CHUNK_BYTES_MB: int = 16,
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: int = 300,
+    VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS: int = 5,
+    VLLM_WORKER_MULTIPROC_METHOD: Literal["fork", "spawn"] = "fork",
 
+
+
+def env_with_choices(
+    env_name: str,
+    default: str | None,
+    choices: list[str] | Callable[[], list[str]],
+    case_sensitive: bool = True,
+) -> Callable[[], str | None]:
+    """Create a lambda that validates environment variable against allowed choices.
+
+    Args:
+        env_name: Name of the environment variable
+        default: Default value if not set (can be None)
+        choices: List of valid string options or callable that returns list
+        case_sensitive: Whether validation should be case sensitive
+
+    Returns:
+        Lambda function for environment_variables dict
+
+    """
+
+    def _get_validated_env() -> str | None:
+        value = os.getenv(env_name)
+        if value is None:
+            return default
+
+        # Resolve choices if it's a callable (for lazy loading)
+        actual_choices = choices() if callable(choices) else choices
+
+        if not case_sensitive:
+            check_value = value.lower()
+            check_choices = [choice.lower() for choice in actual_choices]
+        else:
+            check_value = value
+            check_choices = actual_choices
+
+        if check_value not in check_choices:
+            raise ValueError(
+                f"Invalid value '{value}' for {env_name}. "
+                f"Valid options: {actual_choices}."
+            )
+
+        return value
+
+    return _get_validated_env
 
 def get_vllm_port() -> int | None:
     """读取通信起始端口；未设置 VLLM_PORT 时由网络工具向系统申请端口。
@@ -47,6 +100,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HOST_IP": lambda: os.getenv("VLLM_HOST_IP", ""),
     # 非空配置作为空闲端口搜索起点；未设置时返回 None。
     "VLLM_PORT": get_vllm_port,
+    "VLLM_RINGBUFFER_WARNING_INTERVAL": lambda: int(
+        os.environ.get("VLLM_RINGBUFFER_WARNING_INTERVAL", "60")
+    ),
+    # ZMQ 的本地 IPC socket 使用该目录；沿用 vLLM 的系统临时目录默认值。
+    "VLLM_RPC_BASE_PATH": lambda: os.getenv("VLLM_RPC_BASE_PATH", tempfile.gettempdir()),
+    # 只在显式开启时导入并编译 CPU 等待扩展，普通单卡路径不增加构建步骤。
+    "VLLM_USE_SPINLOOP_EXT": lambda: bool(int(os.getenv("VLLM_USE_SPINLOOP_EXT", "0"))),
+    "VLLM_MQ_MAX_CHUNK_BYTES_MB": lambda: int(
+        os.getenv("VLLM_MQ_MAX_CHUNK_BYTES_MB", "16")
+    ),
+    "VLLM_WORKER_MULTIPROC_METHOD": env_with_choices(
+        "VLLM_WORKER_MULTIPROC_METHOD", "fork", ["spawn", "fork"]
+    ),
+    "VLLM_PROCESS_NAME_PREFIX": lambda: os.getenv("VLLM_PROCESS_NAME_PREFIX", "VLLM"),
+    "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": lambda: int(
+        os.getenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "300")
+    ),
+    "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS": lambda: int(
+        os.getenv("VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", "5")
+    ),
 }
 
 
@@ -57,7 +130,7 @@ def __getattr__(name: str) -> Any:
         name: 访问的属性名，例如 VLLM_HOST_IP，由 Python 属性查找机制传入。
 
     Returns:
-        env_value: 对应读取函数的结果；当前为字符串、整数或 None。每次访问重新读取，
+        env_value: 对应读取函数的结果；当前为字符串、整数、布尔值或 None。每次访问重新读取，
             不将结果写入模块属性，因此后续环境变量变化仍然可见。
 
     Raises:
@@ -68,3 +141,42 @@ def __getattr__(name: str) -> Any:
     if name in environment_variables:
         return environment_variables[name]()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+
+def _is_envs_cache_enabled() -> bool:
+    """Checked if __getattr__ is wrapped with functools.cache."""
+    global __getattr__
+    return hasattr(__getattr__, "cache_clear")
+
+
+def enable_envs_cache() -> None:
+    """Enables caching of environment variables. This is useful for performance
+    reasons, as it avoids the need to re-evaluate environment variables on
+    every call.
+
+    NOTE: Currently, it's invoked after service initialization to reduce
+    runtime overhead. This also means that environment variables should NOT
+    be updated after the service is initialized.
+    """
+    if _is_envs_cache_enabled():
+        # Avoid wrapping functools.cache multiple times
+        return
+    # Tag __getattr__ with functools.cache
+    global __getattr__
+    __getattr__ = functools.cache(__getattr__)
+
+    # Cache all environment variables
+    for key in environment_variables:
+        __getattr__(key)
+
+
+def disable_envs_cache() -> None:
+    """Resets the environment variables cache. It could be used to isolate environments
+    between unit tests.
+    """
+    global __getattr__
+    # If __getattr__ is wrapped by functions.cache, unwrap the caching layer.
+    if _is_envs_cache_enabled():
+        assert hasattr(__getattr__, "__wrapped__")
+        __getattr__ = __getattr__.__wrapped__

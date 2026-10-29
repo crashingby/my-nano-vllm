@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tensor Parallel 进程组的全局状态与初始化逻辑。
 
 本模块遵循 vLLM ``distributed.parallel_state`` 的职责划分：
@@ -9,6 +11,9 @@
 4. ``graph_capture`` 准备独立 CUDA stream，供模型预热和 Graph 捕获共享。
 5. ``cleanup_dist_env_and_memory`` 在执行端关闭后销毁并行组，回收空闲设备缓存。
 
+每个 GroupCoordinator 管理设备组和 Gloo CPU 协调组；多 rank TP 组另外安装
+DeviceCommunicatorBase，通过 PyTorch/NCCL 执行设备集合通信。
+
 当前 nano-vLLM 只支持 Tensor Parallelism，因此只维护 ``_WORLD`` 与 ``_TP``。
 Pipeline / Data / Context / Expert Parallelism 的 group 并非在这里被简化成默认 group，
 而是暂不实现；未来可沿用 vLLM 的全局状态与初始化顺序继续扩展。
@@ -16,17 +21,27 @@ Pipeline / Data / Context / Expert Parallelism 的 group 并非在这里被简�
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
+from multiprocessing import shared_memory
+from typing import Any
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from nanovllm.distributed.device_communicators.base_device_communicator import (
+    DeviceCommunicatorBase,
+)
+from nanovllm.distributed.utils import (
+    StatelessProcessGroup,
+)
 from nanovllm.logger import init_logger
 
 
@@ -47,23 +62,48 @@ class GraphCaptureContext:
     stream: torch.cuda.Stream  # 保存原始 stream 引用，避免各组各自创建捕获 stream。
 
 
-class GroupCoordinator:
-    """封装一个逻辑并行组在当前 rank 上对应的 PyTorch process group。
+_group_name_counter: dict[str, int] = {}  # 同名逻辑组重建时递增，避免复用日志身份。
 
-    vLLM 的完整 ``GroupCoordinator`` 还管理 CPU group、device communicator、共享内存
-    broadcaster 等优化组件。nano-vLLM 的当前层实现只需要知道 TP group 的成员关系和
-    device-side process group，因此保留其核心状态，删除尚未使用的通信优化设施。
+
+def _get_unique_name(name: str) -> str:
+    """沿用 vLLM 的 name:index 格式生成当前进程内的组名。
+
+    Returns:
+        unique_name: 例如 ``tp:0``；各 rank 按相同顺序建组时名称一致。
+
+    Side Effects:
+        递增同名组计数；由初始化线程按照所有 rank 一致的顺序调用。
+    """
+    index = _group_name_counter.get(name, 0)
+    _group_name_counter[name] = index + 1
+    return f"{name}:{index}"
+
+
+class GroupCoordinator:
+    """管理逻辑组的成员身份、设备通信和 CPU 协调。
+
+    沿用 vLLM 的双组设计：device_group 承载 tensor 通信，Gloo cpu_group
+    承载对象广播和 barrier。CPU group 服务于 CUDA Worker 之间的协调，
+    不表示支持 CPU 模型执行。WORLD 只创建进程组，TP 额外创建设备通信器。
+
+    当前设备通信器使用 PyTorch/NCCL；未接入自定义通信算子、组内 MQ 广播、
+    PP 点对点传输、EP dispatch/combine 或弹性进程组。
 
     Attributes:
-        rank: 当前进程在默认 PyTorch world 中的全局 rank。
-        local_rank: 当前进程在本机可见加速器中的编号，用于将来创建 device communicator。
-        group_ranks: 全部同类逻辑组的全局 rank 列表。例如 8 卡 world、TP=2 时为
-            ``[[0, 1], [2, 3], [4, 5], [6, 7]]``。
-        ranks: 当前 rank 实际所属逻辑组的全局 rank 列表。
-        world_size: 当前逻辑组内的 rank 数量。
-        rank_in_group: 当前 rank 在 ``ranks`` 内的相对编号。
-        device_group: 当前逻辑组对应的 PyTorch device-side process group。
-        torch_distributed_backend: 创建 ``device_group`` 时使用的 backend 名称。
+        unique_name: 当前进程内唯一的逻辑组名，例如 ``tp:0``。
+        rank: 默认 world 中的全局 rank。
+        ranks: 本逻辑组的全局 rank 列表；src/dst 参数按其下标解释。
+        world_size: 本逻辑组的 rank 数量。
+        local_rank: 本机可见 CUDA device 编号，与组内 rank 是不同概念。
+        device_index: 对齐 vLLM 的设备编号字段，当前等于 local_rank。
+        device: 当前 Worker 的 CUDA 设备描述；构造描述本身不初始化 CUDA。
+        rank_in_group: 当前进程在 ranks 中的位置。
+        group_ranks: 同一种并行维度的全部分组，所有 rank 按此顺序创建子组。
+        device_group: 使用指定设备 backend 的 PyTorch process group。
+        cpu_group: 与 device_group 成员相同的 Gloo process group。
+        use_device_communicator: 是否为多 rank 组创建设备通信器。
+        device_communicator: 多 rank TP 的通信对象；单 rank 或禁用时为 None。
+        torch_distributed_backend: device_group 使用的 backend 名称。
     """
 
     def __init__(
@@ -71,119 +111,265 @@ class GroupCoordinator:
         group_ranks: list[list[int]],
         local_rank: int,
         torch_distributed_backend: str,
+        use_device_communicator: bool,
         group_name: str | None = None,
     ) -> None:
-        """为当前 rank 创建并选出所属的逻辑进程组。
+        """按统一顺序创建双进程组，并为当前 rank 安装通信器。
 
-        所有 rank 必须以相同顺序调用 ``dist.new_group``。即使某个 rank 不属于某个
-        group，它也仍要参与该 ``new_group`` 调用，否则多进程初始化会死锁；这正是
-        ``group_ranks`` 保留“全部组”而不是只传当前组的原因。
+        所有 world rank 都必须调用本构造函数，并按 group_ranks 中的顺序
+        创建 device/Gloo 子组；不属于某一子组也不能跳过其 new_group()。
 
         Args:
-            group_ranks: 按创建顺序排列的全部逻辑组成员列表。
-            local_rank: 当前进程的本机 device 编号。
-            torch_distributed_backend: 创建子组使用的 backend，例如 ``"nccl"``。
-            group_name: 仅用于异常信息的逻辑组名称。
+            group_ranks: 当前并行维度的全部 rank 分组。
+            local_rank: 当前进程绑定的本机可见 CUDA device 编号。
+            torch_distributed_backend: 设备通信 backend，正常 CUDA 路径为 nccl。
+            use_device_communicator: 多 rank 组是否额外创建设备通信执行对象。
+            group_name: 逻辑组名称，None 时使用 anonymous。
+
+        Side Effects:
+            创建两套 PyTorch 子组并保存当前 rank 所属组；启用时创建通信器。
+            不加载模型，不创建 Executor 的 RPC 队列，也不切换当前 CUDA device。
 
         Raises:
-            RuntimeError: 默认 process group 未初始化，或当前 rank 不属于任何给定
-                逻辑组时抛出。
+            RuntimeError: 默认进程组未初始化，或当前 rank 没有对应子组。
+            AssertionError: local_rank 没有提供。
         """
         if not dist.is_initialized():
-            raise RuntimeError(
-                "The default process group must be initialized before "
-                "creating a GroupCoordinator."
-            )
-
-        # rank 是默认 world 中的身份；每个逻辑 group 再提供 rank_in_group。
-        self.rank = dist.get_rank()
+            raise RuntimeError("The default process group must be initialized first")
+        assert local_rank >= 0, "local_rank must be provided when creating a group"
+        self.unique_name = _get_unique_name(group_name or "anonymous")
+        self.rank = dist.get_rank()  # global rank 不随当前 TP 子组变化。
         self.local_rank = local_rank
+        self.device_index = local_rank  # 当前仅 CUDA，无需其他平台的设备映射。
+        self.device = torch.device("cuda", self.device_index)
         self.group_ranks = group_ranks
         self.torch_distributed_backend = torch_distributed_backend
 
-        current_device_group: ProcessGroup | None = None
-        current_group_ranks: list[int] | None = None
-
-        # 依序创建全部同类子组，保证每个 rank 的 collective 调用顺序完全一致。
+        self_device_group: ProcessGroup | None = None
+        self_cpu_group: ProcessGroup | None = None
+        # 各 rank 必须按相同顺序创建所有子组，再选中自己所属的那一对。
         for ranks in group_ranks:
-            device_group = dist.new_group(
-                ranks=ranks,
-                backend=torch_distributed_backend,
-            )
+            device_group = dist.new_group(ranks, backend=torch_distributed_backend)
+            cpu_group = dist.new_group(ranks, backend="gloo")
             if self.rank in ranks:
-                current_device_group = device_group
-                current_group_ranks = ranks
+                self.ranks = ranks
+                self.world_size = len(ranks)
+                self.rank_in_group = ranks.index(self.rank)
+                self_device_group = device_group
+                self_cpu_group = cpu_group
 
-        if current_device_group is None or current_group_ranks is None:
+        if self_device_group is None or self_cpu_group is None:
             raise RuntimeError(
-                f"Global rank {self.rank} does not belong to any "
-                f"{group_name or 'anonymous'} group: {group_ranks}."
+                f"Global rank {self.rank} does not belong to any group: {group_ranks}"
+            )
+        self.device_group = self_device_group  # tensor 通信使用设备 backend。
+        self.cpu_group = self_cpu_group  # 控制操作使用 Gloo，避免隐式 CUDA tensor。
+
+        self.use_device_communicator = use_device_communicator
+        self.device_communicator: DeviceCommunicatorBase | None = None
+        # 单 rank 通信由公开接口直接返回；WORLD 不额外安装设备通信器。
+        if use_device_communicator and self.world_size > 1:
+            self.device_communicator = DeviceCommunicatorBase(
+                cpu_group=self.cpu_group,
+                device=self.device,
+                device_group=self.device_group,
+                unique_name=self.unique_name,
             )
 
-        # 这些字段与 vLLM GroupCoordinator 的核心含义一致，供模型层和未来通信封装读取。
-        self.ranks = current_group_ranks
-        self.world_size = len(current_group_ranks)
-        self.rank_in_group = current_group_ranks.index(self.rank)
-        self.device_group = current_device_group
+    @property
+    def first_rank(self) -> int:
+        """返回组内首个进程的全局 rank，即 first_rank。"""
+        return self.ranks[0]
 
-    def destroy(self) -> None:
-        """销毁当前逻辑组的 device process group，并解除本对象持有的引用。
+    @property
+    def last_rank(self) -> int:
+        """返回组内最后一个进程的全局 rank，即 last_rank。"""
+        return self.ranks[-1]
 
-        上层先停止依赖该组的模型执行，再按 TP、WORLD、默认 process group 的顺序
-        关闭。当前没有独立 CPU group 或 device communicator，只销毁已有设备组。
-        与 vLLM 一样删除 device_group 属性，重复调用时不会再次销毁同一组。
+    @property
+    def is_first_rank(self) -> bool:
+        """返回当前进程是否为组内首个进程，即 is_first_rank。"""
+        return self.rank == self.first_rank
 
-        Side Effects:
-            调用 torch.distributed.destroy_process_group() 释放组内通信资源；
-            组销毁失败时异常继续传播，属性仍保留以反映尚未完成的清理。
-        """
-        # 未创建或已经销毁的组无需清理；不把缺失属性误当成默认 process group。
-        if hasattr(self, "device_group"):
-            dist.destroy_process_group(self.device_group)
-            del self.device_group
+    @property
+    def is_last_rank(self) -> bool:
+        """返回当前进程是否为组内最后一个进程，即 is_last_rank。"""
+        return self.rank == self.last_rank
+
+    @property
+    def next_rank(self) -> int:
+        """返回组内环形顺序的下一个全局 rank，即 next_rank。"""
+        return self.ranks[(self.rank_in_group + 1) % self.world_size]
+
+    @property
+    def prev_rank(self) -> int:
+        """返回组内环形顺序的上一个全局 rank，即 prev_rank。"""
+        return self.ranks[(self.rank_in_group - 1) % self.world_size]
 
     @contextmanager
     def graph_capture(
         self,
         graph_capture_context: GraphCaptureContext | None = None,
     ):
-        """为本逻辑组建立捕获 stream 环境，进入后将上下文交给调用方。
-
-        沿用 vLLM 的创建/复用 stream、等待当前 stream、切换并 yield 的流程。
-        当前没有 device_communicator、自定义 all-reduce 或 ROCm aiter，因而
-        不进入上游 ca_comm.capture()/aiter.capture() 的通信专用上下文。
+        """建立通信与模型共享的 CUDA stream 环境，供外层预热或捕获。
 
         Args:
-            graph_capture_context: 要共享的已有上下文；None 时在当前 CUDA
-                device 上创建新 stream。Runner 应优先使用模块级 graph_capture，
-                由它为指定 device 创建上下文，再传给本接口。
+            graph_capture_context: 要复用的捕获上下文；None 时创建新 stream。
 
         Yields:
-            graph_capture_context: 本作用域实际使用的 GraphCaptureContext，保留传入对象身份。
-                调用方可将其 stream 传给 torch.cuda.graph，发起真正的捕获。
+            graph_capture_context: 本作用域实际使用的上下文，保留传入对象身份。
 
         Side Effects:
-            捕获 stream 等待进入前的当前 stream，保证其已有初始化工作先完成。
-            作用域内切换当前 stream，正常或异常退出时恢复进入前的 stream。
-            wait_stream 建立 GPU 依赖，不同步等待 CPU，也不调用设备级 synchronize。
-            本接口不调用 cudaStreamBeginCapture，不修改 Graph 捕获许可。
-            退出时不额外让原 stream 等待本 stream；跨 stream 消费结果的依赖
-            由调用方维护。TP 通信的预热和多 rank 一致捕获顺序也由上层保证。
+            捕获 stream 等待进入前的当前 stream；退出时恢复原 stream。
+            不启动 CUDA Graph 捕获，不调用 CPU barrier 或设备级 synchronize。
+            当前通信器直接使用 PyTorch/NCCL，无自定义 all-reduce capture 上下文。
         """
         if graph_capture_context is None:
-            stream = torch.cuda.Stream()  # 直接调用组接口时使用当前 device。
-            graph_capture_context = GraphCaptureContext(stream)  # 新建可共享上下文。
+            stream = torch.cuda.Stream(device=self.device)
+            graph_capture_context = GraphCaptureContext(stream)
         else:
-            stream = graph_capture_context.stream  # 复用同一 stream，不创建第二套环境。
+            stream = graph_capture_context.stream
 
-        # 与上游一致，在切换 stream 前保证已提交的初始化工作先于捕获环境的工作。
         curr_stream = torch.cuda.current_stream()
         if curr_stream != stream:
-            stream.wait_stream(curr_stream)  # 同 stream 已有顺序，无需等待自己。
-
-        # torch.cuda.stream 在 finally 中恢复原 stream，模型/捕获抛异常时同样生效。
+            stream.wait_stream(curr_stream)  # 只建立 GPU 依赖，不等待 CPU。
         with torch.cuda.stream(stream):
-            yield graph_capture_context  # 保持作用域开放，由调用方预热或真正捕获。
+            yield graph_capture_context
+
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        """在组内执行 SUM，返回归约后的 output。
+
+        当前基础通信器原地更新 input_，返回值与输入共享存储。单 rank 直接返回
+        input_；多 rank 必须以相同顺序参与，不能仅由结果回包 rank 调用。
+        """
+        if self.world_size == 1:
+            return input_
+        return self._all_reduce_out_place(input_)
+
+    def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
+        """按 vLLM 的内部入口转发，返回通信器生成的 output。
+
+        当前基类通信器采用原地归约；方法名对齐上游入口，不承诺独立存储。
+        """
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.all_reduce(input_)
+
+    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        """按组内 rank 顺序沿 dim 拼接输入，返回各 rank 都持有的 output。
+
+        各 rank 的输入形状、dtype 必须一致；单 rank 返回 input_ 本身。
+        多 rank 创建拼接结果，不修改输入，dim 支持负数。
+        """
+        if self.world_size == 1:
+            return input_
+        assert -input_.dim() <= dim < input_.dim(), (
+            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        )
+        return self._all_gather_out_place(input_, dim)
+
+    def _all_gather_out_place(self, input_: torch.Tensor, dim: int) -> torch.Tensor:
+        """转交设备通信器执行，返回沿 dim 拼接后的 output。"""
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.all_gather(input_, dim)
+
+    def gather(
+        self, input_: torch.Tensor, dst: int = 0, dim: int = -1
+    ) -> torch.Tensor | None:
+        """将各 rank 输入沿 dim 拼接，仅在目标进程返回 output。
+
+        Args:
+            input_: 本 rank 的 tensor，各 rank 必须使用相同形状和 dtype。
+            dst: 组内目标 rank，通过 ranks[dst] 映射成全局 rank。
+            dim: 拼接维度，支持负数。
+
+        Returns:
+            output: dst 上为完整 tensor，其他 rank 为 None；单 rank 返回 input_。
+
+        Side Effects:
+            多 rank 参与设备 gather，目标 rank 分配接收 tensor。
+        """
+        assert 0 <= dst < self.world_size, f"Invalid dst rank ({dst})"
+        if self.world_size == 1:
+            return input_
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.gather(input_, dst, dim)
+
+    def broadcast(self, input_: torch.Tensor, src: int = 0) -> torch.Tensor:
+        """从组内 src 广播 tensor，原地更新并返回 input_。
+
+        src 是组内编号；所有 rank 都提供形状和 dtype 一致的接收 tensor。
+        tensor 通信直接使用 device_group，与上游相同，不要求设备通信器存在。
+        """
+        assert 0 <= src < self.world_size, f"Invalid src rank ({src})"
+        if self.world_size == 1:
+            return input_
+        dist.broadcast(input_, src=self.ranks[src], group=self.device_group)
+        return input_
+
+    def broadcast_object(self, obj: Any | None = None, src: int = 0) -> Any:
+        """通过 CPU group 广播 Python 对象，返回源 rank 提供的 obj。
+
+        obj 只有在组内 src 上有意义；其他 rank 返回反序列化后的对象。
+        此接口不使用 Executor 的 RPC MQ，所有组成员必须共同调用。
+        """
+        assert 0 <= src < self.world_size, f"Invalid src rank ({src})"
+        if self.world_size == 1:
+            return obj
+        objects = [obj if self.rank_in_group == src else None]
+        dist.broadcast_object_list(objects, src=self.ranks[src], group=self.cpu_group)
+        return objects[0]
+
+    def broadcast_object_list(
+        self,
+        obj_list: list[Any],
+        src: int = 0,
+        group: ProcessGroup | None = None,
+    ) -> list[Any]:
+        """广播并原地更新对象列表，返回 obj_list。
+
+        src 是本逻辑组内编号；各 rank 提供相同长度的列表。默认沿用 vLLM
+        的 device_group 路径；显式 group 必须具有相同的成员和 rank 顺序。
+        """
+        assert 0 <= src < self.world_size, f"Invalid src rank ({src})"
+        if self.world_size == 1:
+            return obj_list
+        dist.broadcast_object_list(
+            obj_list,
+            src=self.ranks[src],
+            group=self.device_group if group is None else group,
+        )
+        return obj_list
+
+    def barrier(self) -> None:
+        """通过 CPU group 等待全部组成员，避免 NCCL barrier 隐式创建 GPU tensor。"""
+        dist.barrier(group=self.cpu_group)
+
+    def cpu_all_reduce_(self, tensor: torch.Tensor) -> torch.Tensor:
+        """通过 Gloo 原地 SUM 小型 CPU tensor，返回归约后的 tensor。
+
+        此接口用于控制信息；不会把输入搬到 GPU，也不参与模型层设备计算。
+        """
+        dist.all_reduce(tensor, group=self.cpu_group)
+        return tensor
+
+    def destroy(self) -> None:
+        """先释放通信器资源，再销毁设备组和 CPU 组。
+
+        上层须先停止所有使用本组的执行。删除已销毁的属性，重复调用不会
+        重复销毁进程组；默认 world process group 由外层单独销毁。
+        """
+        if self.device_communicator is not None:
+            self.device_communicator.destroy()
+            self.device_communicator = None
+        if hasattr(self, "device_group"):
+            dist.destroy_process_group(self.device_group)
+            del self.device_group
+        if hasattr(self, "cpu_group"):
+            dist.destroy_process_group(self.cpu_group)
+            del self.cpu_group
 
 
 # ``_WORLD`` 描述默认全局进程组，``_TP`` 描述模型实际使用的 Tensor Parallel 子组。
@@ -262,6 +448,7 @@ def init_world_group(
         group_ranks=[ranks],
         local_rank=local_rank,
         torch_distributed_backend=backend,
+        use_device_communicator=False,
         group_name="world",
     )
 
@@ -270,7 +457,8 @@ def init_model_parallel_group(
     group_ranks: list[list[int]],
     local_rank: int,
     backend: str,
-    group_name: str,
+    group_name: str | None = None,
+    use_device_communicator: bool = True,
 ) -> GroupCoordinator:
     """创建一种模型并行维度的全部子组。
 
@@ -279,6 +467,7 @@ def init_model_parallel_group(
         local_rank: 当前进程的本机 device 编号。
         backend: 创建子组使用的通信 backend。
         group_name: 逻辑组名称，例如 ``"tp"``。
+        use_device_communicator: 是否为多 rank 组创建设备通信器，默认启用。
 
     Returns:
         group: 当前 rank 所属的逻辑并行组描述。
@@ -287,6 +476,7 @@ def init_model_parallel_group(
         group_ranks=group_ranks,
         local_rank=local_rank,
         torch_distributed_backend=backend,
+        use_device_communicator=use_device_communicator,
         group_name=group_name,
     )
 
@@ -471,6 +661,14 @@ def get_tensor_model_parallel_world_size() -> int:
     return get_tp_group().world_size
 
 
+def get_tensor_model_parallel_rank() -> int:
+    """返回本进程在 TP 组中的编号，即 tp_rank。
+
+    权重分片必须使用组内编号；默认 world 的 global rank 可能属于其他 TP 子组。
+    """
+    return get_tp_group().rank_in_group
+
+
 def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     backend: str | None = None,
@@ -557,3 +755,97 @@ def cleanup_dist_env_and_memory() -> None:
     if host_empty_cache is not None:
         host_empty_cache()
     logger.debug("[shutdown] Distributed: cleanup complete")
+
+
+
+def in_the_same_node_as(
+    pg: ProcessGroup | StatelessProcessGroup, source_rank: int = 0
+) -> list[bool]:
+    """This is a collective operation that returns if each rank is in the same node
+    as the source rank. It tests if processes are attached to the same
+    memory system (shared access to shared memory).
+    """
+    if isinstance(pg, ProcessGroup):
+        assert torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL, (
+            "in_the_same_node_as should be tested with a non-NCCL group."
+        )
+        # local rank inside the group
+        rank = torch.distributed.get_rank(group=pg)
+        world_size = torch.distributed.get_world_size(group=pg)
+
+        # global ranks of the processes in the group
+        ranks = torch.distributed.get_process_group_ranks(pg)
+    else:
+        rank = pg.rank
+        world_size = pg.world_size
+        ranks = list(range(world_size))
+
+    # local tensor in each process to store the result
+    is_in_the_same_node = torch.tensor(
+        [0] * world_size, dtype=torch.int32, device="cpu"
+    )
+
+    magic_message = b"magic_message"
+    shm = None
+
+    try:
+        with contextlib.suppress(OSError):
+            if rank == source_rank:
+                # create a shared memory segment
+                shm = shared_memory.SharedMemory(create=True, size=128)
+                assert shm.buf is not None, "Buffer was not created"
+                shm.buf[: len(magic_message)] = magic_message
+                if isinstance(pg, ProcessGroup):
+                    torch.distributed.broadcast_object_list(
+                        [shm.name], src=ranks[source_rank], group=pg
+                    )
+                else:
+                    pg.broadcast_obj(shm.name, src=source_rank)
+                is_in_the_same_node[rank] = 1
+            else:
+                # try to open the shared memory segment
+                if isinstance(pg, ProcessGroup):
+                    recv = [None]
+                    torch.distributed.broadcast_object_list(
+                        recv, src=ranks[source_rank], group=pg
+                    )
+                    name = recv[0]
+                else:
+                    name = pg.broadcast_obj(None, src=source_rank)
+                # fix to https://stackoverflow.com/q/62748654/9191338
+                # Python incorrectly tracks shared memory even if it is not
+                # created by the process. The following patch is a workaround.
+                with patch(
+                    "multiprocessing.resource_tracker.register",
+                    lambda *args, **kwargs: None,
+                ):
+                    shm = shared_memory.SharedMemory(name=name)
+                assert shm.buf is not None, "Buffer was not opened"
+                if shm.buf[: len(magic_message)] == magic_message:
+                    is_in_the_same_node[rank] = 1
+    except Exception as e:
+        logger.error("Error ignored in is_in_the_same_node: %s", e)
+    finally:
+        if shm:
+            shm.close()
+
+    if isinstance(pg, ProcessGroup):
+        torch.distributed.barrier(group=pg)
+    else:
+        pg.barrier()
+
+    # clean up the shared memory segment
+    with contextlib.suppress(OSError):
+        if rank == source_rank and shm:
+            shm.unlink()
+
+    if isinstance(pg, ProcessGroup):
+        torch.distributed.all_reduce(is_in_the_same_node, group=pg)
+        aggregated_data = is_in_the_same_node
+    else:
+        aggregated_data = torch.zeros_like(is_in_the_same_node)
+        for i in range(world_size):
+            rank_data = pg.broadcast_obj(is_in_the_same_node, src=i)
+            aggregated_data += rank_data
+
+    return [x == 1 for x in aggregated_data.tolist()]

@@ -11,14 +11,14 @@
 | 部分 | 已接通的功能 |
 | --- | --- |
 | 模型与加载 | 本地 Hugging Face Qwen3 普通 decoder，加载 safetensors 权重。 |
-| 执行端 | 单进程、单 CUDA GPU 的 `UniProcExecutor`。 |
-| 调度与缓存 | 同步连续批处理、分块 prefill、分页 KV cache、prefix cache。 |
+| 执行端 | 同进程 `UniProcExecutor` 与单机多进程 `MultiprocExecutor`。 |
+| 调度与缓存 | 同步或异步连续批处理、分块 prefill、分页 KV cache、prefix cache。 |
 | Attention | FlashAttention-2，支持混合 prefill/decode 与 GQA。 |
 | CUDA Graph | 单 token decode 使用 `FULL_DECODE_ONLY`，prefill 和混合 batch 使用 eager。 |
 | 自定义算子 | SiLU × Mul 提供 `torch`、`triton`、`cutedsl` 三种实现，两个自定义后端支持自动调优。 |
 | 性能测试 | 本地吞吐、逐 token 延迟，以及算子数值与性能对比。 |
 
-**TP 多进程执行尚未接通**：并行配置、部分权重分片与通信代码已经存在，端到端启动当前仍要求 `tensor_parallel_size=1`。后续将继续扩展 TP 执行器与自定义算子。
+单机 TP 的进程启动、RPC、权重分片和组内通信链路已接通。目前已验证单 GPU 下 `tensor_parallel_size=1` 的多进程推理，以及 CPU/Gloo 下 TP 子组的模型层数值；真实多 GPU 的端到端推理仍待验证。Query head 数、词表大小及 MLP 中间维度须能被 TP size 整除；KV head 数不少于 TP size 时均分，少于时复制，要求 TP size 是 KV head 数的整数倍。当前尚不支持词表 padding。
 
 ## 安装
 
@@ -110,6 +110,10 @@ block hashes。`prefix_match_unit` 可省略；当前单 KV group 启用缓存�
 范围为 `[0, 1)`，默认 0.0；例如 0.05 表示按总 block 数向下取整预留 5%。
 `example.py` 和两个 benchmark 对应提供 `--block-size`、
 `--no-enable-prefix-caching`、`--prefix-match-unit` 和 `--watermark`。
+
+共享内存消息队列可通过 `VLLM_USE_SPINLOOP_EXT=1` 启用原生 CPU 等待扩展，
+首次使用按当前 Python 版本编译并缓存，无需 `nvcc`。默认关闭，构建失败时队列
+回退到 Python/ZMQ 路径，使用方式见 [安装指南](docs/installation.md#可选的-spinloop-等待扩展)。
 
 ## 测试与文档
 

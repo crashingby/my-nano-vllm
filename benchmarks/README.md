@@ -114,6 +114,11 @@ VLLM_HOST_IP=127.0.0.1 python -m benchmarks.benchmark_engine_throughput \
 去掉 --enforce-eager 即可测试 FULL decode CUDA Graph。--ignore-eos 关闭 EOS 提前
 结束；数据准备会为目标输出预留上下文容量，便于比较相同输出工作量。
 
+两个正式 benchmark 都支持 `--distributed-executor-backend mp`，单 GPU 可配合
+`--tensor-parallel-size 1` 验证子进程执行。多 GPU 使用对应的 TP size；省略后端时，
+TP=1 默认 uni，TP>1 默认 mp。执行器会在创建队列和 Worker 前检查可见设备数量。
+Nsight 重叠诊断入口目前仍要求 UniProcExecutor，其 Runner 标记安装在当前进程。
+
 ## LongBench 回放
 
 已下载的默认目录为 ~/datasets/LongBench/data。可直接指定 JSONL，也可指定
@@ -185,9 +190,11 @@ truncate 会改变原始任务内容，适用于性能负载控制。它保留�
 | --max-tokens | 128 | 每请求目标输出长度。 |
 | --temperature | 0.6 | 正 temperature 随机采样，当前没有 greedy 分支。 |
 | --ignore-eos | 关闭 | 忽略 EOS，执行到目标输出长度。 |
-| --seed | 0 | Engine 启动后重置生成随机数状态。 |
+| --seed | 0 | 写入 ModelConfig，并通过 RPC 在所有 Worker 内重置生成随机数状态。 |
 | --result-path | 不指定 | 可选 JSON 报告路径；计时结束后保存配置摘要和统计，可覆盖已有文件。 |
 | --enforce-eager | 关闭 | 禁用 CUDA Graph，局部层编译和内核预热仍存在。 |
+| --tensor-parallel-size | 1 | 单机 TP Worker 数；模型分片维度须满足当前整除约束。 |
+| --distributed-executor-backend | 自动选择 | uni 或 mp；TP=1 也可显式选择 mp，uni 不支持 TP>1。 |
 | --async-scheduling / --no-async-scheduling | 关闭 | 启用或显式关闭异步调度，两个入口均支持。 |
 | --max-model-len | 4096 | prompt 与 output 的总上下文容量。 |
 | --max-num-batched-tokens | 1024 | 单轮真实 token 预算，必须不小于 max-active。 |
@@ -201,6 +208,9 @@ truncate 会改变原始任务内容，适用于性能负载控制。它保留�
 
 seed 固定的是生成前随机数初态，不保证不同 batch 调度或 Graph 模式生成逐字相同
 的文本。需要固定工作量时，同时使用 --ignore-eos 和相同的输入/输出长度策略。
+Python 调用方省略 `BenchmarkConfig.seed` 时沿用 `ModelConfig.seed`；显式提供时
+覆盖模型配置中的值。正式回放和诊断请求预热后的重置都发生在 Worker 进程中。
+JSON 报告会记录 TP size、执行器后端和实际 seed，便于区分执行方式。
 
 `watermark` 只在本轮已有请求被安排执行时影响新接纳的 WAITING/PREEMPTED 请求；
 首个请求和 RUNNING 请求继续计算不受该门槛限制。预留块数为

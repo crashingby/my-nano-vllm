@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""模型选择、构造与权重后处理工具，保留 vLLM 的非量化加载主流程。"""
+"""模型选择、构造与权重后处理工具，统一权重方法和 Attention 的加载后处理。"""
 
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 import inspect
 from typing import Any
@@ -14,6 +14,7 @@ from torch import nn
 
 from nanovllm.config import ModelConfig, NanovllmConfig, set_current_config
 from nanovllm.model_executor.layers.attention import Attention
+from nanovllm.model_executor.layers.quantization import QuantizeMethodBase
 from nanovllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -93,10 +94,11 @@ def process_weights_after_loading(
     model_config: ModelConfig,
     target_device: torch.device,
 ) -> None:
-    """在权重装填后调用普通 Attention 层的后处理钩子。
+    """在权重装填后，先处理各层权重方法，再处理 Attention 钩子。
 
-    保留 vLLM 的 Attention 后处理遍历；删去量化、MLA、多模态和权重重载分支。
-    当前 Attention 尚未定义该钩子，因此会被跳过，不能据此认为 Impl 已接通。
+    顺序沿用 vLLM：每个 quant_method 可以在这里将 checkpoint 布局转换为执行
+    布局。普通精度方法默认无需转换。后续独立遍历 Attention，确保相关投影
+    权重已经处理完；当前没有在线量化计时、权重缓存或权重重载路径。
 
     Args:
         model: 权重已经装填的模型。
@@ -109,7 +111,22 @@ def process_weights_after_loading(
     Side Effects:
         可能临时搬运参数，并调用层级后处理；钩子异常直接向上传播。
     """
-    # module 是模型树中的单个层；名称不参与处理，故与 vLLM 一样忽略它。
+    # 权重方法只处理本层参数；是否需要临时搬运设备由方法自行声明。
+    for _, module in model.named_modules():
+        quant_method = getattr(module, "quant_method", None)
+        if isinstance(quant_method, QuantizeMethodBase):
+            loading_context = (
+                device_loading_context(module, target_device)
+                if quant_method.requires_device_loading
+                else nullcontext()
+            )
+            with loading_context:
+                quant_method.process_weights_after_loading(module)
+            # 方法可能重建专用参数，新的 TP 默认值未必符合本层 disable_tp 或覆盖值。
+            if hasattr(module, "update_param_tp_status"):
+                module.update_param_tp_status()
+
+    # Attention 最后处理，以便使用已经完成方法级转换的投影参数。
     for _, module in model.named_modules():
         if isinstance(module, Attention) and hasattr(
             module, "process_weights_after_loading"
@@ -254,7 +271,8 @@ class ParamMapping:
     """维护融合模块与其组成模块的双向名称映射。
 
     沿用 vLLM 数据结构；它不是 checkpoint 文件加载器，也不执行 TP 切片。
-    当前 nano 的 Qwen packed_modules_mapping 是另一种方向与结构，不能直接传入。
+    Qwen 的 packed_modules_mapping 使用相同结构，可直接传入；checkpoint 名称
+    转换和 shard 标识由独立的 WeightsMapper 处理。
 
     Attributes:
         packed_mapping: 融合模块名到有序子模块名列表的映射，例如

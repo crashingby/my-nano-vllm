@@ -82,7 +82,8 @@ class UniProcExecutor(Executor):
 
     构造时继承基类 __init__()，由其调用本类 _init_executor() 加载权重。
     正式 KV 仍需在 Engine 显存规划后通过 initialize_from_config() 初始化，
-    再完成内核、Graph 和 sampler 的启动准备。
+    再由 Engine 调用 compile_or_warm_up_model()，完成内核、Graph 和 sampler
+    的启动准备；这两个阶段分别经过基类的独立 RPC 入口。
 
     Attributes:
         driver_worker: 同进程 WorkerWrapperBase 实例。显式生命周期方法在
@@ -101,6 +102,9 @@ class UniProcExecutor(Executor):
             正式 KV cache 尚未分配。Worker 构造、设备初始化或权重加载失败时，
             先关闭已创建的 Worker 并清理本进程分布式环境，再重新抛出原始异常。
         """
+        # 自定义类或导入路径也可能选中本类，不能只依赖字符串 uni 的配置校验。
+        if self.parallel_config.world_size != 1:
+            raise ValueError("UniProcExecutor requires tensor_parallel_size=1")
         # driver_worker 保存包装端点；两个编号均为 0，不由实际 CUDA device index 决定。
         self.driver_worker = WorkerWrapperBase(
             rpc_rank=0,
