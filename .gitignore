@@ -195,3 +195,6 @@ cython_debug/
 .cursorindexingignore
 
 nsys_reports/
+
+# 本地性能实验的原始报告、日志与分析数据。
+/tmp/

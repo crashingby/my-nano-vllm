@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import asdict
@@ -16,6 +17,7 @@ from benchmarks.metrics import BenchmarkStats
 from benchmarks.utils import nvtx_range, set_random_seed
 from nanovllm import LLM, SamplingParams
 from nanovllm.logger import init_logger
+from nanovllm.metrics.stats import PrefixCacheStats
 
 logger = init_logger(__name__)
 
@@ -66,16 +68,42 @@ def run_benchmark(
     try:
         # 通过 RPC 重置模型所在进程，mp 模式下父进程的 RNG 不决定采样结果。
         set_random_seed(llm, model_config.seed)
+        if config.warmup_num_prompts:
+            # 使用固定合成输入，不拿正式 Alpaca 样本预填充前缀缓存。
+            prompt_len = min(128, model_config.max_model_len - config.warmup_output_tokens)
+            logger.info(
+                "Warming up %d synthetic requests before measurement",
+                config.warmup_num_prompts,
+            )
+            llm.generate(
+                [[100] * prompt_len for _ in range(config.warmup_num_prompts)],
+                SamplingParams(
+                    temperature=config.sampling_params.temperature,
+                    max_tokens=config.warmup_output_tokens,
+                    ignore_eos=True,
+                ),
+                use_tqdm=False,
+            )
+            set_random_seed(llm, model_config.seed)  # 预热消耗的采样 RNG 不进入正式回放。
+        # 仅记录正式请求的查询与命中；开启缓存不等于自然数据一定能命中完整块。
+        cache_manager = llm.scheduler.kv_cache_manager
+        cache_manager.log_stats = True
+        cache_manager.prefix_cache_stats = PrefixCacheStats()
         stats = replay(llm, requests, config.sampling_params, max_active)
         stats.log()  # 排序分位数和打印报告均发生在回放计时之后。
         if config.result_path is not None:
-            _save_result(config, stats)
+            _save_result(config, stats, requests, cache_manager.make_prefix_cache_stats())
         return stats
     finally:
         llm.close()  # 测量、打印或写文件失败时也释放已创建的执行资源。
 
 
-def _save_result(config: BenchmarkConfig, stats: BenchmarkStats) -> None:
+def _save_result(
+    config: BenchmarkConfig,
+    stats: BenchmarkStats,
+    requests: list[SampleRequest],
+    prefix_cache_stats: PrefixCacheStats | None,
+) -> None:
     """保存配置摘要及统计快照，按需创建报告父目录并覆盖目标 JSON 文件。"""
     # 本函数只从已检查保存选项的分支调用，保护内部路径构造的不变量。
     assert config.result_path is not None
@@ -83,12 +111,15 @@ def _save_result(config: BenchmarkConfig, stats: BenchmarkStats) -> None:
     scheduler_config = config.vllm_config.scheduler_config
     cache_config = config.vllm_config.cache_config  # 记录缓存开关与接纳策略，避免不同策略混测。
     parallel_config = config.vllm_config.parallel_config
+    compilation_config = config.vllm_config.compilation_config
     backend = parallel_config.distributed_executor_backend
     report = {
         "config": {
             "model": model_config.model,
             "dtype": str(model_config.dtype),
             "enforce_eager": model_config.enforce_eager,
+            "cudagraph_mode": str(compilation_config.cudagraph_mode),
+            "cudagraph_capture_sizes": compilation_config.cudagraph_capture_sizes,
             "tensor_parallel_size": parallel_config.tensor_parallel_size,
             "distributed_executor_backend": (
                 backend if isinstance(backend, str)
@@ -110,7 +141,18 @@ def _save_result(config: BenchmarkConfig, stats: BenchmarkStats) -> None:
             "num_prompts_requested": config.num_prompts,
             "sampling_params": asdict(config.sampling_params),
             "seed": config.seed,
+            "warmup_num_prompts": config.warmup_num_prompts,
+            "warmup_output_tokens": config.warmup_output_tokens,
         },
+        "workload": {
+            "request_ids": [request.request_id for request in requests],
+            "prompt_lengths": [request.prompt_len for request in requests],
+            # 稳定摘要用于核对不同 TP、不同回放入口实际使用了同一批输入。
+            "prompt_token_ids_sha256": hashlib.sha256(json.dumps(
+                [request.prompt for request in requests], separators=(",", ":"),
+            ).encode()).hexdigest(),
+        },
+        "prefix_cache": asdict(prefix_cache_stats) if prefix_cache_stats is not None else None,
         "metrics": stats.to_dict(),  # 延迟子类在这里加入分布和逐请求时间戳。
     }
     path = Path(config.result_path).expanduser()  # 仅在调用方指定保存位置后进入本函数。

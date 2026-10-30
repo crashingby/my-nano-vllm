@@ -1,4 +1,4 @@
-"""使用本地 Qwen3 执行单卡文本生成，默认先验证 eager 路径。"""
+"""使用本地 Qwen3 执行单机文本生成，支持单卡与 TP，默认采用 eager。"""
 
 import argparse
 import os
@@ -8,6 +8,7 @@ from nanovllm.config import (
     CacheConfig,
     ModelConfig,
     NanovllmConfig,
+    ParallelConfig,
     SchedulerConfig,
 )
 from nanovllm.logger import init_logger
@@ -21,6 +22,10 @@ def main() -> None:
     parser.add_argument("--model", default="~/Models/Qwen3-0.6B", help="本地模型目录。")
     parser.add_argument("--max-tokens", type=int, default=64, help="每个请求最多生成的 token 数。")
     parser.add_argument(
+        "--tensor-parallel-size", "-tp", type=int, default=1,
+        help="单机 TP 的 GPU 数量；大于 1 时自动选择多进程执行器。",
+    )
+    parser.add_argument(
         "--gpu-memory-utilization", type=float, default=0.9, help="当前实例的 GPU 显存预算比例。",
     )
     parser.add_argument("--cuda-graph", action="store_true", help="启用 FULL decode CUDA Graph。")
@@ -33,7 +38,7 @@ def main() -> None:
     parser.add_argument("--watermark", type=float, default=0.0, help="新请求接纳时的 KV 预留比例，范围 [0, 1)。")
     args = parser.parse_args()
     path = os.path.expanduser(args.model)
-    # 当前示例只有同进程单卡 Worker，使用回环地址建立本地 process group 即可。
+    # 所有 TP Worker 都位于本机，使用回环地址建立 process group 即可。
     os.environ.setdefault("VLLM_HOST_IP", "127.0.0.1")
     logger.info("Loading tokenizer from %s", path)
     tokenizer = AutoTokenizer.from_pretrained(path)
@@ -44,6 +49,8 @@ def main() -> None:
             enforce_eager=not args.cuda_graph,
             max_model_len=1024,
         ),
+        # TP=1 保持单进程路径；TP>1 由 ParallelConfig 自动选择 mp 后端。
+        parallel_config=ParallelConfig(tensor_parallel_size=args.tensor_parallel_size),
         scheduler_config=SchedulerConfig(
             max_num_batched_tokens=256,
             max_num_seqs=4,

@@ -1,6 +1,6 @@
 # 本地推理 Benchmarks
 
-这个目录将数据集读取、配置、指标和回放分开。当前支持单进程 Engine 的吞吐与
+这个目录将数据集读取、配置、指标和回放分开。当前支持单卡与单机多进程 TP 的吞吐与
 逐 token 延迟测试，可选择同步或异步调度，复用相同的配置、数据集和启动流程。数据集包含
 Alpaca 与 LongBench 文本负载；后续新增数据集，只需实现适配器并登记名称。
 
@@ -21,6 +21,8 @@ Alpaca 与 LongBench 文本负载；后续新增数据集，只需实现适配�
 | [benchmark_engine_throughput.py](benchmark_engine_throughput.py) | 创建 Engine，持续补充请求，调用 step_fn() 并消费完成结果。 |
 | [benchmark_engine_latency.py](benchmark_engine_latency.py) | 持续补充请求，在每轮 step_fn() 返回后观察生成 token，统计本地延迟。 |
 | [profile_engine_overlap.py](profile_engine_overlap.py) | 真实请求预热后，临时标记各批次 CPU 阶段，供 Nsight 诊断跨批次重叠。 |
+| [profile_tensor_parallel.py](profile_tensor_parallel.py) | 在所有 Worker 中限定 Nsight 采集窗口，支持 TP 与 Graph 内 NCCL 观测。 |
+| [analyze_tensor_parallel.py](analyze_tensor_parallel.py) | 从 SQLite 复算 NCCL kernel 累计占比与跨 GPU 去重后的墙钟占比。 |
 | [analyze_engine_overlap.py](analyze_engine_overlap.py) | 读取四组 Nsight SQLite 与批次布局，计算 16 并发稳态 decode 的重叠及等待。 |
 
 这里使用 Python ABC 基类与显式注册表。格式差异放在各数据集类中，共同的编码和
@@ -29,6 +31,10 @@ Alpaca 与 LongBench 文本负载；后续新增数据集，只需实现适配�
 同步与异步在 eager、CUDA Graph 下的实测对比，以及 Nsight 采集命令见
 [异步调度性能记录](../docs/performance/async_schedule.md)。诊断入口增加观测开销，
 其 TPS 不用于替代两个正式 benchmark 的结果。
+
+单机 TP=1/2 在 Alpaca 上的吞吐、延迟及实际通信路径见
+[TP 性能记录](../docs/performance/tensor_parallel.md)。TP 对照建议显式使用同一种
+执行器后端，并保留完整 JSON，避免把进程模型差异混入 GPU 通信的解释。
 
 ## 配置与数据怎样流动
 
@@ -193,7 +199,10 @@ truncate 会改变原始任务内容，适用于性能负载控制。它保留�
 | --seed | 0 | 写入 ModelConfig，并通过 RPC 在所有 Worker 内重置生成随机数状态。 |
 | --result-path | 不指定 | 可选 JSON 报告路径；计时结束后保存配置摘要和统计，可覆盖已有文件。 |
 | --enforce-eager | 关闭 | 禁用 CUDA Graph，局部层编译和内核预热仍存在。 |
+| --cuda-graph | 默认开启 | 显式选择 decode Graph，与 --enforce-eager 互斥。 |
 | --tensor-parallel-size | 1 | 单机 TP Worker 数；模型分片维度须满足当前整除约束。 |
+| --warmup-num-prompts | 0 | 正式计时前执行的合成请求数，0 保持原有不额外预热的协议。 |
+| --warmup-output-tokens | 16 | 每条合成预热请求的固定输出长度，不计入正式 token 数和延迟。 |
 | --distributed-executor-backend | 自动选择 | uni 或 mp；TP=1 也可显式选择 mp，uni 不支持 TP>1。 |
 | --async-scheduling / --no-async-scheduling | 关闭 | 启用或显式关闭异步调度，两个入口均支持。 |
 | --max-model-len | 4096 | prompt 与 output 的总上下文容量。 |
@@ -211,6 +220,52 @@ seed 固定的是生成前随机数初态，不保证不同 batch 调度或 Grap
 Python 调用方省略 `BenchmarkConfig.seed` 时沿用 `ModelConfig.seed`；显式提供时
 覆盖模型配置中的值。正式回放和诊断请求预热后的重置都发生在 Worker 进程中。
 JSON 报告会记录 TP size、执行器后端和实际 seed，便于区分执行方式。
+报告还包含 Graph 模式与捕获档位、预热配置、正式输入的 ID/长度/token 摘要和
+前缀缓存查询/命中数。预热使用重复 token 100 的合成输入，不复用正式数据集样本；
+测量前会在所有 Worker 内重新设置 seed，并重置缓存统计窗口。
+
+例如用双卡运行 Graph、异步调度和前缀缓存全部开启的 Alpaca 吞吐回放：
+
+```shell
+CUDA_VISIBLE_DEVICES=0,1 VLLM_WORKER_MULTIPROC_METHOD=spawn \
+VLLM_HOST_IP=127.0.0.1 OMP_NUM_THREADS=1 \
+python -m benchmarks.benchmark_engine_throughput \
+  --model-path "$HOME/Models/Qwen3-0.6B" \
+  --dataset-name alpaca \
+  --dataset-path "$HOME/datasets/alpaca/data/train-00000-of-00001-a09b74b3ef9c3b56.parquet" \
+  --tensor-parallel-size 2 --distributed-executor-backend mp \
+  --cuda-graph --async-scheduling --enable-prefix-caching \
+  --num-prompts 128 --max-active 16 --max-tokens 128 --ignore-eos \
+  --max-model-len 1024 --max-prompt-tokens 512 --long-prompt-policy truncate \
+  --max-num-batched-tokens 1024 --gpu-memory-utilization 0.2 \
+  --warmup-num-prompts 16 --warmup-output-tokens 16 \
+  --result-path tmp/tp_throughput.json
+```
+
+将入口换成 `benchmarks.benchmark_engine_latency` 即可记录逐请求 TTFT、TPOT、ITL
+和 E2EL。启动命令只运行一个主进程，多进程执行器负责创建各 TP Worker。
+
+采集通信时，将入口换成 `benchmarks.profile_tensor_parallel`，并在 Python 命令前加：
+
+```shell
+nsys profile --trace=cuda,nvtx,osrt --sample=none --cpuctxsw=none \
+  --cuda-graph-trace=node --capture-range=cudaProfilerApi \
+  --capture-range-end=stop --output=tmp/tp_profile
+```
+
+两个 Worker 通过 RPC 分别调用 `cudaProfilerStart/Stop`；主进程的 `tp_profile`
+NVTX 范围用于排除初始化和预热。`node` 采集有额外开销，采集运行的 TPS 不作为
+正式吞吐结果。本机的 Nsight 2023.4 在完整 TP=2 trace 导入时出现事件顺序错误，
+改用配套的 2024.2.3 采集器和导入器后成功；具体工具路径和失败记录见
+[TP 性能记录](../docs/performance/tensor_parallel.md#nsight-版本与失败记录)。
+
+将 `.nsys-rep` 导出 SQLite 后可复算通信占比：
+
+```shell
+nsys export --type=sqlite --output=tmp/tp_profile.sqlite tmp/tp_profile.nsys-rep
+python -m benchmarks.analyze_tensor_parallel \
+  --sqlite tmp/tp_profile.sqlite --result-path tmp/tp_communication.json
+```
 
 `watermark` 只在本轮已有请求被安排执行时影响新接纳的 WAITING/PREEMPTED 请求；
 首个请求和 RUNNING 请求继续计算不受该门槛限制。预留块数为

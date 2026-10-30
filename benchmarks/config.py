@@ -70,6 +70,8 @@ class BenchmarkConfig:
     )
     seed: int | None = None  # 缺省跟随 ModelConfig.seed，显式值覆盖 Worker 的种子。
     result_path: str | None = None  # 可选 JSON 报告路径，写入发生在性能计时结束后。
+    warmup_num_prompts: int = 0  # 计时前执行的合成请求数，默认保持原有冷回放行为。
+    warmup_output_tokens: int = 16  # 合成请求的固定输出长度，不计入正式工作量。
 
     def __post_init__(self) -> None:
         """检查回放规模与输出预算，避免模型加载后才发现无效工作量。"""
@@ -80,6 +82,16 @@ class BenchmarkConfig:
             self.vllm_config.model_config.seed = self.seed
         if self.num_prompts < 1:
             raise ValueError("num_prompts must be positive")
+        if self.warmup_num_prompts < 0 or self.warmup_output_tokens < 1:
+            raise ValueError(
+                "warmup_num_prompts must be non-negative and "
+                "warmup_output_tokens positive"
+            )
+        if (
+            self.warmup_num_prompts
+            and self.warmup_output_tokens >= self.vllm_config.model_config.max_model_len
+        ):
+            raise ValueError("warmup_output_tokens must be less than max_model_len")
         # 每条请求至少保留一个输入 token；完整输入是否装得下由数据集层检查。
         if self.sampling_params.max_tokens >= self.vllm_config.model_config.max_model_len:
             raise ValueError("max_tokens must be less than max_model_len")
@@ -115,8 +127,25 @@ def parse_args(
     parser.add_argument("--ignore-eos", action="store_true", help="忽略 EOS，测试固定输出长度。")
     parser.add_argument("--seed", type=int, default=0, help="生成随机种子，不保证跨模式逐字一致。")
     parser.add_argument("--result-path", help="可选 JSON 报告路径，包含配置摘要与实际指标。")
-    parser.add_argument("--enforce-eager", action="store_true", help="禁用 CUDA Graph。")
-    parser.add_argument("--tensor-parallel-size", type=int, default=1, help="单机 TP Worker 数量。")
+    graph_group = parser.add_mutually_exclusive_group()
+    graph_group.add_argument(
+        "--cuda-graph", dest="enforce_eager", action="store_false",
+        help="显式开启 decode CUDA Graph。",
+    )
+    graph_group.add_argument(
+        "--enforce-eager", dest="enforce_eager", action="store_true",
+        help="禁用 CUDA Graph。",
+    )
+    parser.set_defaults(enforce_eager=False)  # 保持原有默认开启 Graph 的行为。
+    parser.add_argument("--tensor-parallel-size", "-tp", type=int, default=1, help="单机 TP Worker 数量。")
+    parser.add_argument(
+        "--warmup-num-prompts", type=int, default=0,
+        help="计时前执行的合成预热请求数，默认不额外预热。",
+    )
+    parser.add_argument(
+        "--warmup-output-tokens", type=int, default=16,
+        help="每条合成预热请求的输出 token 数。",
+    )
     parser.add_argument(
         "--distributed-executor-backend", choices=("uni", "mp"),
         help="执行器后端；省略时 TP=1 使用 uni，TP>1 使用 mp。",
@@ -194,6 +223,8 @@ def parse_args(
             ),
             seed=args.seed,
             result_path=args.result_path,
+            warmup_num_prompts=args.warmup_num_prompts,
+            warmup_output_tokens=args.warmup_output_tokens,
         )
     except ValueError as exc:
         parser.error(str(exc))
