@@ -8,6 +8,7 @@
 """
 
 from abc import ABC, abstractmethod
+import inspect
 import re
 from typing import TYPE_CHECKING, Any
 
@@ -88,6 +89,17 @@ class QuantizeMethodBase(ABC):
             weight: 子类还原的浮点权重或权重二元组，基类不提供默认转换。
         """
         raise NotImplementedError(f"{type(self).__name__} does not support dequantization")
+
+
+def method_has_implemented_embedding(method_class: type[QuantizeMethodBase]) -> bool:
+    """检查参数方法是否提供了有效查表实现，判断方式沿用 vLLM。
+
+    Returns:
+        has_embedding: embedding 存在且不同于基类的未实现接口时为 True。
+    """
+    base_embedding = inspect.getattr_static(QuantizeMethodBase, "embedding", None)
+    class_embedding = inspect.getattr_static(method_class, "embedding", None)
+    return class_embedding is not None and class_embedding is not base_embedding
 
 
 class QuantizationConfig(ABC):

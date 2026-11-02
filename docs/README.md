@@ -42,6 +42,12 @@
 
 | 层次 | 文档 |
 | --- | --- |
+| 模型 | [Qwen3 各模块的计算、层循环与语言模型接口](model_executor/models/qwen3.md)。 |
+| 模型层 | [Linear 的权重布局、TP 切分、偏置与加载](model_executor/layers/linear.md)。 |
+| 模型层 | [词表并行的分片、padding、追加区域与索引转换](model_executor/layers/vocab_parallel_embedding.md)。 |
+| 模型层 | [LogitsProcessor 的词表分数、采样关系与 TP 候选选择](model_executor/layers/logits_processor.md)。 |
+| 模型参数 | [Parameter 的继承关系、TP 源分片与融合权重装填](model_executor/parameter.md)。 |
+| 模型层 | [量化基类：方案配置、执行方法与加载协议](model_executor/layers/quantization/base_config.md)。 |
 | 模型层 | [SiluAndMul 的原理与调用位置](model_executor/layers/activation.md)。 |
 | 算子 | [silu_and_mul 的三种后端与性能记录](ir/ops/activation.md)。 |
 | kernel | [Triton SiluAndMul 的持久化调度与自动调优](kernels/triton/activation/SiluAndMul.md)。 |

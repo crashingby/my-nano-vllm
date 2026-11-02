@@ -298,7 +298,12 @@ class Qwen3Model(nn.Module):
         # ModuleList 的索引也是 PyTorch module path 的一部分，所以直接用 layer_idx
         # 构造 ``model.layers.<idx>``，不能依赖运行时遍历顺序。
         layers_prefix = f"{prefix}.layers" if prefix else "layers"
-        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=vllm_config.quant_config,
+            prefix=f"{prefix}.embed_tokens" if prefix else "embed_tokens",
+        )
         self.layers = nn.ModuleList(
             [
                 Qwen3DecoderLayer(
@@ -367,7 +372,7 @@ class Qwen3ForCausalLM(nn.Module):
         Side Effects:
             创建模型参数，各 Attention 层以派生出的完整名称注册到静态上下文。
             当前不支持 PP 或投机解码，模型始终持有全部 decoder 层。
-            quant_config 只向 decoder 线性层传递，词表层仍使用普通精度。
+            quant_config 传给 decoder 和词表层；未配置时均使用普通浮点方法。
         """
         super().__init__()
         config = vllm_config.model_config.hf_config  # HF 配置只负责具体模型结构。
@@ -379,10 +384,15 @@ class Qwen3ForCausalLM(nn.Module):
             self.quant_config.packed_modules_mapping.update(self.packed_modules_mapping)
         model_prefix = f"{prefix}.model" if prefix else "model"
         self.model = Qwen3Model(vllm_config=vllm_config, prefix=model_prefix)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=vllm_config.quant_config,
+            prefix=f"{prefix}.lm_head" if prefix else "lm_head",
+        )
         if config.tie_word_embeddings:
             # 共享同一个 Parameter，而不只是 data，参数遍历才能正确去重。
-            self.lm_head.weight = self.model.embed_tokens.weight
+            self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
         # 沿用 vLLM：LMHead 保存权重，由独立接口计算和汇集词表分数。
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
